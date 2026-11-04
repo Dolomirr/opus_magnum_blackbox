@@ -7,7 +7,22 @@ authors = [
     { name = "Dolomirr", email = "dolomirr@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+  "gymnasium>=1.4.0",
+  "numpy>=2.5.4",
+  "pytest>=9.2.0",
+  "torch>=2.15.0",
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu134", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu134"
+url = "https://download.pytorch.org/whl/cu134"
+explicit = true
 
 [project.scripts]
 opus-magnum-blackbox = "opus_magnum_blackbox:main"
@@ -15,3 +30,91 @@ opus-magnum-blackbox = "opus_magnum_blackbox:main"
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+exclude = [
+    ".git",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "site-packages",
+    "examples",
+]
+extend-include = ["*.ipynb"]
+line-length = 120
+indent-width = 4
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "SIM",    # flake8-simplify
+    "PT",     # flake8-pytest-style
+    "RUF",    # ruff-specific rules
+    "PL",     # pylint
+    "TRY",    # tryceratops
+    "PERF",   # perflint
+    "S",      # flake8-bandit
+    "D",      # pydocstyle
+    "TD",     # flake8-todos
+    "FIX",    # flake8-fixme
+    "PGH",    # pygrep-hooks
+    "ISC",    # flake8-implicit-str-concat
+    "COM818", # trailing-commas
+    "ERA",    # eradicate
+    "Q",      # flake8-quotes
+    "T20",    # flake8-print
+]
+
+ignore = [
+    "ANN",  # flake8-annotations
+    "EXE",  # flake8-executable
+    "TID",  # flake8-tidy-imports
+    "C90",  # mccabe complexity
+    "T10",  # flake8-debugger
+    "DJ",   # django
+
+    # docstring formatting & missing docs
+    "D200", "D203", "D205", "D212",
+    "D400", "D415",
+    "D401",
+    "D100", "D101", "D102", "D103",
+    "D104", "D105", "D106", "D107",
+
+    # style preferences
+    "E402",              # module import not at top (false positives for local imports)
+    "E501",              # line too long
+    "TRY003",            # long exception messages
+    "TD002", "TD003",    # missing info in TODO/FIXME
+    "TD004", "FIX002",   # missing info in TODO/FIXME
+    "F401",              # unused import
+    "PGH004", "RUF100",  # unused noqa directives
+    "Q000", "Q001",      # quote style
+    "ERA001",            # commented-out code
+    "COM819",            # trailing comma in single-line
+    "W293",              # blank line contains whitespace
+    "PLR2004",           # magic value comparison
+    "C408",              # dict()/list()/tuple() vs literals
+    "S311",              # non-cryptographic random
+    "PLR0912",           # too many branches
+    "PGH003",            # blanket noqa
+    "ISC003",            # explicit string concatenation
+    "T201",              # no prints
+]
+
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+"**/tests/**/*.py" = ["S101"]
+"test_*.py" = ["S101"]
