@@ -41,3 +41,41 @@ class TokenizerConfig:
         return 1 + 4 * self.max_placements + 1 + 1 + 3 * self.max_program_actions + 1
 
 
+
+# fmt: off
+@dataclass(frozen=True)
+class RewardConfig:
+    """
+    All reward terms, so each curriculum stage can use its own values.
+
+    Stage 0 sets every metric weight to zero (learn to deliver at all);
+    later stages raise alpha/beta/gamma to optimize cost/area/cycles.
+    """
+
+    # terminal base rewards
+    solve_reward           : float = 1.0  # solved episode
+    failure_penalty        : float = -1.0 # static failure or FAILED
+    error_base             : float = -0.5 # ERROR with unknown crash step
+    error_progress         : float = 0.4  # ERROR over crash_step / spec.steps
+    unsolved_reward        : float = 0.0  # ran to completion but did not reach target
+
+    # pareto metric bonuses, set per stage
+    alpha                  : float = 0.0  # cost
+    beta                   : float = 0.0  # area
+    gamma                  : float = 0.0  # cycles
+    cost_max               : int   = 100  # per-level normalization (overridden by LevelEntry)
+
+    # shaping / progress
+    shaping_weight         : float = 0.0  # delivered on unsolved COMPLETED
+    placement_reward       : float = 0.0  # per correct placement, credited on failure
+    invalid_action_penalty : float = 0.0  # per-step, for a token the mask disallowed
+# fmt: on
+
+
+@dataclass(frozen=True)
+class Curriculum:
+    """
+    Ordered reward configs, one per training stage.
+    """
+
+    stages: tuple[RewardConfig, ...] = (RewardConfig(),)
