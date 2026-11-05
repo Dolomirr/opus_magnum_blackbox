@@ -1,3 +1,28 @@
+"""
+Flat integer vocabulary for the Opus Magnum RL translation layer.
+
+Token categories (each a contiguous id range):
+
+- specials:  [PAD] [START_LAYOUT] [END_LAYOUT] [START_PROGRAM] [SUBMIT]
+- modes:     MODE_FIXED MODE_UNFIXED UNPLACED
+- ctypes:    CTYPE_ENTRANCE CTYPE_EXIT            (encoder shape segments)
+- atoms:     ATOM_NONE + one per real AtomType    (encoder typed cells)
+- builtins:  BP_<name> per implemented built-in blueprint
+- entrypoint shape slots: ESHAPE_0..K-1 (resolved against the current spec)
+- rotations: ROT_0..5
+- coords:    Q_0..max_cols-1 (maps to Hex.s), R_0..max_rows-1 (maps to Hex.r)
+- deltas:    D_<off> encoder cell offsets in [-max_offset, max_offset]
+- cells:     CELL_0..max_shape_cells-1 (encoder link endpoints)
+- handles:   H_0..H-1 (n-th placed arm)
+- ticks:     TICK_0..max_steps-1
+- actions:   ACT_GRAB ACT_RELEASE ACT_ROTATE_CLW ACT_ROTATE_CCLW
+             ACT_EXTEND ACT_RETRACT ACT_NOP
+
+The transformer-facing surface is integer-only.
+Numeric categories are addressed as `base(category) + value`;
+string names exist only for authoring, error messages and tests.
+"""
+
 from dataclasses import dataclass
 
 from opus_magnum_sym import AtomType, StepActionType
@@ -21,6 +46,7 @@ ACTION_TOKEN_NAMES = (
     "ACT_NOP",
 )
 
+# ACT_NOP is decode-time only ("assign nothing at this tick"); it has no StepActionType.
 ACTION_TO_STEP_TYPE = {
     "ACT_GRAB": StepActionType.GRAB,
     "ACT_RELEASE": StepActionType.RELEASE,
@@ -30,15 +56,19 @@ ACTION_TO_STEP_TYPE = {
     "ACT_RETRACT": StepActionType.RETRACT,
 }
 
+# Actions every arm accepts, plus the piston-only pair.
 BASE_ACTION_NAMES = ("ACT_GRAB", "ACT_RELEASE", "ACT_ROTATE_CLW", "ACT_ROTATE_CCLW", "ACT_NOP")
 PISTON_ACTION_NAMES = ("ACT_EXTEND", "ACT_RETRACT")
 
+# Real atom types only; NONE marks untyped encoder cells, BASIC is not a game type.
 ATOM_TOKEN_TYPES = tuple(t for t in AtomType if t not in (AtomType.NONE, AtomType.BASIC))
 ATOM_TYPES = (None, *ATOM_TOKEN_TYPES)
 
 
 @dataclass(frozen=True)
 class Builtin:
+    """Resolved capability of one built-in blueprint (captured once, read-only)."""
+
     name: str
     manipulator: bool  # consumes a program handle
     extendable: bool  # piston arm (accepts EXTEND/RETRACT)
@@ -46,6 +76,7 @@ class Builtin:
 
 
 def _resolve_builtins() -> tuple[Builtin, ...]:
+    """Snapshot the implemented built-ins from the registry, in ``BPN`` order."""
     builtins = []
     for name in BPN:
         blueprint = default_registry.get(name)
@@ -62,6 +93,7 @@ def _resolve_builtins() -> tuple[Builtin, ...]:
 
 BUILTINS = _resolve_builtins()
 
+# Debug prefixes for numeric categories; `name()` reproduces the token spelling.
 _TOKEN_PREFIXES = {
     "entry_slot": "ESHAPE_",
     "rotation": "ROT_",
@@ -76,6 +108,8 @@ _TOKEN_PREFIXES = {
 
 
 class Vocab:
+    """Named token maps plus per-category id ranges."""
+
     def __init__(self, config: VocabConfig | None = None) -> None:
         self.config = config or VocabConfig()
         cfg = self.config
@@ -144,6 +178,9 @@ class Vocab:
 
 
     def value_id(self, category: str, value: int) -> int:
+        """
+        Numeric category token for `value` (deltas are shifted by max_cell_offset).
+        """
         if category == "delta":
             value += self.config.max_cell_offset
         if not 0 <= value < len(self.ranges[category]):
@@ -161,7 +198,13 @@ class Vocab:
 
 
     def builtin(self, token_id: int) -> Builtin:
+        """
+        Resolved capability of built-in token.
+        """
         return self.builtins[token_id - self.base("builtin")]
 
     def step_type(self, action_id: int) -> StepActionType | None:
+        """
+        `StepActionType` for action token, or None for NOP.
+        """
         return self._step_types[action_id - self.base("action")]

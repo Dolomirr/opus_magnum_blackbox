@@ -27,6 +27,10 @@ from opus_magnum_blackbox.reward import compute_reward
 
 @dataclass(frozen=True)
 class LevelEntry:
+    """
+    One corpus level: its source plus curriculum/normalization config.
+    """
+
     source: Path | LevelSpec
     cost_max: int
     name: str
