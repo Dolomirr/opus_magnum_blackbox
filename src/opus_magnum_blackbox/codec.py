@@ -93,7 +93,6 @@ class OpusTokenizer:
         self.config = config or TokenizerConfig()
         self.vocab = Vocab(self.config.vocab)
 
-
     def encode_level_spec(self, spec: LevelSpec) -> tuple[np.ndarray, int]:
         """
         Encode spec as fixed-length padded id array + its true length.
@@ -147,7 +146,6 @@ class OpusTokenizer:
         padded = np.full(self.config.max_encoder_len, vocab.pad_id, dtype=np.int64)
         padded[:length] = tokens
         return padded, length
-
 
     def decode_solution_to_level(self, tokens: list[int] | np.ndarray, spec: LevelSpec, level: Level) -> DecodeReport:
         """

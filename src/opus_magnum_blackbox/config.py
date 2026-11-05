@@ -41,7 +41,6 @@ class TokenizerConfig:
         return 1 + 4 * self.max_placements + 1 + 1 + 3 * self.max_program_actions + 1
 
 
-
 # fmt: off
 @dataclass(frozen=True)
 class RewardConfig:

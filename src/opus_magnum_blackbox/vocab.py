@@ -167,7 +167,6 @@ class Vocab:
     def __len__(self) -> int:
         return len(self._names)
 
-
     def id(self, name: str) -> int:
         return self._name_to_id[name]
 
@@ -193,7 +192,6 @@ class Vocab:
     def base(self, category: str) -> int:
         return self.ranges[category].start
 
-
     def value_id(self, category: str, value: int) -> int:
         """
         Numeric category token for `value` (deltas are shifted by max_cell_offset).
@@ -212,7 +210,6 @@ class Vocab:
 
     def builtin_id(self, name: str) -> int:
         return self._name_to_id[name]
-
 
     def builtin(self, token_id: int) -> Builtin:
         """
