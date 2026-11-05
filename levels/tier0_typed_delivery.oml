@@ -1,0 +1,30 @@
+# RL curriculum tier 0: typed, solution-placed entrypoints.
+#
+# Mirrors `examples/27_level_typed.oml` from the simulator repo, extended with
+# `target 1` (stop after every exit delivers) and `cycling 1` (short periodic
+# programs), per the RL level-authoring rules.
+#
+# Water+salt molecule is delivered to a typed exit that verifies the exact
+# bond pattern and atom types.
+
+size 6 6
+steps 30
+entrypoints_fixed 0
+atom_types salt water
+
+target 1
+cycling 1
+
+# The arm's 4-step swing mirrors the molecule,
+# so entrance's origin cell is water and its beam salt;
+# exit have opposite assignment.
+shape entrance_typed entrance cells=(0,0):water,(-1,1):salt links=0-1
+shape exit_typed exit cells=(0,0):salt,(-1,1):water links=0-1
+
+# Both cells are typed, so no `atom_type` fallback is needed.
+entrance entrance_typed
+exit exit_typed
+
+# Blueprints available to the solution.
+# Entrypoint shapes are added automatically.
+allow arm
