@@ -1,0 +1,20 @@
+# minimal entrance -> arm -> exit delivery
+
+# The level file defines the starting conditions.
+# The solution defines placement and actions.
+
+size 6 6
+steps 30
+
+# single-cell entrypoint shapes (use links= for single-cell shapes)
+shape entrance_1 entrance cells=(0,0) links=
+shape exit_1 exit cells=(0,0) links=
+
+# entrance spawns a salt atom at (2,3)
+entrance entrance_1 2 3 atom_type=salt
+
+# exit consumes the atom once it is released at (3,2)
+exit exit_1 3 2 atom_type=salt
+
+# blueprints available to the solution
+allow arm
