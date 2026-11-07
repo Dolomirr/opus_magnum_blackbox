@@ -26,6 +26,15 @@ om-validate file:
 
 
 # ===============================
+# Training
+# ===============================
+
+# Train the baseline policy on tier-0 level (default overfit config)
+train:
+    uv run opus-magnum-blackbox train
+
+
+# ===============================
 # Tests
 # ===============================
 
