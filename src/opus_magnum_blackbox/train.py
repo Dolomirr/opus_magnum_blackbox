@@ -176,19 +176,29 @@ class Trainer:
         return path
 
     @classmethod
-    def resume(cls, path: str | Path, envs: list[OpusEnv], train_config: TrainConfig | None = None) -> Trainer:
+    def resume(
+        cls,
+        path: str | Path,
+        envs: list[OpusEnv],
+        train_config: TrainConfig | None = None,
+        reward_config: RewardConfig | None = None,
+    ) -> Trainer:
         """
         Rebuild trainer from checkpoint.
         """
         payload = torch.load(path, map_location="cpu", weights_only=False)
         model_config = ModelConfig(**payload["model_config"])
         train_config = train_config or TrainConfig(**payload["train_config"])
-        reward_config = RewardConfig(**payload["reward_config"])
+        reward_config = reward_config or RewardConfig(**payload["reward_config"])
 
         policy = OpusPolicy(envs[0].tokenizer.config, model_config)
         policy.load_state_dict(payload["model_state"])
         trainer = cls(policy, envs, train_config, reward_config, model_config)
         trainer.optimizer.load_state_dict(payload["optimizer_state"])
+        # load_state_dict restores lr; overrideing with resotred
+        # (identity for exact resume, where train_config comes from the same checkpoint)
+        for group in trainer.optimizer.param_groups:
+            group["lr"] = trainer.train_config.lr
         trainer.iteration = payload["iteration"]
 
         rng = payload["rng"]
