@@ -3,6 +3,8 @@ default:
     @just --list
 
 alias t  := test
+alias f  := format
+alias l  := lint
 alias tv := test-verbose
 
 
