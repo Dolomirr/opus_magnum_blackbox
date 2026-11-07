@@ -3,7 +3,7 @@
 Autoregressive RL translation layer and training code for Opus Magnum. 
 It converts a level `LevelSpec` into integer tokens, constrains generation with a grammar-aware action mask, decodes token sequences back onto a `Level`, runs the simulation, and scores the result through a Gymnasium environment.
 
-Current state: codec, grammar, masker, reward, and environment are implemented and tested. There is one tier-0 training level and no training CLI yet (`__main__.py` is a placeholder). Run `just test` to verify the setup; run `just full` before finishing a change.
+Current state: codec, grammar, masker, reward, and environment are implemented and tested. There is one tier-0 training level and no training CLI yet (`__main__.py` is a placeholder). Run `just test` to verify the setup; gate a change with `just lint` + `just test` (the `ty` stage is advisory — see below).
 
 ## 1. Scope and related projects
 
@@ -26,6 +26,8 @@ just full                       # check + lint + test
 ```
 
 The `just om-*` recipes (`om-repl-headless`, `om-run`, `om-validate`) call the simulator's `opus-magnum` CLI, not this package.
+
+**`ty` usage**: advisory only, allowed to fail (accepted baseline diagnostics; `just full` stops at `just check`) — gate changes with `just lint` + `just test`. For a new diagnostic, judge real vs false alarm (e.g. `X | None` narrowing, torch stub quirks): fix real ones, ignore false ones. Never silence with `# ty: ignore` or restructure code for the checker, and never re-add suppressions the user removed.
 
 `tests/test_torch_cuda.py` skips if torch is absent but asserts CUDA is available when torch is installed. A failing CUDA test is an environment problem, not necessarily a code regression.
 
