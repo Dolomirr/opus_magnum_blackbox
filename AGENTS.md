@@ -3,7 +3,7 @@
 Autoregressive RL translation layer and training code for Opus Magnum. 
 It converts a level `LevelSpec` into integer tokens, constrains generation with a grammar-aware action mask, decodes token sequences back onto a `Level`, runs the simulation, and scores the result through a Gymnasium environment.
 
-Current state: codec, grammar, masker, reward, and environment are implemented and tested. There is one tier-0 training level and no training CLI yet (`__main__.py` is a placeholder). Run `just test` to verify the setup; gate a change with `just lint` + `just test` (the `ty` stage is advisory — see below).
+Current state: codec, grammar, masker, reward, environment, and the framework-free training stack (policy model, rollout, REINFORCE trainer, CLI) are implemented and tested. There is one tier-0 training level. `just train` starts the default overfit run; checkpoints and `metrics.jsonl` land under `runs/` (git-ignored). Gate a change with `just lint` + `just test` (the `ty` stage is advisory — see below).
 
 ## 1. Scope and related projects
 
@@ -23,6 +23,7 @@ just lint                       # ruff check --fix (mutates files)
 just format                     # ruff format
 just check                      # ty check src
 just full                       # check + lint + test
+just train                      # default overfit run on tier-0, writes runs/<timestamp>-<level>/
 ```
 
 The `just om-*` recipes (`om-repl-headless`, `om-run`, `om-validate`) call the simulator's `opus-magnum` CLI, not this package.
@@ -43,6 +44,10 @@ src/opus_magnum_blackbox/
 ├── geometry.py  # placement footprint/bounds/overlap for masking
 ├── reward.py    # pure terminal reward function
 ├── env.py       # OpusEnv (Gymnasium)
+├── model.py     # OpusPolicy: transformer policy/value network
+├── rollout.py   # episode collection, teacher-forced batches
+├── train.py     # Trainer: masked REINFORCE loop, checkpoints, metrics
+├── cli.py       # `train` / `eval` subcommands
 └── corpus.py    # level entries for training
 levels/          # .oml level files
 tests/           # behavior-focused pytest suite
@@ -124,21 +129,31 @@ Rules enforced by `advance`:
 - `__getstate__` clears the level cache for pickling/async workers.
 - Reward is terminal-only and pure (`reward.py`): static failure/`FAILED` → `failure_penalty + placement_reward * placements`; `ERROR` → `error_base + error_progress * crash_step/spec.steps`; unsolved `COMPLETED` → `unsolved_reward + shaping`; solved → `solve_reward + alpha/beta/gamma` clamped cost/area/cycles bonuses. All weights live in `RewardConfig`.
 
-## 7. Levels and corpus
+## 7. Training stack
+
+Framework-free PyTorch, wired `model.py` → `rollout.py` → `train.py` → `cli.py`. No Trainer framework; the loop is hand-written and visible.
+
+- `model.py`: `OpusPolicy` is a pre-norm encoder-decoder transformer over the env's Dict observation. Embedding index `vocab_size` is a model-internal BOS (never in any token stream). Decoder input is the BOS-shifted history; output position `t` is the distribution for action `a_t` and the value of state `s_t`. `masked_distribution` turns invalid logits into `-inf` before softmax, so only mask-valid tokens are ever sampled.
+- `rollout.py`: `collect_episode` records per-step actions, old logprobs/values, masks, rewards and discounted returns; `collect_batch` spreads episodes round-robin over env instances and stacks teacher-forced tensors plus `mean_return`/`solve_rate`/`mean_length`. Old logprobs/values travel with each step, so the batch format is PPO-ready.
+- `train.py`: `Trainer` — masked REINFORCE with a learned value baseline (`A = G - V` detached, value MSE, entropy bonus, Adam, global grad-norm clip). `update()` is the single PPO seam. Checkpoints (`latest.pt` plus numbered `iter_XXXX.pt`) store model/optimizer/iteration and torch/cuda/numpy RNG states plus all configs; `Trainer.resume(path, envs, train_config=None)` restores them. Metrics append to `metrics.jsonl` (train entries + greedy eval entries).
+- CLI: `uv run opus-magnum-blackbox train --level tier0_typed_delivery [--resume ckpt.pt] [--iterations N --episodes N --lr F --seed N --device D --run-dir DIR]`; unspecified options fall back to `TrainConfig` defaults on fresh runs and to the checkpoint's stored config on resume. `... eval ckpt.pt [--episodes K] [--dump-tokens]` prints the greedy solve rate.
+- Sizes/knobs: `ModelConfig` (d_model=128, nhead=4, 2+2 layers), loop knobs in `TrainConfig` (`device=""` auto-resolves to cuda when available).
+
+## 8. Levels and corpus
 
 - Training levels are `.oml` files under `levels/`; `corpus.py` hardcodes `LevelEntry` objects with `cost_max` and optional sampling `weight`.
 - The live simulator supports `target <n>` (per-exit delivery requirement) and `cycling 0|1` (repeat programs); `levels/tier0_typed_delivery.oml` uses both. Older simulator docs may not mention them.
 - `LevelEntry.source` may be a `Path` or an in-memory `LevelSpec`; tests use the latter.
 - When adding a level, mirror the existing tier-0 file's structure and add a corpus entry.
 
-## 8. Testing and style
+## 9. Testing and style
 
 - Tests are behavior-focused and intentionally assert exact tokens, masks, rewards, and full solves. Update tests only when the contract changes; do not weaken the wire-format guards.
 - `tests/conftest.py` provides `spec`, `vocab`, `tokenizer`, `masker`, and `known_solution_tokens` (a hand-translation of the tier-0 solution). Treat `known_solution_tokens` as the canonical encoding regression.
-- Test modules: `test_grammar.py` (phase/group rules, mask/decoder agreement), `test_tokenizer.py` (encode/decode/round-trip), `test_masking.py` (per-phase masks), `test_reward.py` (reward branches), `test_env.py` (Gymnasium compliance, determinism, truncation, full solve).
+- Test modules: `test_grammar.py` (phase/group rules, mask/decoder agreement), `test_tokenizer.py` (encode/decode/round-trip), `test_masking.py` (per-phase masks), `test_reward.py` (reward branches), `test_env.py` (Gymnasium compliance, determinism, truncation, full solve), `test_model.py` (shapes, causality, BOS isolation, masking, encoder padding), `test_rollout.py` (mask validity, hand-computed returns, batch alignment, determinism), `test_train.py` (smoke run, checkpoint/resume).
 - Python `>=3.14.10`; `uv`; Ruff line length 120 with a deliberately broad rule set (docstring and unused-import rules are mostly ignored — do not fight it). Use `numpy` integer arrays on the hot path; avoid new dependencies.
 
-## 9. Files to read first
+## 10. Files to read first
 
 1. `src/opus_magnum_blackbox/grammar.py` — sequence contract.
 2. `src/opus_magnum_blackbox/codec.py` — encode/decode boundary.
@@ -146,7 +161,7 @@ Rules enforced by `advance`:
 4. `src/opus_magnum_blackbox/reward.py` / `config.py` — scoring and caps.
 5. `tests/conftest.py` + `tests/test_env.py` — canonical spec and full solve.
 
-## 10. Do not touch unless asked
+## 11. Do not touch unless asked
 
 - `TODO.md` (user tracker), `.session`, `.agent-shell/transcripts/`, `.venv/`, caches, `uv.lock`.
 - Do not commit, push, or rewrite history without an explicit request.
