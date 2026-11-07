@@ -57,6 +57,34 @@ class ModelConfig:
     # fmt: on
 
 
+@dataclass(frozen=True)
+class TrainConfig:
+    """
+    Masked REINFORCE hyperparameters;
+
+    Overfit-run defaults.
+
+    `device` "" auto-resolves to cuda when available,
+    else cpu (kept as a string so this config stays importable without torch).
+    """
+
+    # fmt: off
+    iterations             : int   = 2000
+    episodes_per_iteration : int   = 32
+    lr                     : float = 3e-4
+    entropy_coef           : float = 0.01
+    value_coef             : float = 0.5
+    gamma                  : float = 1.0
+    grad_clip              : float = 1.0
+    eval_interval          : int   = 10
+    eval_episodes          : int   = 8
+    checkpoint_interval    : int   = 50
+    seed                   : int   = 0
+    device                 : str   = ""     # auto-resolves to cuda then avaliable
+    run_dir                : str   = "runs"
+    # fmt: on
+
+
 # fmt: off
 @dataclass(frozen=True)
 class RewardConfig:
