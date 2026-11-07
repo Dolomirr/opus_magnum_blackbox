@@ -41,6 +41,22 @@ class TokenizerConfig:
         return 1 + 4 * self.max_placements + 1 + 1 + 3 * self.max_program_actions + 1
 
 
+@dataclass(frozen=True)
+class ModelConfig:
+    """
+    Transformer value sizes.
+    """
+
+    # fmt: off
+    d_model         : int   = 128
+    nhead           : int   = 4
+    encoder_layers  : int   = 2
+    decoder_layers  : int   = 2
+    dim_feedforward : int   = 512
+    dropout         : float = 0.0
+    # fmt: on
+
+
 # fmt: off
 @dataclass(frozen=True)
 class RewardConfig:
