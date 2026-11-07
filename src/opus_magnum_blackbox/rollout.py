@@ -94,7 +94,7 @@ def collect_episode(env: OpusEnv, policy: OpusPolicy, device, greedy: bool = Fal
             mask = obs["action_mask"].astype(bool)
             logits, value = _forward_observation(policy, obs, device)
             dist = policy.masked_distribution(logits, torch.from_numpy(mask).to(device))
-            action = int(dist.probs.argmax()) if greedy else int(dist.sample())  # ty: ignore[unresolved-attribute]
+            action = int(dist.probs.argmax()) if greedy else int(dist.sample())
             logprob = float(dist.log_prob(torch.tensor(action, device=device)))
 
             obs, reward, terminated, truncated, info = env.step(action)
