@@ -43,6 +43,9 @@ def _build_parser() -> argparse.ArgumentParser:
     train.add_argument("--run-dir",                      default=None)
     train.add_argument("--shaping-weight",   type=float, default=None, help="reward shaping on unsolved COMPLETED (fallback knob)")
     train.add_argument("--placement-reward", type=float, default=None, help="per-placement credit on failure (fallback knob)")
+    train.add_argument("--alpha",            type=float, default=None, help="reward weight: cost bonus (rl-optimise knob)")
+    train.add_argument("--beta",             type=float, default=None, help="reward weight: area bonus (rl-optimise knob)")
+    train.add_argument("--gamma",            type=float, default=None, help="reward weight: cycles bonus (rl-optimise knob)")
     train.add_argument("--resume",                       default=None, help="checkpoint path to resume from")
     # fmt: on
 
@@ -91,10 +94,15 @@ def _train_config(args: argparse.Namespace, base: TrainConfig) -> TrainConfig:
 
 
 def _reward_config(args: argparse.Namespace, base: RewardConfig) -> RewardConfig:
-    """Stage-5 fallback knobs; None means unspecified."""
+    """
+    Fallback and rl-optimise knobs; None means unspecified.
+    """
     mapping = {
         "shaping_weight": args.shaping_weight,
         "placement_reward": args.placement_reward,
+        "alpha": args.alpha,
+        "beta": args.beta,
+        "gamma": args.gamma,
     }
     return replace(base, **{field: value for field, value in mapping.items() if value is not None})
 
