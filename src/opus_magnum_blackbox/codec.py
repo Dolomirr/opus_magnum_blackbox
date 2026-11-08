@@ -20,14 +20,19 @@ from opus_magnum_sym.elements.components import ComponentType
 
 from opus_magnum_blackbox.config import TokenizerConfig
 from opus_magnum_blackbox.grammar import (
+    Action,
     GrammarError,
+    Placement,
     Solution,
     entrypoint_index,
     parse,
     solution,
     spec_model,
 )
-from opus_magnum_blackbox.vocab import Vocab
+from opus_magnum_blackbox.vocab import ACTION_TO_STEP_TYPE, Vocab
+
+# inverse of token-name -> StepActionType table; covers every real action type
+_STEP_TYPE_TO_NAME = {step_type: name for name, step_type in ACTION_TO_STEP_TYPE.items()}
 
 
 @dataclass
@@ -146,6 +151,51 @@ class OpusTokenizer:
         padded = np.full(self.config.max_encoder_len, vocab.pad_id, dtype=np.int64)
         padded[:length] = tokens
         return padded, length
+
+    def encode_solution(self, placements: list[Placement], actions: list[Action], spec: LevelSpec) -> list[int]:
+        """
+        Encode solution IR to token sequence (inverse of `decode_solution`).
+
+        Quadruplets keep given placement order;
+        triplets keep given order and must be "canonical";
+        handles non-decreasing, ticks unique per handle,
+        otherwise the emitted sequence would not parse.
+        """
+        vocab = self.vocab
+        model = spec_model(spec)
+        tokens = [vocab.special_id("[START_LAYOUT]")]
+        for placement in placements:
+            if placement.slot is not None:
+                if placement.slot >= len(model.slots):
+                    raise ValueError(f"entrypoint slot {placement.slot} is out of range for the spec")
+                tokens.append(vocab.value_id("entry_slot", placement.slot))
+            else:
+                if placement.builtin.name not in model.builtins:
+                    raise ValueError(f"built-in {placement.builtin.name!r} is not allowed by the spec")
+                tokens.append(vocab.builtin_id(placement.builtin.name))
+            tokens += [
+                vocab.value_id("rotation", placement.rotation),
+                vocab.value_id("q", placement.q),
+                vocab.value_id("r", placement.r),
+            ]
+        tokens += [vocab.special_id("[END_LAYOUT]"), vocab.special_id("[START_PROGRAM]")]
+        previous: Action | None = None
+        for action in actions:
+            if previous is not None and (
+                action.handle < previous.handle or (action.handle == previous.handle and action.tick == previous.tick)
+            ):
+                raise ValueError(
+                    f"program triplets must be canonical: handle {action.handle} tick {action.tick} "
+                    f"follows handle {previous.handle} tick {previous.tick}"
+                )
+            tokens += [
+                vocab.value_id("handle", action.handle),
+                vocab.value_id("tick", action.tick),
+                vocab.id(_STEP_TYPE_TO_NAME[action.action]),
+            ]
+            previous = action
+        tokens.append(vocab.special_id("[SUBMIT]"))
+        return tokens
 
     def decode_solution_to_level(self, tokens: list[int] | np.ndarray, spec: LevelSpec, level: Level) -> DecodeReport:
         """

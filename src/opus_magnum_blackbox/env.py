@@ -35,6 +35,7 @@ class LevelEntry:
     cost_max: int
     name: str
     weight: float = 1.0
+    solutions: tuple[Path, ...] = ()
 
 
 class OpusEnv(gym.Env):

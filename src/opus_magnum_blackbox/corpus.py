@@ -15,5 +15,6 @@ TIER0_LEVELS = [
         source=LEVELS_DIR / "tier0_typed_delivery.oml",
         cost_max=50,
         name="tier0_typed_delivery",
+        solutions=(LEVELS_DIR / "tier0_typed_delivery.oms",),
     ),
 ]
