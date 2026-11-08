@@ -1,9 +1,9 @@
 # Tier-0 overfit pipeline: pretrain on known solution, then RL tries to catch up.
 
 [run]
-levels = ["tier0_typed_delivery"]
-seed   = 0
-device = "cuda" # force cuda
+levels          = ["tier0_typed_delivery"]
+seed            = 0
+device          = "cuda" # force cuda
 
 [[stage]]
 name            = "bc"
@@ -15,20 +15,20 @@ augment         = true
 early_stop_loss = 0.1
 
 [[stage]]
-name         = "rl-consolidate"
-kind         = "rl"
-iterations   = 200
-episodes     = 32
-lr           = 1e-4
-entropy_coef = 0.002
+name            = "rl-consolidate"
+kind            = "rl"
+iterations      = 200
+episodes        = 32
+lr              = 1e-4
+entropy_coef    = 0.002
 
 [[stage]]
-name         = "rl-optimise"
-kind         = "rl"
-iterations   = 500
-episodes     = 32
-lr           = 1e-4
-entropy_coef = 0.005
-alpha        = 0.2
-beta         = 0.2
-gamma        = 0.2
+name            = "rl-optimise"
+kind            = "rl"
+iterations      = 500
+episodes        = 32
+lr              = 1e-4
+entropy_coef    = 0.005
+alpha           = 0.2    # not actually used in this scenario
+beta            = 0.2    # not actually used in this scenario
+gamma           = 0.2    # not actually used in this scenario
