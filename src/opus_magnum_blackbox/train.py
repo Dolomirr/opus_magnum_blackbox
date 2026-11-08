@@ -20,7 +20,7 @@ from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfi
 from opus_magnum_blackbox.env import OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import Timer
-from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched
+from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched, replicate_envs
 
 
 class Trainer:
@@ -50,6 +50,8 @@ class Trainer:
         self.stage: str | None = None
         # Optional `profile.ProfiledEnvs`; when set, `run` writes `profile.jsonl`.
         self.profile = None
+        # Stepping-independent env replicas for the lockstep collector, cached per slot count.
+        self._slot_env_pool: dict[int, list[OpusEnv]] = {}
         # Sub-second precision: trainer + resume within one second must not share a run dir.
         # The directory is created lazily on the first write, so resumes can target an existing one.
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
@@ -77,7 +79,7 @@ class Trainer:
             self.policy.eval()
             with self._timed("rollout"):
                 batch = collect_batched(
-                    self.envs,
+                    self._slot_env_pool_for(self.train_config.episodes_per_iteration),
                     self.policy,
                     self.train_config.episodes_per_iteration,
                     self.device,
@@ -182,8 +184,26 @@ class Trainer:
         Greedy solve rate over eval_episodes, with envs round-robining.
         """
         self.policy.eval()
-        batch = collect_batched(self.envs, self.policy, self.train_config.eval_episodes, self.device, greedy=True)
+        batch = collect_batched(
+            self._slot_env_pool_for(self.train_config.eval_episodes),
+            self.policy,
+            self.train_config.eval_episodes,
+            self.device,
+            greedy=True,
+        )
         return batch.solve_rate
+
+    def _slot_env_pool_for(self, n: int) -> list[OpusEnv]:
+        """
+        Step lock env replicas for `n` slots, built on first use.
+        """
+        pool = self._slot_env_pool.get(n)
+        if pool is None:
+            pool = replicate_envs(self.envs, n)
+            if self.profile is not None:
+                self.profile.envs.extend(pool)
+            self._slot_env_pool[n] = pool
+        return pool
 
     def pretrain(self, batches: list[RolloutBatch], config: PretrainConfig, stage: str | None = None) -> None:
         """

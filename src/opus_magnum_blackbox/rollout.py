@@ -1,10 +1,11 @@
 """
 Rollout collection: masked-sampling episodes and teacher-forced training batches.
 
-Batchues already contain old values per step,
-so shoul be ready for PPO.
+Batches already contain old values per step,
+so should be ready for PPO.
 """
 
+import pickle
 from dataclasses import dataclass
 
 import numpy as np
@@ -235,6 +236,15 @@ def _batched_step(  # noqa: PLR0913, PLR0917
     return packet[:, 0].long().tolist(), packet[:, 1].tolist(), packet[:, 2].tolist()
 
 
+def replicate_envs(envs: list[OpusEnv], n: int) -> list[OpusEnv]:
+    """
+    `n` independent copies of the env pool.
+
+    Pickle drop shared Level cache, so steps never mutate each other's stepping state.
+    """
+    return [pickle.loads(pickle.dumps(envs[i % len(envs)])) for i in range(n)]  # noqa: S301
+
+
 def collect_batched(  # noqa: PLR0913, PLR0917
     envs: list[OpusEnv], policy: OpusPolicy, n: int, device, greedy: bool = False, gamma: float = 1.0
 ) -> RolloutBatch:
@@ -245,8 +255,13 @@ def collect_batched(  # noqa: PLR0913, PLR0917
     Each token-step issues one batched policy forward across all slots;
     slot with finished episodes is refilled from its env
     until `n` episodes are collected.
+    Slots never share stepping state:
+    pool smaller than `n` is replicated, so pass pre-replicated pools where profiling must
+    see the replicas.
     """
     device = torch.device(device)
+    if len(envs) < n:
+        envs = replicate_envs(envs, n)
     vocab_size = len(envs[0].tokenizer.vocab)
     max_dec = envs[0].tokenizer.config.max_decoder_len
     slots = [
