@@ -1,5 +1,6 @@
-def main() -> None:
-    print("Hello from opus-magnum-blackbox!")
+import sys
 
-if __name__=="__main__":
-    main()
+from opus_magnum_blackbox.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())

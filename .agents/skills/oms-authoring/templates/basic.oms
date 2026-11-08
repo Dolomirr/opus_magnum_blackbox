@@ -1,0 +1,16 @@
+
+# minimal entrance -> arm -> exit
+
+# entrance spawns basic atom
+comp 2 3 entrance atom_type=basic # id 0
+
+# exit consumes atom once it is released
+comp 3 2 exit atom_type=basic     # id 1
+
+comp 3 3 arm                      # id 2
+
+# move atom from entrance to exit
+action 2 1 rotate_cclw
+action 2 2 grab
+action 2 3 rotate_cclw
+action 2 4 release

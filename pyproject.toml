@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.14.10"
 dependencies = [
   "gymnasium>=1.4.0",
+  "lightning>=2.6.6",
   "numpy>=2.5.4",
   "opus-magnum-sym",
   "pytest>=9.2.0",
@@ -28,7 +29,7 @@ url = "https://download.pytorch.org/whl/cu134"
 explicit = true
 
 [project.scripts]
-opus-magnum-blackbox = "opus_magnum_blackbox:main"
+opus-magnum-blackbox = "opus_magnum_blackbox.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14.0"]
