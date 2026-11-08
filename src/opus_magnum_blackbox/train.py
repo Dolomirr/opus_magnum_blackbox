@@ -306,6 +306,7 @@ class Trainer:
         }
         if self.stage is not None:
             entry["stage"] = self.stage
+        entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
         print(
@@ -317,10 +318,12 @@ class Trainer:
         entry = {"iteration": self.iteration, "greedy_solve_rate": greedy_solve_rate}
         if self.stage is not None:
             entry["stage"] = self.stage
+        timestamp = datetime.now().isoformat()
+        entry["timestamp"] = timestamp
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
         print(
-            f"iter {self.iteration} | greedy solve {greedy_solve_rate:.2f} over {self.train_config.eval_episodes} episodes"
+            f"iter {self.iteration} | greedy solve {greedy_solve_rate:.2f} over {self.train_config.eval_episodes} episodes | {timestamp}"
         )
 
     def _log_pretrain(self, stage: str, epoch: int, loss: float, accuracy: float, greedy_solve_rate: float) -> None:
@@ -331,6 +334,7 @@ class Trainer:
             "token_accuracy": accuracy,
             "greedy_solve_rate": greedy_solve_rate,
         }
+        entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
         print(
