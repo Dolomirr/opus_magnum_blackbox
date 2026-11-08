@@ -8,6 +8,7 @@ upgrades algorithm; batch format and everything outside is unaffected.
 import json
 import time
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +44,9 @@ class Trainer:
         self.policy.to(self.device)  # apply Module to com. device
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.train_config.lr)
         self.iteration = 0
+        # Stage name stamped onto metrics entries while a pipeline stage runs; None outside.
+        self.stage: str | None = None
+        # Sub-second precision: trainer + resume within one second must not share a run dir.
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -51,7 +55,7 @@ class Trainer:
         return "cuda" if torch.cuda.is_available() else "cpu"
 
     def _run_name(self) -> str:
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         levels = sorted({entry.name for env in self.envs for entry in env.levels})
         return f"{stamp}-{'-'.join(levels)}"
 
@@ -148,7 +152,7 @@ class Trainer:
             solved += episode.solved
         return solved / self.train_config.eval_episodes
 
-    def pretrain(self, batches: list[RolloutBatch], config: PretrainConfig) -> None:
+    def pretrain(self, batches: list[RolloutBatch], config: PretrainConfig, stage: str | None = None) -> None:
         """
         Behavior cloning: masked NLL on known solution sequences.
 
@@ -160,6 +164,7 @@ class Trainer:
         for group in self.optimizer.param_groups:
             group["lr"] = config.lr
 
+        stage_name = stage or "pretrain"
         for epoch in range(1, config.epochs + 1):
             losses: list[float] = []
             accuracies: list[float] = []
@@ -173,7 +178,7 @@ class Trainer:
             mean_accuracy = sum(accuracies) / len(accuracies)
             if epoch % config.eval_interval == 0 or epoch == config.epochs:
                 solve_rate = self.evaluate()
-                self._log_pretrain(epoch, mean_loss, mean_accuracy, solve_rate)
+                self._log_pretrain(stage_name, epoch, mean_loss, mean_accuracy, solve_rate)
                 if solve_rate >= config.early_stop_solve_rate and mean_loss <= config.early_stop_loss:
                     break
 
@@ -296,6 +301,8 @@ class Trainer:
             "entropy": entropy,
             "wall_time": wall_time,
         }
+        if self.stage is not None:
+            entry["stage"] = self.stage
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
         print(
@@ -305,16 +312,18 @@ class Trainer:
 
     def _log_eval(self, greedy_solve_rate: float) -> None:
         entry = {"iteration": self.iteration, "greedy_solve_rate": greedy_solve_rate}
+        if self.stage is not None:
+            entry["stage"] = self.stage
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
         print(
             f"iter {self.iteration} | greedy solve {greedy_solve_rate:.2f} over {self.train_config.eval_episodes} episodes"
         )
 
-    def _log_pretrain(self, epoch: int, loss: float, accuracy: float, greedy_solve_rate: float) -> None:
+    def _log_pretrain(self, stage: str, epoch: int, loss: float, accuracy: float, greedy_solve_rate: float) -> None:
         entry = {
             "iteration": epoch,
-            "stage": "pretrain",
+            "stage": stage,
             "loss": loss,
             "token_accuracy": accuracy,
             "greedy_solve_rate": greedy_solve_rate,

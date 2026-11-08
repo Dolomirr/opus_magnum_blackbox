@@ -9,6 +9,7 @@ from opus_magnum_blackbox.corpus import TIER0_LEVELS
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.rollout import collect_episode
+from opus_magnum_blackbox.stages import load_pipeline, run_pipeline
 from opus_magnum_blackbox.train import Trainer
 
 
@@ -17,6 +18,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "train":
         _train(args)
+    elif args.command == "run":
+        _run(args)
     else:
         _eval(args)
     return 0
@@ -51,6 +54,9 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--device",                default=None)
     evaluate.add_argument("--dump-tokens", action="store_true",    help="print each episode's token sequence")
     # fmt: on
+
+    run = subparsers.add_parser("run", help="execute a stage pipeline from a TOML file")
+    run.add_argument("config", help="pipeline TOML file")
     return parser
 
 
@@ -107,6 +113,12 @@ def _train(args: argparse.Namespace) -> None:
         trainer = Trainer(OpusPolicy(env.tokenizer.config), [env], _train_config(args, TrainConfig()), reward_config)
     print(f"run directory: {trainer.run_dir}")
     trainer.run()
+
+
+def _run(args: argparse.Namespace) -> None:
+    pipeline = load_pipeline(args.config)
+    run_dir = run_pipeline(pipeline)
+    print(f"run directory: {run_dir}")
 
 
 def _eval(args: argparse.Namespace) -> None:
