@@ -33,6 +33,10 @@ om-validate file:
 train:
     uv run opus-magnum-blackbox train
 
+# Run a stage pipeline from a TOML config
+run-file file:
+    uv run opus-magnum-blackbox run {{file}}
+
 
 # ===============================
 # Tests
