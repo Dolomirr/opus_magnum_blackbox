@@ -191,3 +191,68 @@ checkpoint_interval = 10
     assert [entry["stage"] for entry in train_entries] == ["rl-a", "rl-b"]
     evals = [entry for entry in metrics if "greedy_solve_rate" in entry and entry.get("stage") == "rl-b"]
     assert [entry["iteration"] for entry in evals] == [2]
+
+
+def _resume_setup(tmp_path):
+    oms = tmp_path / "tier0_test.oms"
+    oms.write_text(TIER0_OMS.read_text())
+    path = _write_pipeline(
+        tmp_path,
+        """
+[run]
+levels = ["tier0_typed_delivery"]
+seed = 0
+device = "cpu"
+
+[[stage]]
+name = "bc"
+kind = "pretrain"
+epochs = 1
+batch_size = 32
+augment = false
+eval_interval = 1
+
+[[stage]]
+name = "rl-a"
+kind = "rl"
+iterations = 1
+episodes = 2
+
+[[stage]]
+name = "rl-b"
+kind = "rl"
+iterations = 1
+episodes = 2
+eval_interval = 1
+eval_episodes = 2
+checkpoint_interval = 10
+""",
+    )
+    pipeline = load_pipeline(path)
+    pipeline = replace(pipeline, train_config=replace(pipeline.train_config, run_dir=str(tmp_path)))
+    entries = [LevelEntry(source=make_spec(), cost_max=50, name="tier0_test", solutions=(oms,))]
+    return pipeline, entries
+
+
+def test_pipeline_resume_continues_and_refuses_when_done(tmp_path):
+    pipeline, entries = _resume_setup(tmp_path)
+
+    run_dir = run_pipeline(replace(pipeline, stages=pipeline.stages[:2]), entries=entries)
+
+    with pytest.raises(ValueError, match="no stage checkpoint"):
+        run_pipeline(pipeline, entries=entries, resume_dir=tmp_path / "missing-dir")
+
+    continued = run_pipeline(pipeline, entries=entries, resume_dir=run_dir)
+    assert continued == run_dir
+    assert (run_dir / "stage_rl-b.pt").exists()
+    assert torch.load(run_dir / "stage_rl-b.pt", weights_only=False)["iteration"] == 2
+
+    metrics = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
+    bc_entries = [entry for entry in metrics if entry.get("stage") == "bc"]
+    assert len(bc_entries) == 1  # completed stages are skipped, not re-run
+    train_entries = [entry for entry in metrics if "policy_loss" in entry]
+    assert [entry["iteration"] for entry in train_entries] == [1, 2]
+    assert [entry["stage"] for entry in train_entries] == ["rl-a", "rl-b"]
+
+    with pytest.raises(ValueError, match="already completed"):
+        run_pipeline(pipeline, entries=entries, resume_dir=run_dir)
