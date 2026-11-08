@@ -66,6 +66,37 @@ def test_batched_episodes_replay_clean(env, policy):
             assert masker.mask(tokens[:t], spec)[token]
 
 
+class _CountingEnv(OpusEnv):
+    def __init__(self, levels):
+        super().__init__(levels)
+        self.step_calls = 0
+
+    def step(self, action):
+        self.step_calls += 1
+        return super().step(action)
+
+
+def test_batched_collection_discards_no_steps(policy):
+    """
+    Every env.step belongs to a counted episode. The only accepted residue is
+    slots ordered before the finishing slot in the final token-step (one step
+    each, bounded by n-1); the Stage 1 refill policy discarded whole episodes.
+    """
+    n = 4
+    envs = []
+    for _ in range(n):
+        counting = _CountingEnv([LevelEntry(source=make_spec(), cost_max=50, name="tier0_test")])
+        counting.reset(seed=0)
+        envs.append(counting)
+    torch.manual_seed(0)
+    batch = collect_batched(envs, policy, n, "cpu")
+
+    total_tokens = int(batch.valid.sum())
+    total_steps = sum(item.step_calls for item in envs)
+    assert batch.actions.shape[0] == n
+    assert total_steps - total_tokens < n  # zero discarded episodes, bounded residue only
+
+
 def test_batch_alignment_with_policy_forward(env, policy):
     """Teacher-forced forward on the batch reproduces the per-step rollout data."""
     episodes = [collect_episode(env, policy, "cpu") for _ in range(2)]
