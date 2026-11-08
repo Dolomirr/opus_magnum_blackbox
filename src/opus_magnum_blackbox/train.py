@@ -20,7 +20,7 @@ from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfi
 from opus_magnum_blackbox.env import OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import Timer
-from opus_magnum_blackbox.rollout import RolloutBatch, collect_batch, collect_episode
+from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched
 
 
 class Trainer:
@@ -76,7 +76,7 @@ class Trainer:
 
             self.policy.eval()
             with self._timed("rollout"):
-                batch = collect_batch(
+                batch = collect_batched(
                     self.envs,
                     self.policy,
                     self.train_config.episodes_per_iteration,
@@ -182,11 +182,8 @@ class Trainer:
         Greedy solve rate over eval_episodes, with envs round-robining.
         """
         self.policy.eval()
-        solved = 0
-        for i in range(self.train_config.eval_episodes):
-            episode = collect_episode(self.envs[i % len(self.envs)], self.policy, self.device, greedy=True)
-            solved += episode.solved
-        return solved / self.train_config.eval_episodes
+        batch = collect_batched(self.envs, self.policy, self.train_config.eval_episodes, self.device, greedy=True)
+        return batch.solve_rate
 
     def pretrain(self, batches: list[RolloutBatch], config: PretrainConfig, stage: str | None = None) -> None:
         """

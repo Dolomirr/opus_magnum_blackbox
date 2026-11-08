@@ -71,12 +71,14 @@ class OpusPolicy(nn.Module):
         self.policy_head = nn.Linear(cfg.d_model, self.vocab_size)
         self.value_head = nn.Linear(cfg.d_model, 1)
 
-    def forward(
+    def forward(  # noqa: PLR0913, PLR0917
         self,
         encoder_input: torch.Tensor,
         encoder_length: torch.Tensor,
         decoder_history: torch.Tensor,
         decoder_length: torch.Tensor,
+        encoder_memory: torch.Tensor | None = None,
+        encoder_pad_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Per-position logits `[B, T + 1, vocab_size]` and values `[B, T + 1]`.
@@ -90,6 +92,9 @@ class OpusPolicy(nn.Module):
             encoder_length:   [B] true spec token counts
             decoder_history:  [B, T] padded action token ids
             decoder_length:   [B] tokens emitted so far
+            encoder_memory:   [B, E, d_model] precomputed `encode` output;
+                              when given, encoder_input/encoder_length are unused
+            encoder_pad_mask: [B, E] padding mask matching `encode` (True on padding)
 
         Returns:
             Tuple:
@@ -97,29 +102,39 @@ class OpusPolicy(nn.Module):
                 - [B, T + 1]
 
         """
-        enc_width = encoder_input.shape[1]
         dec_width = decoder_history.shape[1] + 1
-        device = encoder_input.device
-        enc_positions = torch.arange(enc_width, device=device)
-        dec_positions = torch.arange(dec_width, device=device)
-
-        enc_pad = enc_positions.unsqueeze(0) >= encoder_length.unsqueeze(1)
-        memory = self.encoder(self.embed(encoder_input) + self.encoder_pos(enc_positions), src_key_padding_mask=enc_pad)
+        device = decoder_history.device
+        if encoder_memory is None:
+            encoder_memory, encoder_pad_mask = self.encode(encoder_input, encoder_length)
 
         # BOS-shift: position 0 holds BOS, position i holds history token i-1.
         bos = torch.full((decoder_history.shape[0], 1), self.vocab_size, dtype=torch.long, device=device)
         dec_input = torch.cat((bos, decoder_history), dim=1)
         # Position i is a valid input through i = decoder_length (holds a_{t-1}); beyond that is padding.
+        dec_positions = torch.arange(dec_width, device=device)
         dec_pad = dec_positions.unsqueeze(0) > decoder_length.unsqueeze(1)
         causal = torch.triu(torch.ones(dec_width, dec_width, dtype=torch.bool, device=device), diagonal=1)
         hidden = self.decoder(
             self.embed(dec_input) + self.decoder_pos(dec_positions),
-            memory,
+            encoder_memory,
             tgt_mask=causal,
             tgt_key_padding_mask=dec_pad,
-            memory_key_padding_mask=enc_pad,
+            memory_key_padding_mask=encoder_pad_mask,
         )
         return self.policy_head(hidden), self.value_head(hidden).squeeze(-1)
+
+    def encode(self, encoder_input: torch.Tensor, encoder_length: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encoder memory `[B, E, d_model]` plus padding mask `[B, E]` (True on padding).
+
+        Pure function of the spec tokens: reusable across decoder steps while
+        the spec stays fixed (see `forward`'s encoder_memory argument).
+        """
+        device = encoder_input.device
+        enc_positions = torch.arange(encoder_input.shape[1], device=device)
+        enc_pad = enc_positions.unsqueeze(0) >= encoder_length.unsqueeze(1)
+        memory = self.encoder(self.embed(encoder_input) + self.encoder_pos(enc_positions), src_key_padding_mask=enc_pad)
+        return memory, enc_pad
 
     def masked_distribution(self, logits: torch.Tensor, action_mask: torch.Tensor) -> torch.distributions.Categorical:
         """
