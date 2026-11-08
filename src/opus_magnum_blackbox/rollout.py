@@ -9,8 +9,11 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from opus_magnum_sym import LevelSpec
 
+from opus_magnum_blackbox.codec import OpusTokenizer
 from opus_magnum_blackbox.env import OpusEnv
+from opus_magnum_blackbox.masking import ActionMasker
 from opus_magnum_blackbox.model import OpusPolicy
 
 
@@ -171,4 +174,52 @@ def build_batch(episodes: list[Episode], pad_id: int) -> RolloutBatch:
         mean_return=sum(e.returns[0] for e in episodes) / batch_size,
         solve_rate=sum(e.solved for e in episodes) / batch_size,
         mean_length=sum(len(e.tokens) for e in episodes) / batch_size,
+    )
+
+
+def build_supervised(
+    sequences: list[list[int]],
+    spec: LevelSpec,
+    tokenizer: OpusTokenizer,
+    masker: ActionMasker,
+) -> RolloutBatch:
+    """
+    Stack static solution sequences into the `RolloutBatch` format.
+
+    All rows share the given spec;
+    per-position masks are recomputed over each prefix,
+    reward-derived fields are zeroed.
+    """
+    vocab = tokenizer.vocab
+    batch_size = len(sequences)
+    max_len = max(len(tokens) for tokens in sequences)
+
+    padded, encoder_length = tokenizer.encode_level_spec(spec)
+    encoder_input = torch.from_numpy(padded).unsqueeze(0).repeat(batch_size, 1)
+    encoder_length = torch.full((batch_size,), encoder_length, dtype=torch.long)
+    decoder_length = torch.tensor([len(tokens) for tokens in sequences], dtype=torch.long)
+
+    actions = torch.full((batch_size, max_len), vocab.pad_id, dtype=torch.long)
+    action_masks = torch.zeros((batch_size, max_len, len(vocab)), dtype=torch.bool)
+    valid = torch.zeros((batch_size, max_len), dtype=torch.bool)
+    for i, tokens in enumerate(sequences):
+        actions[i, : len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+        for t in range(len(tokens)):
+            action_masks[i, t] = torch.from_numpy(masker.mask(tokens[:t], spec))
+        valid[i, : len(tokens)] = True
+
+    zeros = torch.zeros(batch_size, max_len)
+    return RolloutBatch(
+        encoder_input=encoder_input,
+        encoder_length=encoder_length,
+        actions=actions,
+        decoder_length=decoder_length,
+        action_masks=action_masks,
+        old_logprobs=zeros,
+        old_values=zeros,
+        returns=zeros,
+        valid=valid,
+        mean_return=0.0,
+        solve_rate=0.0,
+        mean_length=sum(len(tokens) for tokens in sequences) / batch_size,
     )

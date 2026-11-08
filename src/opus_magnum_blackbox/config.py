@@ -85,6 +85,24 @@ class TrainConfig:
     # fmt: on
 
 
+@dataclass(frozen=True)
+class PretrainConfig:
+    """
+    Behavior-cloning (bootstrapping solution) stage hyperparameters.
+    """
+
+    # fmt: off
+    epochs                : int   = 300
+    batch_size            : int   = 32
+    lr                    : float = 1e-3
+    augment               : bool  = True
+    max_variants          : int   = 16
+    eval_interval         : int   = 10
+    early_stop_solve_rate : float = 1.0
+    early_stop_loss       : float = 1e-3
+    # fmt: on
+
+
 # fmt: off
 @dataclass(frozen=True)
 class RewardConfig:

@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from opus_magnum_blackbox.config import ModelConfig, RewardConfig, TrainConfig
+from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfig, TrainConfig
 from opus_magnum_blackbox.env import OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.rollout import RolloutBatch, collect_batch, collect_episode
@@ -148,6 +148,74 @@ class Trainer:
             solved += episode.solved
         return solved / self.train_config.eval_episodes
 
+    def pretrain(self, batches: list[RolloutBatch], config: PretrainConfig) -> None:
+        """
+        Behavior cloning: masked NLL on known solution sequences.
+
+        Each batch holds one level's supervised rows;
+        rows are reshuffled every epoch and sliced into `config.batch_size` steps.
+        Early-stops when greedy solve rate and mean loss both reach their targets.
+        """
+        previous_lr = self.optimizer.param_groups[0]["lr"]
+        for group in self.optimizer.param_groups:
+            group["lr"] = config.lr
+
+        for epoch in range(1, config.epochs + 1):
+            losses: list[float] = []
+            accuracies: list[float] = []
+            for batch in batches:
+                order = torch.randperm(len(batch.decoder_length))
+                for start in range(0, len(order), config.batch_size):
+                    loss, accuracy = self._bc_update(batch, order[start : start + config.batch_size])
+                    losses.append(loss)
+                    accuracies.append(accuracy)
+            mean_loss = sum(losses) / len(losses)
+            mean_accuracy = sum(accuracies) / len(accuracies)
+            if epoch % config.eval_interval == 0 or epoch == config.epochs:
+                solve_rate = self.evaluate()
+                self._log_pretrain(epoch, mean_loss, mean_accuracy, solve_rate)
+                if solve_rate >= config.early_stop_solve_rate and mean_loss <= config.early_stop_loss:
+                    break
+
+        self.save_checkpoint()
+        for group in self.optimizer.param_groups:
+            group["lr"] = previous_lr
+
+    def _bc_update(self, batch: RolloutBatch, rows: torch.Tensor) -> tuple[float, float]:
+        """
+        One gradient step over given batch rows.
+
+        Returns loss and token accuracy, both averaged over valid positions.
+        """
+        self.policy.train()
+
+        # fmt: off
+        encoder_input  = batch.encoder_input[rows].to(self.device)
+        encoder_length = batch.encoder_length[rows].to(self.device)
+        actions        = batch.actions[rows].to(self.device)
+        decoder_length = batch.decoder_length[rows].to(self.device)
+        action_masks   = batch.action_masks[rows].to(self.device)
+        valid          = batch.valid[rows].to(self.device)
+        # fmt: on
+
+        # Padded steps have all-False masks;
+        # make PAD valid there to preserve proper distribution.
+        # Those are excluded from loss by `valid`.
+        action_masks = action_masks.clone()
+        action_masks[~valid, self.pad_id] = True
+
+        logits, _ = self.policy(encoder_input, encoder_length, actions, decoder_length)
+        dist = self.policy.masked_distribution(logits[:, :-1], action_masks)
+        logprobs = dist.log_prob(actions)
+        accuracy = dist.probs.argmax(dim=-1)[valid].eq(actions[valid]).float().mean()
+
+        loss = -logprobs[valid].mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), self.train_config.grad_clip)
+        self.optimizer.step()
+        return loss.item(), accuracy.item()
+
     def save_checkpoint(self, numbered: bool = False) -> Path:
         """
         Full checkpoint: Model, optimizer, iteration, rng state;
@@ -241,4 +309,19 @@ class Trainer:
             file.write(json.dumps(entry) + "\n")
         print(
             f"iter {self.iteration} | greedy solve {greedy_solve_rate:.2f} over {self.train_config.eval_episodes} episodes"
+        )
+
+    def _log_pretrain(self, epoch: int, loss: float, accuracy: float, greedy_solve_rate: float) -> None:
+        entry = {
+            "iteration": epoch,
+            "stage": "pretrain",
+            "loss": loss,
+            "token_accuracy": accuracy,
+            "greedy_solve_rate": greedy_solve_rate,
+        }
+        with (self.run_dir / "metrics.jsonl").open("a") as file:
+            file.write(json.dumps(entry) + "\n")
+        print(
+            f"pretrain epoch {epoch} | loss {loss:.4f} | acc {accuracy:.3f} "
+            f"| greedy solve {greedy_solve_rate:.2f} over {self.train_config.eval_episodes} episodes"
         )
