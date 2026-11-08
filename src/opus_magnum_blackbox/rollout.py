@@ -252,9 +252,12 @@ def collect_batched(  # noqa: PLR0913, PLR0917
     N episodes over `n` lockstep slots,
     slot i bound to `envs[i % len(envs)]`.
 
-    Each token-step issues one batched policy forward across all slots;
-    slot with finished episodes is refilled from its env
-    until `n` episodes are collected.
+    Each token-step issues one batched policy forward across the active slots.
+
+    Finished slot refills only while "demand" is begger then other slots capacity,
+    otherwise retires from active set;
+    every stepped token belongs to a counted episode, minus the accepted residue of slots
+    ordered before the finishing slot in the final token-step.
     Slots never share stepping state:
     pool smaller than `n` is replicated, so pass pre-replicated pools where profiling must
     see the replicas.
@@ -282,6 +285,7 @@ def collect_batched(  # noqa: PLR0913, PLR0917
         slot.reset()
 
     finished: list[Episode] = []
+    active = list(slots)  # active count tracks remaining demand: no discarded replacement episodes
 
     # Staging row layout: decoder_history | decoder_length | action_mask.
     staging = torch.empty((n, max_dec + 1 + vocab_size), dtype=torch.int64, pin_memory=device.type == "cuda")
@@ -290,24 +294,25 @@ def collect_batched(  # noqa: PLR0913, PLR0917
 
     with torch.no_grad():
         while len(finished) < n:
-            shared = _shared_encoder_memory(policy, slots, device, memory_cache)
+            shared = _shared_encoder_memory(policy, active, device, memory_cache)
             if shared is None:
-                encoder_input = torch.from_numpy(np.stack([slot.encoder_input for slot in slots])).to(device)
-                encoder_length = torch.tensor([slot.encoder_length for slot in slots], dtype=torch.long, device=device)
+                encoder_input = torch.from_numpy(np.stack([slot.encoder_input for slot in active])).to(device)
+                encoder_length = torch.tensor([slot.encoder_length for slot in active], dtype=torch.long, device=device)
                 memory, memory_pad_mask = policy.encode(encoder_input, encoder_length)
             else:
                 memory, memory_pad_mask = shared
 
-            for row, slot in enumerate(slots):
+            for row, slot in enumerate(active):
                 obs = slot.obs
                 staging_rows[row, :max_dec] = obs["decoder_history"]
                 staging_rows[row, max_dec] = obs["decoder_length"]
                 staging_rows[row, max_dec + 1 :] = obs["action_mask"]
             actions, logprobs, values = _batched_step(
-                policy, staging, len(slots), max_dec, device, memory, memory_pad_mask, greedy
+                policy, staging, len(active), max_dec, device, memory, memory_pad_mask, greedy
             )
 
-            for slot, action, logprob, value in zip(slots, actions, logprobs, values, strict=True):
+            # Snapshot: finishing slots may retire from `active` below.
+            for slot, action, logprob, value in list(zip(active, actions, logprobs, values, strict=True)):
                 mask = slot.obs["action_mask"].astype(bool)
                 slot.obs, reward, terminated, truncated, info = slot.env.step(action)
                 slot.tokens.append(action)
@@ -319,7 +324,11 @@ def collect_batched(  # noqa: PLR0913, PLR0917
                     finished.append(slot.episode(terminated, info, gamma))
                     if len(finished) == n:
                         break
-                    slot.reset()
+                    # Refill only while demand exceeds the other slots' capacity; else retire.
+                    if n - len(finished) > len(active) - 1:
+                        slot.reset()
+                    else:
+                        active.remove(slot)
 
     pad_id = envs[0].tokenizer.vocab.pad_id
     return build_batch(finished, pad_id)
