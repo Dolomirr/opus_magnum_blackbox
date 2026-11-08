@@ -34,6 +34,7 @@ from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfi
 from opus_magnum_blackbox.corpus import TIER0_LEVELS
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
+from opus_magnum_blackbox.profile import ProfiledEnv, ProfiledEnvs
 from opus_magnum_blackbox.rollout import RolloutBatch, build_supervised
 from opus_magnum_blackbox.solutions import augment, load_solutions
 from opus_magnum_blackbox.train import Trainer
@@ -61,6 +62,7 @@ class PipelineConfig:
     levels: tuple[str, ...]
     train_config: TrainConfig
     stages: tuple[PretrainStage | RLStage, ...]
+    profile: bool = False
 
 
 def load_pipeline(path: str | Path) -> PipelineConfig:
@@ -70,9 +72,9 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
     with Path(path).open("rb") as file:
         data = tomllib.load(file)
 
-    unknown_tables = set(data) - {"run", "stage"}
+    unknown_tables = set(data) - {"run", "stage", "profile"}
     if unknown_tables:
-        raise ValueError(f"unknown config tables: {sorted(unknown_tables)}; expected [run] and [[stage]]")
+        raise ValueError(f"unknown config tables: {sorted(unknown_tables)}; expected [run], [profile] and [[stage]]")
 
     run = data.get("run")
     if not isinstance(run, dict) or not run.get("levels"):
@@ -82,13 +84,23 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
     if unknown_run_keys:
         raise ValueError(f"unknown [run] keys: {sorted(unknown_run_keys)}; known keys: levels, seed, device")
 
+    profile = data.get("profile", {})
+    unknown_profile_keys = set(profile) - {"enabled"}
+    if unknown_profile_keys:
+        raise ValueError(f"unknown [profile] keys: {sorted(unknown_profile_keys)}; known keys: enabled")
+
     train_config = replace(TrainConfig(), seed=run.get("seed", 0), device=run.get("device", ""))
 
     stages = data.get("stage")
     if not stages:
         raise ValueError("config must define at least one [[stage]]")
     parsed = tuple(_parse_stage(raw, train_config) for raw in stages)
-    return PipelineConfig(levels=tuple(run["levels"]), train_config=train_config, stages=parsed)
+    return PipelineConfig(
+        levels=tuple(run["levels"]),
+        train_config=train_config,
+        stages=parsed,
+        profile=bool(profile.get("enabled", False)),
+    )
 
 
 def _parse_stage(raw: dict, run_config: TrainConfig) -> PretrainStage | RLStage:
@@ -154,9 +166,16 @@ def run_pipeline(
 
     `entries` overrides corpus resolution (tests pass in-memory specs).
     `resume_dir` continues an existing run (see module docstring).
+    `config.profile` swaps in `ProfiledEnv`; RL stages then also write
+    `profile.jsonl` and the CLI prints the attribution summary afterwards.
     """
     entries = entries if entries is not None else resolve_entries(list(config.levels))
-    envs = [OpusEnv([entry]) for entry in entries]
+    if config.profile:
+        profiled: list[ProfiledEnv] = [ProfiledEnv([entry]) for entry in entries]
+        envs: list[OpusEnv] = list(profiled)
+    else:
+        profiled = []
+        envs = [OpusEnv([entry]) for entry in entries]
     if resume_dir is None:
         torch.manual_seed(config.train_config.seed)
         trainer = Trainer(OpusPolicy(envs[0].tokenizer.config, ModelConfig()), envs, config.train_config)
@@ -164,6 +183,14 @@ def run_pipeline(
         start = 0
     else:
         trainer, start = _resume_trainer(config, envs, Path(resume_dir))
+        # Resumes restore the checkpoint's stored config; the new run-level one wins.
+        trainer.train_config = replace(
+            trainer.train_config,
+            run_dir=str(trainer.run_dir),
+            seed=config.train_config.seed,
+            device=config.train_config.device,
+        )
+    trainer.profile = ProfiledEnvs(profiled) if profiled else None
 
     for stage in config.stages[start:]:
         if isinstance(stage, PretrainStage):
@@ -195,12 +222,6 @@ def _resume_trainer(config: PipelineConfig, envs: list[OpusEnv], resume_dir: Pat
     # Current config wins for run-level values: writes land in the resumed dir,
     # seed/device may have changed since the checkpoint.
     trainer.run_dir = resume_dir
-    trainer.train_config = replace(
-        trainer.train_config,
-        run_dir=str(resume_dir),
-        seed=config.train_config.seed,
-        device=config.train_config.device,
-    )
     return trainer, start + 1
 
 

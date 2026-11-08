@@ -8,6 +8,7 @@ from opus_magnum_blackbox.config import ModelConfig, RewardConfig, TrainConfig
 from opus_magnum_blackbox.corpus import TIER0_LEVELS
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
+from opus_magnum_blackbox.profile import format_summary, summarize
 from opus_magnum_blackbox.rollout import collect_episode
 from opus_magnum_blackbox.stages import load_pipeline, run_pipeline
 from opus_magnum_blackbox.train import Trainer
@@ -132,6 +133,9 @@ def _run(args: argparse.Namespace) -> None:
     pipeline = load_pipeline(args.config)
     run_dir = run_pipeline(pipeline, resume_dir=args.resume)
     print(f"run directory: {run_dir}")
+    if (run_dir / "profile.jsonl").exists():
+        report = summarize(run_dir / "profile.jsonl")
+        print(format_summary(report))
 
 
 def _eval(args: argparse.Namespace) -> None:

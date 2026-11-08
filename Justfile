@@ -37,6 +37,10 @@ train:
 run-file file:
     uv run opus-magnum-blackbox run {{file}}
 
+# Profile run: per-iteration sim vs model attribution (prints summary table)
+profile-config config="configs/profile_tier0.toml":
+    uv run opus-magnum-blackbox run {{config}}
+
 
 # ===============================
 # Tests

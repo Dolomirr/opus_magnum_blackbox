@@ -244,8 +244,7 @@ def _boundary(  # noqa: PLR0911
             return GrammarError(pos, f"program references unplaced arm handle {handle}")
         return None
     if token == vocab.special_id("[END_LAYOUT]"):
-        model = spec_model(spec)
-        if any(state.slot_use.get(slot, 0) < required for slot, required in enumerate(model.required)):
+        if any(state.slot_use.get(slot, 0) < required for slot, required in enumerate(spec_model(spec).required)):
             return GrammarError(pos, "[END_LAYOUT] before every entrypoint shape was placed")
         return replace(state, phase=Phase.LAYOUT_DONE)
     if vocab.is_in(token, "entry_slot"):
