@@ -48,6 +48,24 @@ def test_collected_actions_are_mask_valid(env, policy):
             assert mask[token]
 
 
+def test_batched_episodes_replay_clean(env, policy):
+    """
+    Lockstep slots never share state: episodes replay valid under the stateless
+    masker and end on [SUBMIT] or at the truncation cap.
+    """
+    batch = collect_batched([env], policy, 4, "cpu")
+    spec = env.levels[0].source
+    masker = env.masker
+    submit_id = env.tokenizer.vocab.special_id("[SUBMIT]")
+    max_dec = env.tokenizer.config.max_decoder_len
+    for i in range(4):
+        length = int(batch.decoder_length[i])
+        tokens = batch.actions[i, :length].tolist()
+        assert tokens[-1] == submit_id or length == max_dec
+        for t, token in enumerate(tokens):
+            assert masker.mask(tokens[:t], spec)[token]
+
+
 def test_batch_alignment_with_policy_forward(env, policy):
     """Teacher-forced forward on the batch reproduces the per-step rollout data."""
     episodes = [collect_episode(env, policy, "cpu") for _ in range(2)]
