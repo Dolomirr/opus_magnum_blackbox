@@ -7,6 +7,7 @@ upgrades algorithm; batch format and everything outside is unaffected.
 
 import json
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from torch import nn
 from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfig, TrainConfig
 from opus_magnum_blackbox.env import OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
+from opus_magnum_blackbox.profile import Timer
 from opus_magnum_blackbox.rollout import RolloutBatch, collect_batch, collect_episode
 
 
@@ -46,6 +48,8 @@ class Trainer:
         self.iteration = 0
         # Stage name stamped onto metrics entries while a pipeline stage runs; None outside.
         self.stage: str | None = None
+        # Optional `profile.ProfiledEnvs`; when set, `run` writes `profile.jsonl`.
+        self.profile = None
         # Sub-second precision: trainer + resume within one second must not share a run dir.
         # The directory is created lazily on the first write, so resumes can target an existing one.
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
@@ -71,18 +75,24 @@ class Trainer:
             started = time.time()
 
             self.policy.eval()
-            batch = collect_batch(
-                self.envs,
-                self.policy,
-                self.train_config.episodes_per_iteration,
-                self.device,
-                gamma=self.train_config.gamma,
-            )
-            policy_loss, value_loss, entropy = self.update(batch)
-            self._log_metrics(batch, policy_loss, value_loss, entropy, time.time() - started)
+            with self._timed("rollout"):
+                batch = collect_batch(
+                    self.envs,
+                    self.policy,
+                    self.train_config.episodes_per_iteration,
+                    self.device,
+                    gamma=self.train_config.gamma,
+                )
+            with self._timed("update"):
+                policy_loss, value_loss, entropy = self.update(batch)
+            iteration_wall = time.time() - started
+            self._log_metrics(batch, policy_loss, value_loss, entropy, iteration_wall)
+            self._log_profile(batch, iteration_wall)
 
             if self.iteration % self.train_config.eval_interval == 0:
-                self._log_eval(self.evaluate())
+                with self._timed("eval"):
+                    solve_rate = self.evaluate()
+                self._log_eval(solve_rate)
 
             if self.iteration % self.train_config.checkpoint_interval == 0:
                 self.save_checkpoint(numbered=True)
@@ -141,6 +151,31 @@ class Trainer:
         nn.utils.clip_grad_norm_(self.policy.parameters(), self.train_config.grad_clip)
         self.optimizer.step()
         return policy_loss.item(), value_loss.item(), entropy.item()
+
+    def _timed(self, name: str):
+        """
+        Loop-phase timer; a no-op context when no profiler is attached.
+        """
+        return Timer(self.profile.loop, name) if self.profile is not None else nullcontext()
+
+    def _log_profile(self, batch: RolloutBatch, iteration_wall: float) -> None:
+        """
+        Append the iteration's phase attribution to `profile.jsonl`.
+        """
+        if self.profile is None:
+            return
+        payload = self.profile.snapshot(
+            kind="iteration",
+            iteration=self.iteration,
+            iteration_wall=iteration_wall,
+            sim={
+                "episodes": len(batch.decoder_length),
+                "steps": int(batch.valid.sum().item()),
+                "solve_rate": batch.solve_rate,
+                "mean_length": batch.mean_length,
+            },
+        )
+        self.profile.log(self.run_dir / "profile.jsonl", payload)
 
     def evaluate(self) -> float:
         """
