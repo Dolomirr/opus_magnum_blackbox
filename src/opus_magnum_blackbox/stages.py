@@ -13,6 +13,11 @@ Config schema:
 Stages execute in order against one `Trainer` (one run dir).
 Each rl stage's `iterations` is absolute target over the global iteration counter,
 and every stage writes `stage_<name>.pt` with the usual checkpoint payload.
+
+`run_pipeline(..., resume_dir=<run dir>)` continues an existing run:
+the latest `stage_<name>.pt` matching config stage is restored,
+that stage and all earlier ones are skipped,
+and remaining stages run against the restored trainer, writing into the same run dir.
 """
 
 # here we go again...
@@ -139,19 +144,28 @@ def resolve_entries(names: list[str]) -> list[LevelEntry]:
     return [registry[name] for name in names]
 
 
-def run_pipeline(config: PipelineConfig, entries: list[LevelEntry] | None = None) -> Path:
+def run_pipeline(
+    config: PipelineConfig,
+    entries: list[LevelEntry] | None = None,
+    resume_dir: str | Path | None = None,
+) -> Path:
     """
     Execute all stages in order against one Trainer; returns the run directory.
 
     `entries` overrides corpus resolution (tests pass in-memory specs).
+    `resume_dir` continues an existing run (see module docstring).
     """
     entries = entries if entries is not None else resolve_entries(list(config.levels))
     envs = [OpusEnv([entry]) for entry in entries]
-    torch.manual_seed(config.train_config.seed)
-    trainer = Trainer(OpusPolicy(envs[0].tokenizer.config, ModelConfig()), envs, config.train_config)
-    trainer._seed()
+    if resume_dir is None:
+        torch.manual_seed(config.train_config.seed)
+        trainer = Trainer(OpusPolicy(envs[0].tokenizer.config, ModelConfig()), envs, config.train_config)
+        trainer._seed()
+        start = 0
+    else:
+        trainer, start = _resume_trainer(config, envs, Path(resume_dir))
 
-    for stage in config.stages:
+    for stage in config.stages[start:]:
         if isinstance(stage, PretrainStage):
             _run_pretrain_stage(trainer, entries, stage, seed=config.train_config.seed)
         else:
@@ -159,6 +173,35 @@ def run_pipeline(config: PipelineConfig, entries: list[LevelEntry] | None = None
         latest = trainer.save_checkpoint()
         shutil.copyfile(latest, trainer.run_dir / f"stage_{stage.name}.pt")
     return trainer.run_dir
+
+
+def _resume_trainer(config: PipelineConfig, envs: list[OpusEnv], resume_dir: Path) -> tuple[Trainer, int]:
+    """
+    Trainer restored from latest stage checkpoint in `resume_dir`,
+    as well as index of the first stage that has not completed yet.
+    """
+    start = max(
+        (index for index, stage in enumerate(config.stages) if (resume_dir / f"stage_{stage.name}.pt").exists()),
+        default=-1,
+    )
+    if start < 0:
+        expected = ", ".join(f"stage_{stage.name}.pt" for stage in config.stages)
+        raise ValueError(f"resume: no stage checkpoint found in {resume_dir}; expected one of: {expected}")
+    if start == len(config.stages) - 1:
+        raise ValueError(f"resume: every stage of the config already completed in {resume_dir}")
+
+    checkpoint = resume_dir / f"stage_{config.stages[start].name}.pt"
+    trainer = Trainer.resume(checkpoint, envs)
+    # Current config wins for run-level values: writes land in the resumed dir,
+    # seed/device may have changed since the checkpoint.
+    trainer.run_dir = resume_dir
+    trainer.train_config = replace(
+        trainer.train_config,
+        run_dir=str(resume_dir),
+        seed=config.train_config.seed,
+        device=config.train_config.device,
+    )
+    return trainer, start + 1
 
 
 def _run_pretrain_stage(trainer: Trainer, entries: list[LevelEntry], stage: PretrainStage, seed: int) -> None:

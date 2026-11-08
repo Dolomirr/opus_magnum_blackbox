@@ -60,6 +60,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="execute a stage pipeline from a TOML file")
     run.add_argument("config", help="pipeline TOML file")
+    run.add_argument(
+        "--resume",
+        default=None,
+        help="existing run dir with stage_<name>.pt checkpoints; stages already completed there are skipped",
+    )
     return parser
 
 
@@ -125,7 +130,7 @@ def _train(args: argparse.Namespace) -> None:
 
 def _run(args: argparse.Namespace) -> None:
     pipeline = load_pipeline(args.config)
-    run_dir = run_pipeline(pipeline)
+    run_dir = run_pipeline(pipeline, resume_dir=args.resume)
     print(f"run directory: {run_dir}")
 
 

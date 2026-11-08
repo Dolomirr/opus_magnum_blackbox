@@ -47,8 +47,8 @@ class Trainer:
         # Stage name stamped onto metrics entries while a pipeline stage runs; None outside.
         self.stage: str | None = None
         # Sub-second precision: trainer + resume within one second must not share a run dir.
+        # The directory is created lazily on the first write, so resumes can target an existing one.
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
-        self.run_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _auto_device() -> str:
@@ -63,6 +63,7 @@ class Trainer:
         """
         Collect, update, log, evaluate and checkpoint until the iteration target is reached.
         """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         if self.iteration == 0:
             self._seed()
         while self.iteration < self.train_config.iterations:
@@ -160,6 +161,7 @@ class Trainer:
         rows are reshuffled every epoch and sliced into `config.batch_size` steps.
         Early-stops when greedy solve rate and mean loss both reach their targets.
         """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         previous_lr = self.optimizer.param_groups[0]["lr"]
         for group in self.optimizer.param_groups:
             group["lr"] = config.lr
@@ -226,6 +228,7 @@ class Trainer:
         Full checkpoint: Model, optimizer, iteration, rng state;
         exact-resume payload in latest.pt.
         """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         # fmt: off
         payload = {
             "iteration"       : self.iteration,
