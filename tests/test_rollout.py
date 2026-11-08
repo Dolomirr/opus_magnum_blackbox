@@ -7,7 +7,13 @@ from conftest import make_spec
 from opus_magnum_blackbox.config import ModelConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
-from opus_magnum_blackbox.rollout import build_batch, collect_batch, collect_episode, discounted_returns
+from opus_magnum_blackbox.rollout import (
+    build_batch,
+    collect_batch,
+    collect_batched,
+    collect_episode,
+    discounted_returns,
+)
 
 TINY = ModelConfig(d_model=32, nhead=4, encoder_layers=1, decoder_layers=1, dim_feedforward=64)
 
@@ -70,8 +76,9 @@ def test_batch_alignment_with_policy_forward(env, policy):
         assert torch.allclose(values[i, :length], torch.tensor(episode.values), atol=1e-5)
 
 
-def test_collect_batch_shape_and_stats(env, policy):
-    batch = collect_batch([env], policy, 3, "cpu")
+@pytest.mark.parametrize("collector", [collect_batch, collect_batched])
+def test_collect_batch_shape_and_stats(env, policy, collector):
+    batch = collector([env], policy, 3, "cpu")
     assert batch.actions.shape[0] == 3
     assert batch.mean_length == pytest.approx(float(batch.decoder_length.float().mean()))
     assert 0.0 <= batch.solve_rate <= 1.0
@@ -85,9 +92,14 @@ def test_collect_batch_shape_and_stats(env, policy):
 def test_seeded_determinism(env, policy):
     env.reset(seed=0)
     torch.manual_seed(0)
-    first = collect_episode(env, policy, "cpu")
+    first = collect_batched([env], policy, 3, "cpu")
+    env.reset(seed=0)
     torch.manual_seed(0)
-    second = collect_episode(env, policy, "cpu")
-    assert first.tokens == second.tokens
-    assert first.logprobs == second.logprobs
-    assert first.rewards == second.rewards
+    second = collect_batched([env], policy, 3, "cpu")
+    assert torch.equal(first.actions, second.actions)
+    assert torch.equal(first.old_logprobs, second.old_logprobs)
+    assert torch.equal(first.old_values, second.old_values)
+    assert torch.equal(first.returns, second.returns)
+    assert first.mean_return == second.mean_return
+    assert first.solve_rate == second.solve_rate
+    assert first.mean_length == second.mean_length
