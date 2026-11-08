@@ -1,0 +1,22 @@
+# Reference level solution demo: delivery through straight-2 entrance and exit pair.
+#
+# Typed delivery solution: place the typed entrypoints, then swing the spawned
+# water+salt molecule onto the typed exit.
+#
+# This is solution.
+# The level defined in `examples/27_level_typed.oml`
+
+# Solution-placed entrypoints (the level runs unfixed).
+place entrance_typed 2 3 rotation=1   # ids 0, 1
+place exit_typed 3 2 rotation=2       # ids 2, 3
+
+# Arm at (3,3): rotation 0 -> hand at (2,4).
+place arm 3 3                         # id 4
+
+# Grab the molecule, move it four steps onto the exit, then release.
+action 4 1 grab
+action 4 2 rotate_clw
+action 4 3 rotate_clw
+action 4 4 rotate_clw
+action 4 5 rotate_clw
+action 4 6 release
