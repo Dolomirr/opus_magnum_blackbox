@@ -1,0 +1,39 @@
+# Full tier-0 overfit pipeline (bc + both rl stages) with per-iteration profiling.
+# Same as overfit_tier0.toml plus [profile] enabled; run via:
+#   just run-file configs/overfit_tier0_profile.toml
+
+[run]
+levels          = ["tier0_typed_delivery"]
+seed            = 0
+device          = "cuda" # force cuda
+
+[profile]
+enabled         = true
+
+[[stage]]
+name            = "bc"
+kind            = "pretrain"
+epochs          = 300
+lr              = 1e-3
+batch_size      = 32
+augment         = true
+early_stop_loss = 0.1
+
+[[stage]]
+name            = "rl-consolidate"
+kind            = "rl"
+iterations      = 200
+episodes        = 32
+lr              = 1e-4
+entropy_coef    = 0.002
+
+[[stage]]
+name            = "rl-optimise"
+kind            = "rl"
+iterations      = 500
+episodes        = 32
+lr              = 1e-4
+entropy_coef    = 0.005
+alpha           = 0.2    # not actually used in this scenario
+beta            = 0.2    # not actually used in this scenario
+gamma           = 0.2    # not actually used in this scenario
