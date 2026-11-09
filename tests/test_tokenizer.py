@@ -4,7 +4,7 @@ from conftest import known_solution_tokens
 from opus_magnum_sym import Hex, Level
 from opus_magnum_sym.levels.result import LevelStatus
 
-from opus_magnum_blackbox.codec import decode_solution
+from opus_magnum_blackbox.codec import apply_solution, decode_solution, solution_to_oms
 from opus_magnum_blackbox.grammar import Solution
 
 
@@ -105,3 +105,40 @@ def test_decode_static_failure_on_illegal_placement(spec, tokenizer):
     report = tokenizer.decode_solution_to_level(tokens, spec, level)
     assert not report.ok
     assert report.error_token_pos == 9
+
+
+KNOWN_SOLUTION_OMS = """\
+place entrance_typed 2 3 rotation=1
+place exit_typed 3 2 rotation=2
+place arm 3 3
+
+action 4 1 grab
+action 4 2 rotate_clw
+action 4 3 rotate_clw
+action 4 4 rotate_clw
+action 4 5 rotate_clw
+action 4 6 release
+"""
+
+
+def test_solution_to_oms_renders_reference_text(spec, tokenizer):
+    sol = decode_solution(known_solution_tokens(tokenizer.vocab), spec, tokenizer.vocab)
+    level = Level(spec)
+    report = apply_solution(sol, spec, level)
+    assert report.ok, report.error
+    assert solution_to_oms(sol, report.handles, spec) == KNOWN_SOLUTION_OMS
+
+
+def test_solution_to_oms_round_trips_through_load_solution(spec, tokenizer, tmp_path):
+    sol = decode_solution(known_solution_tokens(tokenizer.vocab), spec, tokenizer.vocab)
+    level = Level(spec)
+    report = apply_solution(sol, spec, level)
+    assert report.ok, report.error
+
+    path = tmp_path / "generated.oms"
+    path.write_text(solution_to_oms(sol, report.handles, spec))
+    fresh = Level(spec)
+    fresh.load_solution(path)
+    result = fresh.run()
+    assert result.status is LevelStatus.COMPLETED
+    assert result.solved
