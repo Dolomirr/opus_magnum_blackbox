@@ -242,7 +242,7 @@ def replicate_envs(envs: list[OpusEnv], n: int) -> list[OpusEnv]:
 
     Pickle drop shared Level cache, so steps never mutate each other's stepping state.
     """
-    return [pickle.loads(pickle.dumps(envs[i % len(envs)])) for i in range(n)]  # noqa: S301
+    return [pickle.loads(pickle.dumps(envs[i % len(envs)])) for i in range(n)]
 
 
 def collect_batched(  # noqa: PLR0913, PLR0917
