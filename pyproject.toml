@@ -114,6 +114,7 @@ ignore = [
     "PGH003",            # blanket noqa
     "ISC003",            # explicit string concatenation
     "T201",              # no prints
+    "S301",              # no pickle (needed for models)
 ]
 
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"

@@ -12,7 +12,7 @@ of that shape name (n = times the slot was already placed) via
 `Level.place_entrypoint`; built-in blueprint placements route to `Level.place`.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from opus_magnum_sym import Hex, Level, LevelSpec
@@ -46,6 +46,7 @@ class DecodeReport:
     error_token_pos: int | None = None
     placements: int = 0
     program_actions: int = 0
+    handles: list[int] = field(default_factory=list)  # comp id per program handle, in placement order
 
 
 def decode_solution(tokens: list[int] | np.ndarray, spec: LevelSpec, vocab: Vocab) -> Solution | GrammarError:
@@ -90,7 +91,36 @@ def apply_solution(sol: Solution, spec: LevelSpec, level: Level) -> DecodeReport
                 placements=len(sol.placements),
             )
 
-    return DecodeReport(ok=True, placements=len(sol.placements), program_actions=len(sol.actions))
+    return DecodeReport(ok=True, placements=len(sol.placements), program_actions=len(sol.actions), handles=handles)
+
+
+def solution_to_oms(sol: Solution, handles: list[int], spec: LevelSpec) -> str:
+    """
+    Decodes solution IR to `.oms` DSL text.
+
+    `handles` maps program handle -> placed manipulator component id,
+    taken from `DecodeReport.handles` of a successful `apply_solution`.
+    """
+    model = spec_model(spec)
+    slot_use: dict[int, int] = {}
+    lines: list[str] = []
+    for placement in sol.placements:
+        name = model.slots[placement.slot] if placement.slot is not None else placement.builtin.name
+        parts = [f"place {name} {placement.r} {placement.q}"]
+        if placement.slot is not None:
+            use = slot_use.get(placement.slot, 0)
+            slot_use[placement.slot] = use + 1
+            ep = spec.entrypoints[entrypoint_index(model, placement.slot, use)]
+            if ep.atom_type is not None:
+                parts.append(f"atom_type={ep.atom_type.name.lower()}")
+        if placement.rotation:
+            parts.append(f"rotation={placement.rotation}")
+        lines.append(" ".join(parts))
+    lines.append("")
+    lines.extend(
+        f"action {handles[action.handle]} {action.tick} {action.action.name.lower()}" for action in sol.actions
+    )
+    return "\n".join(lines) + "\n"
 
 
 class OpusTokenizer:

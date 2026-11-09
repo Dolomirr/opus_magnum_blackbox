@@ -1,0 +1,18 @@
+# Profiling harness: short RL run on tier-0 with per-iteration attribution.
+# Reproduces the baseline table in .opencode/plan/performance.md; run via:
+#   just profile-config configs/profile_tier0.toml
+# Summary is printed at the end; profile.jsonl lands in the run dir.
+
+[run]
+levels          = ["tier0_typed_delivery"]
+seed            = 0
+device          = "cuda" # force cuda
+
+[profile]
+enabled         = true
+
+[[stage]]
+name            = "profile"
+kind            = "rl"
+iterations      = 20
+episodes        = 32
