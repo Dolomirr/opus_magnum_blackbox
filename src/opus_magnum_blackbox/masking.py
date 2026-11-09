@@ -110,7 +110,11 @@ class ActionMasker:
 
         if group_pos == 0:
             for handle in range(state.current_handle, len(state.arms)):
-                valid[vocab.base("handle") + handle] = True
+                used = state.used_ticks[handle] if handle < len(state.used_ticks) else set()
+                # handle with every tick used cannot complete its triplet:
+                # offering it would leave the next mask empty.
+                if len(used) < spec.steps:
+                    valid[vocab.base("handle") + handle] = True
             valid[vocab.special_id("[SUBMIT]")] = True
         elif group_pos == 1:
             handle = state.pending[0] - vocab.base("handle")
