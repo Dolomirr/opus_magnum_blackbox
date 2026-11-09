@@ -99,6 +99,7 @@ Rules enforced by `advance`:
 - `decode_solution` is pure: tokens → `Solution` (placements/actions), no simulator objects.
 - `apply_solution` mutates a reset `Level` via `Level.place_entrypoint` / `Level.place` / `Level.assign_step_action`; it converts simulator exceptions into `DecodeReport(ok=False, error_token_pos=...)`.
 - `decode_solution_to_level` is just parse + apply. Keep this seam if editing.
+- `solution_to_oms` renders a decoded `Solution` back to `.oms` text; the handle -> component-id mapping comes from `DecodeReport.handles`, filled by `apply_solution`.
 - Coordinate mapping is owned by `codec.py`: token `Q` → `Hex.s` (column), token `R` → `Hex.r` (row).
 
 `masking.py`:
@@ -136,7 +137,7 @@ Framework-free PyTorch, wired `model.py` → `rollout.py` → `train.py` → `cl
 - `model.py`: `OpusPolicy` is a pre-norm encoder-decoder transformer over the env's Dict observation. Embedding index `vocab_size` is a model-internal BOS (never in any token stream). Decoder input is the BOS-shifted history; output position `t` is the distribution for action `a_t` and the value of state `s_t`. `masked_distribution` turns invalid logits into `-inf` before softmax, so only mask-valid tokens are ever sampled.
 - `rollout.py`: `collect_episode` records per-step actions, old logprobs/values, masks, rewards and discounted returns; `collect_batch` spreads episodes round-robin over env instances and stacks teacher-forced tensors plus `mean_return`/`solve_rate`/`mean_length`. Old logprobs/values travel with each step, so the batch format is PPO-ready.
 - `train.py`: `Trainer` — masked REINFORCE with a learned value baseline (`A = G - V` detached, value MSE, entropy bonus, Adam, global grad-norm clip). `update()` is the single PPO seam. Checkpoints (`latest.pt` plus numbered `iter_XXXX.pt`) store model/optimizer/iteration and torch/cuda/numpy RNG states plus all configs; `Trainer.resume(path, envs, train_config=None)` restores them. Metrics append to `metrics.jsonl` (train entries + greedy eval entries).
-- CLI: `uv run opus-magnum-blackbox train --level tier0_typed_delivery [--resume ckpt.pt] [--iterations N --episodes N --lr F --seed N --device D --run-dir DIR]`; unspecified options fall back to `TrainConfig` defaults on fresh runs and to the checkpoint's stored config on resume. `... eval ckpt.pt [--episodes K] [--dump-tokens]` prints the greedy solve rate.
+- CLI: `uv run opus-magnum-blackbox train --level tier0_typed_delivery [--resume ckpt.pt] [--iterations N --episodes N --lr F --seed N --device D --run-dir DIR]`; unspecified options fall back to `TrainConfig` defaults on fresh runs and to the checkpoint's stored config on resume. `... eval ckpt.pt [--episodes K] [--dump-tokens]` prints the greedy solve rate. `... generate ckpt.pt --level <corpus-name|path.oml> [-n N --seed S --out-dir DIR]` samples N independent (re-seeded) solutions and writes them as `.oms` files (only grammar-valid, applicable sequences are written).
 - Sizes/knobs: `ModelConfig` (d_model=128, nhead=4, 2+2 layers), loop knobs in `TrainConfig` (`device=""` auto-resolves to cuda when available).
 
 ## 8. Levels and corpus
