@@ -21,6 +21,8 @@ from opus_magnum_sym import Level, LevelSpec
 
 from opus_magnum_blackbox.codec import OpusTokenizer
 from opus_magnum_blackbox.config import RewardConfig, TokenizerConfig
+from opus_magnum_blackbox.geometry import footprint, occupied_cells
+from opus_magnum_blackbox.grammar import GrammarError, ParseState, advance, spec_model
 from opus_magnum_blackbox.masking import ActionMasker
 from opus_magnum_blackbox.reward import compute_reward
 
@@ -69,17 +71,24 @@ class OpusEnv(gym.Env):
         })
         self.action_space = spaces.Discrete(vocab_size)
 
-        self._level_cache    : dict[str, Level]  = {}
-        self._current        : LevelEntry | None = None
-        self._spec           : LevelSpec | None  = None
-        self._encoder_input  : np.ndarray | None = None
-        self._encoder_length : int               = 0
-        self._history        : list[int]         = []
+        self._level_cache    : dict[str, Level]                 = {}
+        self._current        : LevelEntry | None                = None
+        self._spec           : LevelSpec | None                 = None
+        self._encoder_input  : np.ndarray | None                = None
+        self._encoder_length : int                              = 0
+        self._history        : list[int]                        = []
+        self._mask_state     : ParseState | GrammarError | None = None  # running parse, rebuilt on reset
+        self._occupied       : set[tuple[int, int]] | None      = None  # fixed entrypoints + placements so far
+        self._mask           : np.ndarray | None                = None  # mask for the current history
         # fmt: on
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         state["_level_cache"] = {}
+        # replica envs never inherit stepping caches; alwasy reset
+        state["_mask_state"] = None
+        state["_occupied"] = None
+        state["_mask"] = None
         return state
 
     def _level_for(self, entry: LevelEntry) -> Level:
@@ -100,11 +109,13 @@ class OpusEnv(gym.Env):
         self._spec = level.spec
         self._encoder_input, self._encoder_length = self.tokenizer.encode_level_spec(self._spec)
         self._history = []
+        self._mask_state = ParseState()
+        self._occupied = set(occupied_cells(self._spec, spec_model(self._spec), ()))
         return self._observation(), {"level": self._current.name}
 
     def step(self, action: int) -> tuple[dict, float, bool, bool, dict]:
         token = int(action)
-        valid = bool(self.masker.mask(self._history, self._spec)[token])
+        valid = bool(self._mask[token])
         self._history.append(token)
         terminated = token == self.tokenizer.vocab.special_id("[SUBMIT]")
         truncated = not terminated and len(self._history) >= self.tokenizer.config.max_decoder_len
@@ -161,6 +172,8 @@ class OpusEnv(gym.Env):
         history = np.full(max_dec, vocab.pad_id, dtype=np.int64)
         length = min(len(self._history), max_dec)
         history[:length] = self._history[:length]
+        self._sync_mask_state()
+        self._mask = self.masker.mask_state(self._mask_state, self._spec, self._occupied)
 
         # fmt: off
         return {
@@ -168,6 +181,28 @@ class OpusEnv(gym.Env):
             "encoder_length"  : self._encoder_length,
             "decoder_history" : history,
             "decoder_length"  : len(self._history),
-            "action_mask"     : self.masker.mask(self._history, self._spec).astype(np.int8),
+            "action_mask"     : self._mask.astype(np.int8),
         }
         # fmt: on
+
+    def _sync_mask_state(self) -> None:
+        """
+        Feed tokens not yet consumed to the running parse state, one `advance` each.
+
+        `GrammarError` ensure every later mask stays `PAD`-only, until `reset`.
+        When a layout group closes, set of occupied cell extends
+        by new placement's footprint instead of being rebuilt from all placements.
+        """
+        if isinstance(self._mask_state, GrammarError):
+            return
+        state = self._mask_state
+        while state.length < len(self._history):
+            placements = len(state.placements)
+            state = advance(state, self._history[state.length], self._spec, self.masker.vocab)
+            if isinstance(state, GrammarError):
+                self._mask_state = state
+                return
+            if len(state.placements) > placements:
+                placement = state.placements[-1]
+                self._occupied |= footprint(placement.template, placement.rotation, placement.r, placement.q)
+            self._mask_state = state
