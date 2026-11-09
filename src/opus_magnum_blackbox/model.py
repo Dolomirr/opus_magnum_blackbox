@@ -81,29 +81,37 @@ class OpusPolicy(nn.Module):
         encoder_pad_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Per-position logits `[B, T + 1, vocab_size]` and values `[B, T + 1]`.
+        Per-position logits `[B, W, vocab_size]` and values `[B, W]`,
+        cropped to used decoder prefix:
+        `W = max(decoder_length) + 1`,
+        clamped to padded input width `T + 1`.
 
         Output position `t` is the distribution for action `a_t` and the value
         of state `s_t`: at rollout time the next-token position to gather is
-        `t = decoder_length`.
+        `t = decoder_length`, which lies inside the crop.
 
         Args:
             encoder_input:    [B, E] padded spec token ids
             encoder_length:   [B] true spec token counts
             decoder_history:  [B, T] padded action token ids
             decoder_length:   [B] tokens emitted so far
-            encoder_memory:   [B, E, d_model] precomputed `encode` output;
+            encoder_memory:   [B, E', d_model] precomputed `encode` output
+                              (already sliced to `max(encoder_length)`);
                               when given, encoder_input/encoder_length are unused
-            encoder_pad_mask: [B, E] padding mask matching `encode` (True on padding)
+            encoder_pad_mask: [B, E'] padding mask matching `encode` (True on padding)
 
         Returns:
             Tuple:
-                - [B, T + 1, vocab_size]
-                - [B, T + 1]
+                - [B, W, vocab_size]
+                - [B, W]
 
         """
-        dec_width = decoder_history.shape[1] + 1
         device = decoder_history.device
+        # mask keeps positions beyond max(decoder_length)
+        # from changing already consumed output, so decoder runs on
+        # used prefix only (instead of the padded tail)
+        t_max = min(decoder_history.shape[1] + 1, int(decoder_length.max()) + 1)
+        decoder_history = decoder_history[:, : t_max - 1]
         if encoder_memory is None:
             encoder_memory, encoder_pad_mask = self.encode(encoder_input, encoder_length)
 
@@ -111,9 +119,9 @@ class OpusPolicy(nn.Module):
         bos = torch.full((decoder_history.shape[0], 1), self.vocab_size, dtype=torch.long, device=device)
         dec_input = torch.cat((bos, decoder_history), dim=1)
         # Position i is a valid input through i = decoder_length (holds a_{t-1}); beyond that is padding.
-        dec_positions = torch.arange(dec_width, device=device)
+        dec_positions = torch.arange(t_max, device=device)
         dec_pad = dec_positions.unsqueeze(0) > decoder_length.unsqueeze(1)
-        causal = torch.triu(torch.ones(dec_width, dec_width, dtype=torch.bool, device=device), diagonal=1)
+        causal = torch.triu(torch.ones(t_max, t_max, dtype=torch.bool, device=device), diagonal=1)
         hidden = self.decoder(
             self.embed(dec_input) + self.decoder_pos(dec_positions),
             encoder_memory,
@@ -125,15 +133,32 @@ class OpusPolicy(nn.Module):
 
     def encode(self, encoder_input: torch.Tensor, encoder_length: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Encoder memory `[B, E, d_model]` plus padding mask `[B, E]` (True on padding).
+        Encoder memory `[B, enc_max, d_model]` and
+        padding mask `[B, enc_max]` (True on padding),
+        sliced to `enc_max = max(encoder_length)`:
+        columns beyond that are padding for every row,
+        so the encoder never runs over them and they never reach cross-attention.
 
-        Pure function of the spec tokens: reusable across decoder steps while
-        the spec stays fixed (see `forward`'s encoder_memory argument).
+        Pure function of the spec tokens:
+        reusable across decoder steps while spec stays fixed.
+
+        Args:
+            encoder_input:  [B, E] padded spec token ids
+            encoder_length: [B] true spec token counts
+
+        Returns:
+            Tuple:
+                - [B, enc_max, d_model]
+                - [B, enc_max]
+
         """
         device = encoder_input.device
-        enc_positions = torch.arange(encoder_input.shape[1], device=device)
+        enc_max = int(encoder_length.max())
+        enc_positions = torch.arange(enc_max, device=device)
         enc_pad = enc_positions.unsqueeze(0) >= encoder_length.unsqueeze(1)
-        memory = self.encoder(self.embed(encoder_input) + self.encoder_pos(enc_positions), src_key_padding_mask=enc_pad)
+        memory = self.encoder(
+            self.embed(encoder_input[:, :enc_max]) + self.encoder_pos(enc_positions), src_key_padding_mask=enc_pad
+        )
         return memory, enc_pad
 
     def masked_distribution(self, logits: torch.Tensor, action_mask: torch.Tensor) -> torch.distributions.Categorical:
