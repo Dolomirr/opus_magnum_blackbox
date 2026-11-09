@@ -128,6 +128,44 @@ def test_program_masks(masker, spec, vocab):
     assert "TICK_30" not in tick_names  # beyond spec.steps
 
 
+def test_exhausted_handle_not_offered(masker, spec, vocab):
+    """
+    A handle with every tick burned must not be offered at a group start:
+    its triplet could never complete, leaving the next mask empty.
+    """
+    spec = make_spec(steps=4)
+    history = [
+        vocab.special_id("[START_LAYOUT]"),
+        vocab.value_id("entry_slot", 0),
+        vocab.value_id("rotation", 1),
+        vocab.value_id("q", 3),
+        vocab.value_id("r", 2),
+        vocab.value_id("entry_slot", 1),
+        vocab.value_id("rotation", 2),
+        vocab.value_id("q", 2),
+        vocab.value_id("r", 3),
+        vocab.builtin_id("arm"),
+        vocab.value_id("rotation", 0),
+        vocab.value_id("q", 3),
+        vocab.value_id("r", 3),
+        vocab.builtin_id("arm"),
+        vocab.value_id("rotation", 0),
+        vocab.value_id("q", 4),
+        vocab.value_id("r", 4),
+        vocab.special_id("[END_LAYOUT]"),
+        vocab.special_id("[START_PROGRAM]"),
+    ]
+    names = masked_names(masker, history, spec)
+    assert names == {"H_0", "H_1", "[SUBMIT]"}
+
+    for tick in range(4):  # burn every tick of handle 0
+        history += [vocab.value_id("handle", 0), vocab.value_id("tick", tick), vocab.id("ACT_ROTATE_CLW")]
+    names = masked_names(masker, history, spec)
+    assert "H_0" not in names
+    assert "H_1" in names
+    assert "[SUBMIT]" in names
+
+
 def test_program_canonical_handle_order(masker, spec, vocab):
     spec2 = make_spec(allowed_blueprints=frozenset({"arm"}))
     history = [

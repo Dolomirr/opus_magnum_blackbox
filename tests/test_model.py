@@ -31,11 +31,37 @@ def make_batch(tokenizer, lengths=(3, 5)):
 def test_forward_shapes(policy, tokenizer):
     enc_in, enc_len, dec_hist, dec_len = make_batch(tokenizer)
     logits, values = policy.forward(enc_in, enc_len, dec_hist, dec_len)
-    width = dec_hist.shape[1] + 1  # BOS-shifted decoder input
+    width = dec_len.max().item() + 1  # BOS-shifted decoder input, cropped to the used prefix
     assert logits.shape == (2, width, len(tokenizer.vocab))
     assert values.shape == (2, width)
     assert torch.isfinite(logits).all()
     assert torch.isfinite(values).all()
+
+
+def test_forward_crops_padded_decoder_tail(policy, tokenizer):
+    """Output width is max(decoder_length) + 1 even when the history is padded wider."""
+    enc_in, enc_len, dec_hist, dec_len = make_batch(tokenizer, lengths=(2, 3))
+    logits, values = policy.forward(enc_in, enc_len, dec_hist, dec_len)
+    assert logits.shape == (2, 4, len(tokenizer.vocab))
+    assert values.shape == (2, 4)
+
+
+def test_padded_batch_matches_unpadded_rows(policy, tokenizer):
+    """
+    Next-token outputs gathered at decoder_length from a padded batch equal
+    per-row unpadded batch-1 forwards (Stage 2.5 prefix-crop equivalence).
+    """
+    enc_in, enc_len, dec_hist, dec_len = make_batch(tokenizer)
+    logits, values = policy.forward(enc_in, enc_len, dec_hist, dec_len)
+    for row, length in enumerate(dec_len.tolist()):
+        row_logits, row_values = policy.forward(
+            enc_in[row : row + 1],
+            enc_len[row : row + 1],
+            dec_hist[row : row + 1, :length],
+            dec_len[row : row + 1],
+        )
+        assert torch.allclose(logits[row, length], row_logits[0, length], atol=1e-4, rtol=0.0)
+        assert torch.allclose(values[row, length], row_values[0, length], atol=1e-4, rtol=0.0)
 
 
 def test_causality(policy, tokenizer):
