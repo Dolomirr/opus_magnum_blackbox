@@ -1,7 +1,7 @@
 """Tokenizer: round-trip acceptance, coordinate mapping, entrypoint routing."""
 
-from conftest import known_solution_tokens
-from opus_magnum_sym import Hex, Level
+from conftest import known_solution_tokens, make_spec
+from opus_magnum_sym import Hex, Level, mkentr, mkexit
 from opus_magnum_sym.levels.result import LevelStatus
 
 from opus_magnum_blackbox.codec import apply_solution, decode_solution, solution_to_oms
@@ -142,3 +142,29 @@ def test_solution_to_oms_round_trips_through_load_solution(spec, tokenizer, tmp_
     result = fresh.run()
     assert result.status is LevelStatus.COMPLETED
     assert result.solved
+
+
+def test_mode_token_spelling_matches_entrypoints_fixed(spec, tokenizer):
+    """Mode names follow the flag: unfixed -> MODE_UNFIXED, fixed -> MODE_FIXED."""
+    vocab = tokenizer.vocab
+    assert spec.entrypoints_fixed is False
+    unfixed, _ = tokenizer.encode_level_spec(spec)
+    assert vocab.name(int(unfixed[0])) == "MODE_UNFIXED"
+
+    fixed_spec = make_spec(
+        entrypoints_fixed=True,
+        entrypoints=(mkentr("entrance_typed", Hex(2, 3), rotation=1), mkexit("exit_typed", Hex(3, 2), rotation=2)),
+    )
+    fixed, _ = tokenizer.encode_level_spec(fixed_spec)
+    assert vocab.name(int(fixed[0])) == "MODE_FIXED"
+
+
+def test_mode_token_ids_are_wire_stable(tokenizer):
+    """Relabelled names keep their concrete ids: 5 = unfixed, 6 = fixed, 7 = UNPLACED."""
+    vocab = tokenizer.vocab
+    assert vocab.value_id("mode", 0) == 5
+    assert vocab.value_id("mode", 1) == 6
+    assert vocab.value_id("mode", 2) == 7
+    assert vocab.name(5) == "MODE_UNFIXED"
+    assert vocab.name(6) == "MODE_FIXED"
+    assert vocab.name(7) == "UNPLACED"

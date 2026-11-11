@@ -139,8 +139,7 @@ def test_encoder_distinguishes_entry_positions():
     assert a.tolist() == b.tolist()
     assert a_len == b_len == c_len
     assert a.tolist() != c.tolist()
-    # header mode token follows `spec.entrypoints_fixed`; note the token names are
-    # inverted relative to that flag (fixed encodes as index 1 == MODE_UNFIXED)
+    # header mode token mirrors `spec.entrypoints_fixed`; names follow the flag
     vocab = tokenizer.vocab
     assert a[0] == vocab.value_id("mode", int(first.entrypoints_fixed))
 

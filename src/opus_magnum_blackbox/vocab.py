@@ -7,7 +7,7 @@ Token categories (each is a contiguous id range):
 |------------|-------------------------------------|-------------------------------|
 | specials   | [PAD] [START_LAYOUT] [END_LAYOUT]   | meta tokens                   |
 |            | [START_PROGRAM] [SUBMIT]            |                               |
-| modes      | MODE_FIXED MODE_UNFIXED UNPLACED    | level config                  |
+| modes      | MODE_UNFIXED MODE_FIXED UNPLACED    | level config                  |
 | ctypes     | CTYPE_ENTRANCE CTYPE_EXIT           | encoder shape segments        |
 | atoms      | ATOM_NONE + one per real AtomType   | encoder typed cells           |
 | builtins   | BP_<name> implemented built-in      |                               |
@@ -34,7 +34,8 @@ from opus_magnum_sym.elements.components.blueprints import BPN, ManipulatorSpec,
 from opus_magnum_blackbox.config import VocabConfig
 
 SPECIAL_TOKENS = ("[PAD]", "[START_LAYOUT]", "[END_LAYOUT]", "[START_PROGRAM]", "[SUBMIT]")
-MODE_TOKENS = ("MODE_FIXED", "MODE_UNFIXED", "UNPLACED")
+# mode value mirrors the `entrypoints_fixed` flag: 0 = unfixed, 1 = fixed
+MODE_TOKENS = ("MODE_UNFIXED", "MODE_FIXED", "UNPLACED")
 CTYPE_TOKENS = ("CTYPE_ENTRANCE", "CTYPE_EXIT")
 ROTATION_COUNT = 6
 
