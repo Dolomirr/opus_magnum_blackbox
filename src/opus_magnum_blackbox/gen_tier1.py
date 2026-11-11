@@ -241,7 +241,7 @@ def _manifest_text(params: BankParams) -> str:
     """
     return "\n".join(
         [
-            "DO NOT EDIT",
+            "# DO NOT EDIT",
             "",
             f"# {FAMILY_NAME} family manifest; consumed by corpus scanner.",
             f"# Regenerate bank with `gen-tier1` (seed {params.seed}).",
