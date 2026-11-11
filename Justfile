@@ -29,6 +29,10 @@ om-validate file:
 # Training
 # ===============================
 
+# Regenerate tier-1 simple-arms level bank
+gen-tier1:
+    uv run python -m opus_magnum_blackbox.gen_tier1
+
 # Train the baseline policy on tier-0 level (default overfit config)
 train:
     uv run opus-magnum-blackbox train
