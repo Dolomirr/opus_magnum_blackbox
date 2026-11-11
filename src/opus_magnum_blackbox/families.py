@@ -45,6 +45,7 @@ from opus_magnum_sym import (
 )
 
 from opus_magnum_blackbox.codec import OpusTokenizer, apply_solution, decode_solution, solution_to_oms
+from opus_magnum_blackbox.config import TokenizerConfig, VocabConfig
 from opus_magnum_blackbox.grammar import Action, GrammarError, Placement, Solution
 from opus_magnum_blackbox.masking import ActionMasker
 from opus_magnum_blackbox.vocab import Vocab
@@ -54,6 +55,9 @@ EXIT_SHAPE = "exit_1"
 
 # rotation -> (dr, ds) hand offset around the arm base; rotation 0 is (-1, +1), CLW is +1
 RING_OFFSETS = ((-1, 1), (0, 1), (1, 0), (1, -1), (0, -1), (-1, 0))
+
+# one delivery cycle is GRAB + k turns + RELEASE + (6 - k) turns back: always 8 actions
+CYCLE_ACTIONS = 8
 
 _GRAB = StepActionType.GRAB
 _RELEASE = StepActionType.RELEASE
@@ -107,6 +111,18 @@ def single_atom_spec(  # noqa: PLR0913
             f"entrance {tuple(entrance)} and exit {tuple(exit)} are {distance} apart; "
             "a single arm needs hex-distance 1 or 2"
         )
+    # parameter combos that would silently break training:
+    # `max_program_actions` would truncate mid-program, steps over `max_steps` exceed the tick tokens
+    program_actions = CYCLE_ACTIONS * target
+    max_actions = TokenizerConfig().max_program_actions
+    if program_actions > max_actions:
+        raise FamilyError(f"target {target} programs {program_actions} actions, over the {max_actions} program-action cap")
+    max_steps = VocabConfig().max_steps
+    if steps > max_steps:
+        raise FamilyError(f"steps {steps} is over the {max_steps} tick-token cap")
+    # actions land on ticks 1..program_actions, and tick tokens stop at steps - 1
+    if program_actions >= steps:
+        raise FamilyError(f"program of {program_actions} actions does not fit into the {steps}-step budget")
     spec = LevelSpec(
         size=size,
         shapes=(
