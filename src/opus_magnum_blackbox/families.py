@@ -116,7 +116,9 @@ def single_atom_spec(  # noqa: PLR0913
     program_actions = CYCLE_ACTIONS * target
     max_actions = TokenizerConfig().max_program_actions
     if program_actions > max_actions:
-        raise FamilyError(f"target {target} programs {program_actions} actions, over the {max_actions} program-action cap")
+        raise FamilyError(
+            f"target {target} programs {program_actions} actions, over the {max_actions} program-action cap"
+        )
     max_steps = VocabConfig().max_steps
     if steps > max_steps:
         raise FamilyError(f"steps {steps} is over the {max_steps} tick-token cap")
