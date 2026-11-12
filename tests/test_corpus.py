@@ -116,5 +116,5 @@ def test_unknown_name_raises_with_listing(tree):
 
 def test_empty_group_raises(tree):
     (tree / "empty").mkdir()
-    with pytest.raises(ValueError, match=r"no \.oml levels"):
+    with pytest.raises(ValueError, match=r"no level \.oml files"):
         resolve_entries(["empty"], levels_dir=tree)
