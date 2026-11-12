@@ -82,17 +82,21 @@ def test_trainer_keeps_single_train_env_and_separate_eval_envs(tmp_path):
     assert [entry.name for entry in trainer.eval_envs[0].levels] == [entry.name for entry in eval_]
 
 
-def test_slot_pools_do_not_alias_across_env_pools(tmp_path):
-    envs = [OpusEnv(_bank(1, "bank/train"))]
+def test_slot_pool_cached_and_entry_envs_separate(tmp_path):
+    envs = [OpusEnv(_bank(2, "bank/train"))]
     eval_envs = [OpusEnv(_bank(1, "bank/eval"))]
     torch.manual_seed(0)
     trainer = Trainer(OpusPolicy(envs[0].tokenizer.config, TINY), envs, TrainConfig(device="cpu"), eval_envs=eval_envs)
 
-    train_pool = trainer._slot_env_pool_for(2)
-    eval_pool = trainer._slot_env_pool_for(2, trainer.eval_envs)
-    assert train_pool[0].levels[0].name == "bank/train/v00"
-    assert eval_pool[0].levels[0].name == "bank/eval/v00"
-    assert trainer._slot_env_pool_for(2) is train_pool  # cached
+    pool = trainer._slot_env_pool_for(4)
+    assert trainer._slot_env_pool_for(4) is pool  # cached
+    assert len(pool) == 4
+    assert pool[0] is not pool[1]  # stepping-independent replicas
+    assert [entry.name for entry in pool[0].levels] == ["bank/train/v00", "bank/train/v01"]
+
+    entry_env = trainer._entry_env(eval_envs, eval_envs[0].levels[0])
+    assert trainer._entry_env(eval_envs, eval_envs[0].levels[0]) is entry_env  # cached per entry
+    assert [entry.name for entry in entry_env.levels] == ["bank/eval/v00"]
 
 
 def test_run_name_for_bank_is_short_and_stable(tmp_path):
@@ -119,14 +123,14 @@ def test_pipeline_logs_train_and_eval_bank_rates(tmp_path):
     assert (run_dir / "stage_bc.pt").exists()
     assert (run_dir / "stage_rl-b.pt").exists()
     metrics = read_metrics(run_dir)
-    # rl stages log both rates; the bc stage stays train-env based.
+    # rl stages log both rates; bc logs the exhaustive eval-bank rate alongside the train one.
     evals = [entry for entry in metrics if "greedy_solve_rate" in entry and entry.get("stage") == "rl-b"]
     assert len(evals) == 1
     assert isinstance(evals[0]["eval_solve_rate"], float)
     bc = [entry for entry in metrics if entry.get("stage") == "bc"]
     assert len(bc) == 1
     assert "greedy_solve_rate" in bc[0]
-    assert "eval_solve_rate" not in bc[0]
+    assert isinstance(bc[0]["eval_solve_rate"], float)
     train_entries = [entry for entry in metrics if "policy_loss" in entry]
     assert [entry["stage"] for entry in train_entries] == ["rl-a", "rl-b"]
 

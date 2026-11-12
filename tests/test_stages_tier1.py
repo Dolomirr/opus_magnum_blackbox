@@ -83,13 +83,13 @@ def test_tier1_pipeline_smoke(tmp_path):
 
     metrics = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
     # Both eval entry kinds land in metrics.jsonl: train-bank greedy plus eval-bank rate;
-    # the bc stage logs the train rate only.
+    # the bc stage logs both too (eval-bank visibility before RL starts).
     rl_evals = [entry for entry in metrics if "greedy_solve_rate" in entry and entry.get("stage") != "bc"]
     assert rl_evals
     assert all("eval_solve_rate" in entry for entry in rl_evals)
     bc = [entry for entry in metrics if entry.get("stage") == "bc"]
     assert bc
-    assert all("eval_solve_rate" not in entry for entry in bc)
+    assert all(isinstance(entry["eval_solve_rate"], float) for entry in bc)
     # Global iteration counter continues across the two rl stages.
     rl = [entry for entry in metrics if "policy_loss" in entry]
     assert [entry["stage"] for entry in rl] == ["rl-shape", "rl-consolidate"]

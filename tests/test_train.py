@@ -1,11 +1,14 @@
-"""Trainer smoke: iterations run, metrics and checkpoints land, resume restores state."""
+"""Trainer smoke: iterations run, metrics and checkpoints land, resume restores state, eval is exhaustive per bank entry."""
 
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
-from conftest import make_spec
+from conftest import known_solution_tokens, make_spec
+from opus_magnum_sym import LevelSpec
+from torch import nn
 
 from opus_magnum_blackbox.config import ModelConfig, TrainConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
@@ -43,6 +46,49 @@ def make_trainer(tmp_path: Path, iterations: int = 3) -> Trainer:
 def read_metrics(run_dir: Path) -> list[dict]:
     lines = (run_dir / "metrics.jsonl").read_text().splitlines()
     return [json.loads(line) for line in lines]
+
+
+class _ScriptPolicy(nn.Module):
+    """
+    Test double: greedy argmax always picks the scripted token, so eval outcomes are
+    known per level (the canonical spec solves; altered specs fail under the script).
+    Matches the rollout collectors' two call shapes: `encode`, then forward with
+    precomputed memory; `dummy` keeps the graph differentiable for `update`.
+    """
+
+    def __init__(self, vocab_size: int, scripts: dict[bytes, list[int]]):
+        super().__init__()
+        self.model_config = ModelConfig()
+        self.vocab_size = vocab_size
+        self.scripts = scripts
+        self.dummy = nn.Parameter(torch.zeros(1))
+        self._encoder: np.ndarray | None = None
+
+    def encode(self, encoder_input, encoder_length):
+        self._encoder = encoder_input.detach().cpu().numpy()
+        batch = encoder_input.shape[0]
+        return torch.zeros(batch, 4, 8), torch.zeros(batch, 4, dtype=torch.bool)
+
+    def masked_distribution(self, logits, action_mask):
+        return torch.distributions.Categorical(logits=logits.masked_fill(~action_mask.bool(), float("-inf")))
+
+    def forward(  # noqa: PLR0913, PLR0917
+        self, encoder_input, encoder_length, decoder_history, decoder_length, memory=None, memory_pad_mask=None
+    ):
+        # BOS-shifted like `OpusPolicy`: T input tokens yield T+1 output positions.
+        batch, steps = decoder_history.shape
+        logits = torch.full((batch, steps + 1, self.vocab_size), -20.0) + self.dummy * 0.0
+        encoder = self._encoder
+        keys = [encoder[0].tobytes()] * batch if encoder.shape[0] == 1 else [encoder[r].tobytes() for r in range(batch)]
+        for row, key in enumerate(keys):
+            for position, token in enumerate(self.scripts.get(key, [])):
+                logits[row, position, token] = 20.0
+        return logits, torch.zeros(batch, steps + 1)
+
+
+def _script_policy(env: OpusEnv, solved_spec: LevelSpec) -> _ScriptPolicy:
+    padded, _ = env.tokenizer.encode_level_spec(solved_spec)
+    return _ScriptPolicy(len(env.tokenizer.vocab), {padded.tobytes(): known_solution_tokens(env.tokenizer.vocab)})
 
 
 def test_smoke_run(tmp_path):
@@ -104,3 +150,76 @@ def test_single_iteration_no_eval_or_interval_checkpoints(tmp_path):
     assert [e["iteration"] for e in entries] == [1]
     assert (trainer.run_dir / "latest.pt").exists()
     assert not (trainer.run_dir / "iter_0001.pt").exists()
+
+
+def test_greedy_eval_is_exhaustive_per_entry(tmp_path):
+    """
+    One deterministic greedy episode per bank entry: a script solving exactly one
+    entry of a 3-entry bank yields exactly 1/3, and repeated calls agree bit-for-bit.
+    """
+    solved = make_spec()
+    entries = [
+        LevelEntry(source=solved, cost_max=50, name="bank/solved"),
+        LevelEntry(source=make_spec(target=2, cycling=False), cost_max=50, name="bank/target2"),
+        LevelEntry(source=make_spec(steps=5), cost_max=50, name="bank/short"),
+    ]
+    env = OpusEnv(entries)
+    trainer = Trainer(_script_policy(env, solved), [env], TrainConfig(device="cpu", run_dir=str(tmp_path)))
+
+    assert trainer.evaluate() == pytest.approx(1 / 3)
+    assert trainer.evaluate() == trainer.evaluate()
+
+
+def test_best_eval_checkpoint_written_on_strict_improvement(tmp_path):
+    spec = make_spec()
+    env = OpusEnv([LevelEntry(source=spec, cost_max=50, name="bank/train")])
+    eval_env = OpusEnv([LevelEntry(source=spec, cost_max=50, name="bank/eval")])
+    config = TrainConfig(
+        iterations=4,
+        episodes_per_iteration=2,
+        eval_interval=2,
+        checkpoint_interval=10,
+        device="cpu",
+        run_dir=str(tmp_path),
+    )
+    trainer = Trainer(_script_policy(env, spec), [env], config, eval_envs=[eval_env])
+    trainer.run()
+
+    evals = [e for e in read_metrics(trainer.run_dir) if "eval_solve_rate" in e]
+    assert [e["eval_solve_rate"] for e in evals] == [1.0, 1.0]
+    # `best_eval.pt` appears on the first eval; the equal second rate must not overwrite it.
+    best = torch.load(trainer.run_dir / "best_eval.pt", weights_only=False)
+    assert best["iteration"] == 2
+    assert best["best_eval_rate"] == 1.0
+
+
+def test_resume_restores_best_eval_rate(tmp_path):
+    env = make_env()
+    eval_env = OpusEnv([LevelEntry(source=make_spec(), cost_max=50, name="tier0_eval")])
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(policy, [env], make_config(tmp_path, iterations=1), eval_envs=[eval_env])
+    trainer._best_eval_rate = 0.5
+
+    resumed = Trainer.resume(trainer.save_checkpoint(), [env], eval_envs=[eval_env])
+    assert resumed._best_eval_rate == 0.5
+
+
+def test_slot_pool_seeding_stable_across_trainers(tmp_path):
+    """
+    Pool replicas are seeded from (train seed, slot count): two fresh trainers with the
+    same config build pools with identical draw streams, and replicas draw independently.
+    """
+
+    def fresh_trainer() -> Trainer:
+        env = OpusEnv([LevelEntry(source=make_spec(), cost_max=50, name=f"bank/v{i:02d}") for i in range(4)])
+        torch.manual_seed(0)
+        policy = OpusPolicy(env.tokenizer.config, TINY)
+        trainer = Trainer(policy, [env], TrainConfig(device="cpu", seed=11, run_dir=str(tmp_path)))
+        trainer._seed()
+        return trainer
+
+    pools = [fresh_trainer()._slot_env_pool_for(3) for _ in range(2)]
+    draws = [[env.reset()[1]["level"] for _ in range(4)] for env in pools[0]]
+    assert draws == [[env.reset()[1]["level"] for _ in range(4)] for env in pools[1]]
+    assert len({tuple(seq) for seq in draws}) > 1  # replicas do not draw in lockstep

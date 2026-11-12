@@ -13,6 +13,7 @@ from opus_magnum_blackbox.rollout import (
     collect_batched,
     collect_episode,
     discounted_returns,
+    replicate_envs,
 )
 
 TINY = ModelConfig(d_model=32, nhead=4, encoder_layers=1, decoder_layers=1, dim_feedforward=64)
@@ -64,6 +65,25 @@ def test_batched_episodes_replay_clean(env, policy):
         assert tokens[-1] == submit_id or length == max_dec
         for t, token in enumerate(tokens):
             assert masker.mask(tokens[:t], spec)[token]
+
+
+def test_replicate_envs_seed_independence_and_reproducibility():
+    """
+    Pre-fix bug: pickle copies shared one RNG stream, so every replica drew the same
+    variant every reset. Seeded replicas must draw independently, reproduce their
+    streams for equal seeds, and diverge under a different seed.
+    """
+    entries = [LevelEntry(source=make_spec(), cost_max=50, name=f"bank/v{i:02d}") for i in range(4)]
+
+    def draw(seed: int) -> list[list[str]]:
+        replicas = replicate_envs([OpusEnv(entries)], 6, seed=seed)
+        return [[env.reset()[1]["level"] for _ in range(4)] for env in replicas]
+
+    first = draw(7)
+    assert draw(7) == first  # same seed reproduces identical draw sequences
+    assert len({seq[0] for seq in first}) > 1  # replicas do not draw in lockstep
+    assert len({tuple(seq) for seq in first}) > 1  # streams diverge over resets too
+    assert draw(8) != first  # different seed diverges
 
 
 class _CountingEnv(OpusEnv):
