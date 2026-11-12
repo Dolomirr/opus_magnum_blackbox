@@ -128,6 +128,7 @@ class RewardConfig:
 
     # shaping / progress
     shaping_weight         : float = 0.0  # delivered on unsolved COMPLETED
+    progress_weight        : float = 0.0  # atom progress toward the exit, on COMPLETED
     placement_reward       : float = 0.0  # per correct placement, credited on failure
     invalid_action_penalty : float = 0.0  # per-step, for a token the mask disallowed
 # fmt: on

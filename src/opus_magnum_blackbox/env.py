@@ -17,10 +17,11 @@ from pathlib import Path
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-from opus_magnum_sym import Level, LevelSpec
+from opus_magnum_sym import ComponentType, Hex, Level, LevelSpec
 
 from opus_magnum_blackbox.codec import OpusTokenizer
 from opus_magnum_blackbox.config import RewardConfig, TokenizerConfig
+from opus_magnum_blackbox.families import hex_distance
 from opus_magnum_blackbox.geometry import footprint, occupied_cells
 from opus_magnum_blackbox.grammar import GrammarError, ParseState, advance, spec_model
 from opus_magnum_blackbox.masking import ActionMasker
@@ -38,6 +39,34 @@ class LevelEntry:
     name: str
     weight: float = 1.0
     solutions: tuple[Path, ...] = ()
+
+
+def progress_distances(level: Level) -> tuple[float | None, float | None]:
+    """
+    Entrance->exit hex distance and the smallest remaining-atom distance
+    to nearest exit cell, applying progress from `compute_reward`.
+
+    Atoms still held by manipulators also counts.
+    Returns `(None, None)` when entrypoint cells are unavailable.
+    """
+    entrances: set[Hex] = set()
+    exits: set[Hex] = set()
+    for comp in level.sim.entrypoints.values():
+        cells = set(comp.footprint())
+        if comp.type is ComponentType.EXIT:
+            exits |= cells
+        else:
+            entrances |= cells
+    if not entrances or not exits:
+        return None, None
+    initial = min(hex_distance(cell, exit_cell) for cell in entrances for exit_cell in exits)
+    atoms = list(level.sim.board.atoms)
+    for comp in level.sim.components.values():
+        holding = getattr(comp, "holding", None)
+        if holding:
+            atoms.extend(holding)
+    final = min((min(hex_distance(cell, exit_cell) for exit_cell in exits) for cell in atoms), default=0)
+    return float(initial), float(final)
 
 
 class OpusEnv(gym.Env):
@@ -131,6 +160,8 @@ class OpusEnv(gym.Env):
         level = self._level_cache[self._current.name]
         report = self.tokenizer.decode_solution_to_level(self._history, self._spec, level)
         result = level.run() if report.ok else None
+        # atom distances must be read before reset
+        initial_dist, final_dist = progress_distances(level)
         # The level is dirty after decoding; guarantee a clean slate for the next episode.
         level.reset()
         reward = compute_reward(
@@ -138,6 +169,8 @@ class OpusEnv(gym.Env):
             result,
             self._spec,
             replace(self.reward_config, cost_max=self._current.cost_max),
+            initial_dist=initial_dist,
+            final_dist=final_dist,
         )
 
         # fmt: off

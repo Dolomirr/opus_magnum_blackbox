@@ -11,6 +11,12 @@ Each outcome contributes a configurable term (see `config.RewardConfig`):
   `shaping_weight` term proportional to the delivered fraction
 - solved: `solve_reward` plus clamped cost/area/cycles bonuses weighted by
   alpha/beta/gamma
+
+COMPLETED outcomes additionally earn `progress_weight` term when caller
+passes atom distances: `progress_weight` scaled by how much closer the closest
+remaining atom ended relative to entrance->exit span.
+Crashes and static failures never earn it, so moving an atom near exit
+and then crashing into it is not rewarded.
 """
 
 from opus_magnum_sym import LevelSpec
@@ -24,11 +30,19 @@ def _clamp01(value: float) -> float:
     return min(max(value, 0.0), 1.0)
 
 
-def compute_reward(
+def _progress_bonus(config: RewardConfig, initial_dist: float | None, final_dist: float | None) -> float:
+    if config.progress_weight <= 0.0 or initial_dist is None or final_dist is None or initial_dist <= 0:
+        return 0.0
+    return config.progress_weight * _clamp01((initial_dist - final_dist) / initial_dist)
+
+
+def compute_reward(  # noqa: PLR0913, PLR0917
     report: DecodeReport,
     result: LevelResult | None,
     spec: LevelSpec,
     config: RewardConfig,
+    initial_dist: float | None = None,
+    final_dist: float | None = None,
 ) -> float:
     if not report.ok or result is None or result.status is LevelStatus.FAILED:
         return config.failure_penalty + config.placement_reward * report.placements
@@ -40,7 +54,7 @@ def compute_reward(
         return config.error_base + config.error_progress * (crash_step / spec.steps)
 
     if not result.solved:
-        reward = config.unsolved_reward
+        reward = config.unsolved_reward + _progress_bonus(config, initial_dist, final_dist)
         if config.shaping_weight <= 0.0 or not spec.target:
             return reward
         num_exits = len(result.finished_by_exit)
@@ -50,7 +64,7 @@ def compute_reward(
 
     rows, cols = spec.size
     completion_steps = result.metrics["completion_steps"]
-    reward = config.solve_reward
+    reward = config.solve_reward + _progress_bonus(config, initial_dist, final_dist)
     reward += config.alpha * _clamp01(1.0 - result.cost / config.cost_max)
     reward += config.beta * _clamp01(1.0 - result.area / (rows * cols))
     if completion_steps is not None:
