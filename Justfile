@@ -41,6 +41,10 @@ train:
 train-tier1:
     uv run opus-magnum-blackbox run configs/tier1_simple_arms.toml
 
+# Run the canonical tier-1 discovery recipe (BC seed + stratified self-imitation)
+train-tier1-discovery:
+    uv run opus-magnum-blackbox run configs/tier1_discovery.toml
+
 # Run tier-1 autodiscovery sweep (k in 1..10; k=1 equals train-tier1, baseline not rerun)
 train-tier1-ad k:
     mkdir -p runs
