@@ -73,6 +73,7 @@ class TrainConfig:
     episodes_per_iteration : int   = 32
     lr                     : float = 3e-4
     entropy_coef           : float = 0.01
+    explore_epsilon        : float = 0.0  # per-step mask-uniform exploration on sampled rollouts
     value_coef             : float = 0.5
     gamma                  : float = 1.0
     grad_clip              : float = 1.0

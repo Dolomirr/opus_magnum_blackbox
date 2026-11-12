@@ -73,6 +73,20 @@ def discounted_returns(rewards: list[float], gamma: float) -> list[float]:
     return returns
 
 
+def mixture_distribution(
+    probs: torch.Tensor, action_mask: torch.Tensor, epsilon: float
+) -> torch.distributions.Categorical:
+    """
+    Mixture of masked policy distribution and mask over uniform valid tokens:
+
+    Exploring steps sampled and scored under under mixture,
+    so logprob always comes from distribution that was sampled from valid posibilities.
+    """
+    valid = action_mask.bool()
+    uniform = valid.float() / valid.float().sum(dim=-1, keepdim=True)
+    return torch.distributions.Categorical(probs=(1.0 - epsilon) * probs + epsilon * uniform)
+
+
 def _forward_observation(policy: OpusPolicy, obs: dict, device) -> tuple[torch.Tensor, torch.Tensor]:
     decoder_length = int(obs["decoder_length"])
     encoder_input = torch.from_numpy(obs["encoder_input"]).unsqueeze(0).to(device)
@@ -83,9 +97,21 @@ def _forward_observation(policy: OpusPolicy, obs: dict, device) -> tuple[torch.T
     return logits[0, decoder_length], values[0, decoder_length]
 
 
-def collect_episode(env: OpusEnv, policy: OpusPolicy, device, greedy: bool = False, gamma: float = 1.0) -> Episode:
+def collect_episode(  # noqa: PLR0913, PLR0917
+    env: OpusEnv,
+    policy: OpusPolicy,
+    device,
+    greedy: bool = False,
+    gamma: float = 1.0,
+    explore_epsilon: float = 0.0,
+) -> Episode:
     """
     Roll-out one episode for masked policy (sampled, or argmax when greedy).
+
+    `explore_epsilon` applies to sampled steps only: a per-step Bernoulli(epsilon)
+    picks between the plain policy sample (recorded under the policy) and the
+    `(1 - epsilon) * p + epsilon * u` mixture (recorded under the mixture).
+    Greedy rollouts ignore it.
     """
     obs, _ = env.reset()
     encoder_input = obs["encoder_input"]
@@ -96,10 +122,19 @@ def collect_episode(env: OpusEnv, policy: OpusPolicy, device, greedy: bool = Fal
     with torch.no_grad():
         while True:
             mask = obs["action_mask"].astype(bool)
+            mask_tensor = torch.from_numpy(mask).to(device)
             logits, value = _forward_observation(policy, obs, device)
-            dist = policy.masked_distribution(logits, torch.from_numpy(mask).to(device))
-            action = int(dist.probs.argmax()) if greedy else int(dist.sample())
-            logprob = float(dist.log_prob(torch.tensor(action, device=device)))
+            dist = policy.masked_distribution(logits, mask_tensor)
+            if greedy:
+                action = int(dist.probs.argmax())
+                logprob = float(dist.log_prob(torch.tensor(action, device=device)))
+            elif explore_epsilon > 0.0 and bool(torch.bernoulli(torch.tensor(explore_epsilon)).item()):
+                mixture = mixture_distribution(dist.probs, mask_tensor, explore_epsilon)
+                action = int(mixture.sample())
+                logprob = float(mixture.log_prob(torch.tensor(action, device=device)))
+            else:
+                action = int(dist.sample())
+                logprob = float(dist.log_prob(torch.tensor(action, device=device)))
 
             obs, reward, terminated, truncated, info = env.step(action)
             tokens.append(action)
@@ -208,6 +243,7 @@ def _batched_step(  # noqa: PLR0913, PLR0917
     memory: torch.Tensor,
     memory_pad_mask: torch.Tensor,
     greedy: bool,
+    explore_epsilon: float = 0.0,
 ) -> tuple[list[int], list[float], list[float]]:
     """
     One policy decision for `rows` stacked observations
@@ -215,6 +251,9 @@ def _batched_step(  # noqa: PLR0913, PLR0917
 
     Single host->device transfer and one batched forward over.
     Masked logprobs and state values come back together in one GPU->CPU sync.
+
+    With `explore_epsilon` > 0 on sampled steps, every row samples: mixture
+    over valid tokens mask and scores it; greedy steps are unaffected.
     """
     buffer = staging[:rows].to(device, non_blocking=True)
     decoder_history = buffer[:, :max_dec]
@@ -231,6 +270,14 @@ def _batched_step(  # noqa: PLR0913, PLR0917
     probs = masked.softmax(dim=-1)
     action = probs.argmax(dim=-1) if greedy else torch.multinomial(probs, 1).squeeze(1)
     logprob = masked.gather(1, action.unsqueeze(1)).squeeze(1) - logsumexp
+
+    if not greedy and explore_epsilon > 0.0:
+        explore = torch.rand(rows, device=device) < explore_epsilon
+        mixture = mixture_distribution(probs, action_mask, explore_epsilon)
+        explore_action = torch.multinomial(mixture.probs, 1).squeeze(1)
+        explore_logprob = mixture.probs.gather(1, explore_action.unsqueeze(1)).log().squeeze(1)
+        action = torch.where(explore, explore_action, action)
+        logprob = torch.where(explore, explore_logprob, logprob)
 
     packet = torch.stack((action.float(), logprob, step_values), dim=1).cpu()
     return packet[:, 0].long().tolist(), packet[:, 1].tolist(), packet[:, 2].tolist()
@@ -253,13 +300,21 @@ def replicate_envs(envs: list[OpusEnv], n: int, seed: int | None = None) -> list
 
 
 def collect_batched(  # noqa: PLR0913, PLR0917
-    envs: list[OpusEnv], policy: OpusPolicy, n: int, device, greedy: bool = False, gamma: float = 1.0
+    envs: list[OpusEnv],
+    policy: OpusPolicy,
+    n: int,
+    device,
+    greedy: bool = False,
+    gamma: float = 1.0,
+    explore_epsilon: float = 0.0,
 ) -> RolloutBatch:
     """
     N episodes over `n` lockstep slots,
     slot i bound to `envs[i % len(envs)]`.
 
     Each token-step issues one batched policy forward across the active slots.
+    `explore_epsilon` mixes mask-uniform exploration into sampled slots.
+    Greedy runs ignore it.
 
     Finished slot refills only while "demand" is begger then other slots capacity,
     otherwise retires from active set;
@@ -315,7 +370,15 @@ def collect_batched(  # noqa: PLR0913, PLR0917
                 staging_rows[row, max_dec] = obs["decoder_length"]
                 staging_rows[row, max_dec + 1 :] = obs["action_mask"]
             actions, logprobs, values = _batched_step(
-                policy, staging, len(active), max_dec, device, memory, memory_pad_mask, greedy
+                policy,
+                staging,
+                len(active),
+                max_dec,
+                device,
+                memory,
+                memory_pad_mask,
+                greedy,
+                explore_epsilon,
             )
 
             # Snapshot: finishing slots may retire from `active` below.

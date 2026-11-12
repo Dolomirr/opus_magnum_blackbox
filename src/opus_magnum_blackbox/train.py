@@ -112,6 +112,7 @@ class Trainer:
                     self.train_config.episodes_per_iteration,
                     self.device,
                     gamma=self.train_config.gamma,
+                    explore_epsilon=self.train_config.explore_epsilon,
                 )
             with self._timed("update"):
                 policy_loss, value_loss, entropy = self.update(batch)

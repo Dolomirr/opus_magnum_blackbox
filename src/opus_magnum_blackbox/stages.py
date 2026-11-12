@@ -100,10 +100,10 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
     autodiscovery = run.get("autodiscovery", 1)
     # bro, why toml bool is python's int?
     if (
-            isinstance(autodiscovery, bool)
-            or not isinstance(autodiscovery, int)
-            or not 1 <= autodiscovery <= 10
-    ):
+        isinstance(autodiscovery, bool)
+        or not isinstance(autodiscovery, int)
+        or not 1 <= autodiscovery <= 10
+    ): # fmt: skip
         raise ValueError(f"[run] `autodiscovery` must be an integer in 1..10, got {autodiscovery!r}")
 
     profile = data.get("profile", {})
