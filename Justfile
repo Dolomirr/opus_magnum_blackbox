@@ -37,6 +37,10 @@ gen-tier1 seed="0":
 train:
     uv run opus-magnum-blackbox train
 
+# Run tier-1 curriculum training pipeline
+train-tier1:
+    uv run opus-magnum-blackbox run configs/tier1_simple_arms.toml
+
 # Run a stage pipeline from a TOML config
 run-file file:
     uv run opus-magnum-blackbox run {{file}}
