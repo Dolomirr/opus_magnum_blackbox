@@ -31,7 +31,7 @@ import torch
 from opus_magnum_sym import Level, LevelSpec
 
 from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfig, TrainConfig
-from opus_magnum_blackbox.corpus import TIER0_LEVELS
+from opus_magnum_blackbox.corpus import resolve_entries
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import ProfiledEnv, ProfiledEnvs
@@ -143,17 +143,6 @@ def _route_keys(keys: dict, targets: tuple[type, ...], stage_name: str) -> dict[
             known = sorted({item.name for target in targets for item in fields(target)} | set(_ALIASES))
             raise ValueError(f"stage {stage_name!r}: unknown key {key!r}; known keys: {known}")
     return routed
-
-
-def resolve_entries(names: list[str]) -> list[LevelEntry]:
-    """
-    Corpus entries for the config's level names, in the given order.
-    """
-    registry = {entry.name: entry for entry in TIER0_LEVELS}
-    missing = [name for name in names if name not in registry]
-    if missing:
-        raise ValueError(f"unknown levels: {missing}; corpus has: {sorted(registry)}")
-    return [registry[name] for name in names]
 
 
 def run_pipeline(
