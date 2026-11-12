@@ -47,9 +47,12 @@ src/opus_magnum_blackbox/
 ├── model.py     # OpusPolicy: transformer policy/value network
 ├── rollout.py   # episode collection, teacher-forced batches
 ├── train.py     # Trainer: masked REINFORCE loop, checkpoints, metrics
+├── stages.py    # pipeline runner: TOML stage configs (bc + rl), train/eval banks
 ├── cli.py       # `train` / `eval` subcommands
-└── corpus.py    # level entries for training
-levels/          # .oml level files
+├── corpus.py    # recursive levels/ scanner: entries, manifests, group resolution
+├── families.py  # tier-1 family: spec builder + simulator-verified reference solver
+└── gen_tier1.py # seeded tier-1 bank generator (.oml/.oms files + manifest)
+levels/          # top-level tier-0 files + tier1_simple_arms/{train,eval} bank (generated)
 tests/           # behavior-focused pytest suite
 ```
 
@@ -142,10 +145,14 @@ Framework-free PyTorch, wired `model.py` → `rollout.py` → `train.py` → `cl
 
 ## 8. Levels and corpus
 
-- Training levels are `.oml` files under `levels/`; `corpus.py` hardcodes `LevelEntry` objects with `cost_max` and optional sampling `weight`.
+- `corpus.py` scans `levels/` recursively: one `LevelEntry` per `.oml`, named by the path relative to `levels/` with `/` separators (`tier1_simple_arms/train/v00`). Same-stem `.oms` siblings become the entry's `solutions`.
+- A resolve name addresses one level, or a directory for the group of every level under it (recursively, sorted) — pipeline configs use group names (`levels = ["tier1_simple_arms/train"]`).
+- Config comes from the nearest `manifest.toml` in or above the level's directory: `cost_max` (int, required), `weight` (default 1.0). Top-level levels without a manifest fall back to `RewardConfig().cost_max`; deeper levels without one raise. `TIER0_LEVELS` stays exported as the explicit tier-0 entry (its name/`cost_max` are load-bearing for the CLI default and run names).
+- `levels/tier1_simple_arms/` is a **generated bank** (48 train + 16 eval variants + `manifest.toml`; git-ignored): run `just gen-tier1 [seed]` before anything that reads it, including repo-bank tests. The generator (`gen_tier1.py`) instantiates the `families.py` single-atom family — 6x6 board, fixed 1-cell typed entrance/exit, `arm`-only allow-list, `target 2` — and re-validates every emitted pair from disk.
+- Tier-1 curriculum run: `just train-tier1` = idempotent `gen-tier1` + `run configs/tier1_simple_arms.toml` (bc on reference solutions → rl with delivery shaping → rl consolidation). Held-out generalization signal: `greedy_solve_rate` (train bank) vs `eval_solve_rate` (eval bank) in `metrics.jsonl`.
+- Adding a level: drop a `.oml` at the top level (defaults apply) or into a subdirectory (a `manifest.toml` must exist in or above its directory). The scanner picks it up; no corpus entry to write.
 - The live simulator supports `target <n>` (per-exit delivery requirement) and `cycling 0|1` (repeat programs); `levels/tier0_typed_delivery.oml` uses both. Older simulator docs may not mention them.
 - `LevelEntry.source` may be a `Path` or an in-memory `LevelSpec`; tests use the latter.
-- When adding a level, mirror the existing tier-0 file's structure and add a corpus entry.
 
 ## 9. Testing and style
 
