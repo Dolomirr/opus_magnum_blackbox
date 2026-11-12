@@ -41,9 +41,12 @@ train:
 train-tier1:
     uv run opus-magnum-blackbox run configs/tier1_simple_arms.toml
 
-# Run tier-1 autodiscovery config (k in 2..10 lowers BC supervision; k=1 equals train-tier1)
+# Run tier-1 autodiscovery sweep (k in 1..10; k=1 equals train-tier1, baseline not rerun)
 train-tier1-ad k:
-    uv run opus-magnum-blackbox run configs/tier1_ad{{k}}.toml
+    mkdir -p runs
+    date +"%Y-%m-%dT%H:%M:%S.%6N"
+    sed 's/%@/{{k}}/g' configs/tier1_ad.toml > runs/tier1_ad{{k}}.toml
+    uv run opus-magnum-blackbox run runs/tier1_ad{{k}}.toml
 
 # Run a stage pipeline from a TOML config
 run-file file:
