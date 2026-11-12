@@ -8,13 +8,14 @@ import numpy as np
 import pytest
 import torch
 from conftest import known_solution_tokens, make_spec
-from opus_magnum_sym import LevelSpec
+from opus_magnum_sym import Hex, LevelSpec
 from torch import nn
 
 from opus_magnum_blackbox.config import ModelConfig, TrainConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
+from opus_magnum_blackbox.families import reference_tokens, single_atom_spec
 from opus_magnum_blackbox.model import OpusPolicy
-from opus_magnum_blackbox.rollout import Episode, build_batch
+from opus_magnum_blackbox.rollout import Episode, RolloutBatch, build_batch
 from opus_magnum_blackbox.train import Trainer
 
 TINY = ModelConfig(d_model=32, nhead=4, encoder_layers=1, decoder_layers=1, dim_feedforward=64)
@@ -278,8 +279,7 @@ def test_slot_pool_seeding_stable_across_trainers(tmp_path):
 # --- self-imitation buffer and step (stage 3 of the discovery plan) ---
 
 
-def make_sil_episode(env: OpusEnv, tokens: list[int], solved: bool, level: str) -> Episode:
-    spec = env.levels[0].source
+def make_sil_episode(env: OpusEnv, spec, tokens: list[int], solved: bool, level: str) -> Episode:
     padded, encoder_length = env.tokenizer.encode_level_spec(spec)
     return Episode(
         encoder_input=padded,
@@ -296,16 +296,110 @@ def make_sil_episode(env: OpusEnv, tokens: list[int], solved: bool, level: str) 
     )
 
 
+def make_solved_batch(env: OpusEnv, levels: list[tuple[object, str]]) -> RolloutBatch:
+    """Batch of solved episodes, one per (spec, level name)."""
+    vocab = env.tokenizer.vocab
+    return build_batch(
+        [make_sil_episode(env, spec, reference_tokens(spec), True, name) for spec, name in levels],
+        vocab.pad_id,
+    )
+
+
+def test_sil_rows_carry_distance_class(tmp_path):
+    """Buffer rows record their level's entrance->exit hex distance at insert."""
+    d1_spec = single_atom_spec(Hex(2, 3), Hex(2, 2))
+    d2_spec = single_atom_spec(Hex(2, 3), Hex(2, 1))
+    env = OpusEnv(
+        [
+            LevelEntry(source=d1_spec, cost_max=100, name="bank/d1"),
+            LevelEntry(source=d2_spec, cost_max=100, name="bank/d2"),
+        ]
+    )
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1))
+    batch = make_solved_batch(env, [(d1_spec, "bank/d1"), (d2_spec, "bank/d2")])
+
+    trainer._sil_step(batch)
+
+    assert trainer._sil_buffer["bank/d1"].distance == 1
+    assert trainer._sil_buffer["bank/d2"].distance == 2
+
+
+def test_sil_unfixed_entrypoints_count_as_rest(tmp_path):
+    """Unfixed entrypoints have no computable distance: 0, never the d1 stratum."""
+    env = make_env()  # conftest spec: entrypoints unfixed (pos None)
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1))
+    batch = build_batch([make_sil_episode(env, env.levels[0].source, known_solution_tokens(env.tokenizer.vocab), True, "tier0_test")], env.tokenizer.vocab.pad_id)
+
+    trainer._sil_step(batch)
+
+    assert trainer._sil_buffer["tier0_test"].distance == 0
+
+
+def test_sil_stratified_minibatch_halves(tmp_path):
+    """sil_stratify: half the draw comes from d1 rows (with replacement), half from the rest."""
+    d1_spec = single_atom_spec(Hex(2, 3), Hex(2, 2))
+    d2_pairs = [((2, 3), (2, 1)), ((3, 3), (3, 1)), ((2, 4), (2, 2)), ((3, 4), (3, 2))]
+    entries = [LevelEntry(source=d1_spec, cost_max=100, name="bank/d1")]
+    for index, (entrance, exit_) in enumerate(d2_pairs):
+        entries.append(LevelEntry(source=single_atom_spec(Hex(*entrance), Hex(*exit_)), cost_max=100, name=f"bank/r{index}"))
+    env = OpusEnv(entries)
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=5, sil_stratify=True))
+    trainer._sil_step(
+        make_solved_batch(env, [(entry.source, entry.name) for entry in entries])
+    )
+
+    torch.manual_seed(7)
+    rows = trainer._sample_sil_rows()
+
+    assert len(rows) == 5
+    d1_picked = [row.level for row in rows if row.distance == 1]
+    rest_picked = [row.level for row in rows if row.distance != 1]
+    assert len(d1_picked) == 2  # half the batch; only one d1 level exists, so it repeats
+    assert set(d1_picked) == {"bank/d1"}
+    assert len(rest_picked) == 3
+    assert set(rest_picked) <= {entry.name for entry in entries[1:]}
+
+
+def test_sil_stratify_falls_back_to_uniform(tmp_path):
+    """Empty stratum: uniform draw over the whole buffer (distinct rows, no stratification)."""
+    d2_spec = single_atom_spec(Hex(2, 3), Hex(2, 1))
+    d2b_spec = single_atom_spec(Hex(3, 3), Hex(3, 1))
+    env = OpusEnv(
+        [
+            LevelEntry(source=d2_spec, cost_max=100, name="bank/d2"),
+            LevelEntry(source=d2b_spec, cost_max=100, name="bank/d2b"),
+        ]
+    )
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=4, sil_stratify=True))
+    trainer._sil_step(make_solved_batch(env, [(d2_spec, "bank/d2"), (d2b_spec, "bank/d2b")]))
+
+    torch.manual_seed(7)
+    rows = trainer._sample_sil_rows()
+
+    assert len(rows) == 2  # capped at buffer size: uniform path draws without replacement
+    assert {row.level for row in rows} == {"bank/d2", "bank/d2b"}
+    assert all(row.distance == 2 for row in rows)
+
+
 def test_sil_buffer_dedupes_per_level_and_caps(tmp_path):
     env = make_env()
     vocab = env.tokenizer.vocab
+    spec = env.levels[0].source
     good = known_solution_tokens(vocab)
     failed = [vocab.special_id("[SUBMIT]")]
     episodes = [
-        make_sil_episode(env, good[:-1], True, "lvl/a"),
-        make_sil_episode(env, failed, False, "lvl/b"),
-        make_sil_episode(env, good, True, "lvl/a"),  # refresh: the latest solve must win
-        make_sil_episode(env, good, True, "lvl/c"),
+        make_sil_episode(env, spec, good[:-1], True, "lvl/a"),
+        make_sil_episode(env, spec, failed, False, "lvl/b"),
+        make_sil_episode(env, spec, good, True, "lvl/a"),  # refresh: the latest solve must win
+        make_sil_episode(env, spec, good, True, "lvl/c"),
     ]
     batch = build_batch(episodes, vocab.pad_id)
 
@@ -327,7 +421,7 @@ def test_sil_disabled_is_inert(tmp_path):
     env = make_env()
     trainer = make_trainer(tmp_path)  # default sil_coef=0
     vocab = env.tokenizer.vocab
-    batch = build_batch([make_sil_episode(env, known_solution_tokens(vocab), True, "lvl/a")], vocab.pad_id)
+    batch = build_batch([make_sil_episode(env, env.levels[0].source, known_solution_tokens(vocab), True, "lvl/a")], vocab.pad_id)
     assert trainer._sil_step(batch) == (None, [])
     assert trainer._sil_buffer == {}
 
@@ -339,7 +433,7 @@ def test_sil_loss_scales_linearly(tmp_path):
     """
     env = make_env()
     vocab = env.tokenizer.vocab
-    batch = build_batch([make_sil_episode(env, known_solution_tokens(vocab), True, "lvl/a")], vocab.pad_id)
+    batch = build_batch([make_sil_episode(env, env.levels[0].source, known_solution_tokens(vocab), True, "lvl/a")], vocab.pad_id)
 
     losses = {}
     for sil_coef in (0.5, 1.0):
@@ -361,8 +455,8 @@ def test_sil_step_leaves_update_untouched(tmp_path):
     vocab = env.tokenizer.vocab
     batch = build_batch(
         [
-            make_sil_episode(env, known_solution_tokens(vocab), True, "lvl/a"),
-            make_sil_episode(env, [vocab.special_id("[SUBMIT]")], False, "lvl/failed"),
+            make_sil_episode(env, env.levels[0].source, known_solution_tokens(vocab), True, "lvl/a"),
+            make_sil_episode(env, env.levels[0].source, [vocab.special_id("[SUBMIT]")], False, "lvl/failed"),
         ],
         vocab.pad_id,
     )
