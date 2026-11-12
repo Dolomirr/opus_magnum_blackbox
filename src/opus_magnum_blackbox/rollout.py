@@ -236,13 +236,20 @@ def _batched_step(  # noqa: PLR0913, PLR0917
     return packet[:, 0].long().tolist(), packet[:, 1].tolist(), packet[:, 2].tolist()
 
 
-def replicate_envs(envs: list[OpusEnv], n: int) -> list[OpusEnv]:
+def replicate_envs(envs: list[OpusEnv], n: int, seed: int | None = None) -> list[OpusEnv]:
     """
     `n` independent copies of the env pool.
 
     Pickle drop shared Level cache, so steps never mutate each other's stepping state.
+    With `seed`, replica's RNG is reseeded from deterministic child of that seed:
+    unpickled copies would otherwise share seed and use identical level sequences.
     """
-    return [pickle.loads(pickle.dumps(envs[i % len(envs)])) for i in range(n)]
+    replicas = [pickle.loads(pickle.dumps(envs[i % len(envs)])) for i in range(n)]
+    if seed is not None:
+        children = np.random.SeedSequence(seed).spawn(n)
+        for replica, child in zip(replicas, children, strict=True):
+            replica.np_random = np.random.default_rng(child)
+    return replicas
 
 
 def collect_batched(  # noqa: PLR0913, PLR0917

@@ -29,9 +29,17 @@ om-validate file:
 # Training
 # ===============================
 
+# Regenerate tier-1 simple-arms level bank
+gen-tier1 seed="0":
+    uv run python -m opus_magnum_blackbox.gen_tier1 --seed {{seed}}
+
 # Train the baseline policy on tier-0 level (default overfit config)
 train:
     uv run opus-magnum-blackbox train
+
+# Run tier-1 curriculum training pipeline
+train-tier1:
+    uv run opus-magnum-blackbox run configs/tier1_simple_arms.toml
 
 # Run a stage pipeline from a TOML config
 run-file file:
