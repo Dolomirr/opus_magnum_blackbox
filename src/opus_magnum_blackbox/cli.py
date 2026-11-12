@@ -8,7 +8,7 @@ from opus_magnum_sym import Level
 
 from opus_magnum_blackbox.codec import apply_solution, decode_solution, solution_to_oms
 from opus_magnum_blackbox.config import ModelConfig, RewardConfig, TrainConfig
-from opus_magnum_blackbox.corpus import TIER0_LEVELS
+from opus_magnum_blackbox.corpus import TIER0_LEVELS, resolve_entries
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.grammar import GrammarError
 from opus_magnum_blackbox.model import OpusPolicy
@@ -57,10 +57,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     evaluate = subparsers.add_parser("eval", help="greedy-evaluate a checkpoint")
     evaluate.add_argument("checkpoint")
-    evaluate.add_argument("--level",                 default=None, help="corpus level name (default: first tier-0 level)")
-    evaluate.add_argument("--episodes",    type=int, default=TrainConfig().eval_episodes)
-    evaluate.add_argument("--device",                default=None)
-    evaluate.add_argument("--dump-tokens", action="store_true",    help="print each episode's token sequence")
+    evaluate.add_argument("--level", default=None, help="corpus level, bank/group name, or path to a .oml file (default: first tier-0 level)")
+    evaluate.add_argument("--device", default=None)
+    evaluate.add_argument("--dump-tokens", action="store_true", help="print each variant's token sequence")
 
     generate = subparsers.add_parser("generate", help="generate .oms solution files from a checkpoint")
     generate.add_argument("checkpoint")
@@ -92,6 +91,21 @@ def _find_entry(name: str | None) -> LevelEntry:
             return entry
     known = ", ".join(entry.name for entry in TIER0_LEVELS)
     sys.exit(f"unknown level {name!r}; give a corpus level name or a path to a .oml file (corpus has: {known})")
+
+
+def _find_entries(name: str | None) -> list[LevelEntry]:
+    """
+    Level entries for a corpus name: one level, a bank/directory group, or a `.oml` path.
+    """
+    if name is None:
+        return [TIER0_LEVELS[0]]
+    path = Path(name)
+    if path.suffix == ".oml" and path.exists():
+        return [LevelEntry(source=path, cost_max=RewardConfig().cost_max, name=path.stem)]
+    try:
+        return resolve_entries([name])
+    except ValueError as error:
+        sys.exit(str(error))
 
 
 def _train_config(args: argparse.Namespace, base: TrainConfig) -> TrainConfig:
@@ -154,24 +168,29 @@ def _run(args: argparse.Namespace) -> None:
 
 
 def _eval(args: argparse.Namespace) -> None:
-    env = OpusEnv([_find_entry(args.level)])
+    entries = _find_entries(args.level)
+    env = OpusEnv(entries)
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     policy = OpusPolicy(env.tokenizer.config, ModelConfig(**payload["model_config"]))
     policy.load_state_dict(payload["model_state"])
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy.to(device).eval()
 
+    # Exhaustive per-variant rate: one deterministic greedy episode per level entry.
     solved = 0
     rewards: list[float] = []
-    for _ in range(args.episodes):
-        episode = collect_episode(env, policy, device, greedy=True)
+    for entry in entries:
+        episode = collect_episode(OpusEnv([entry]), policy, device, greedy=True)
         solved += episode.solved
         rewards.append(sum(episode.rewards))
         if args.dump_tokens:
             tokens = " ".join(env.tokenizer.vocab.name(token) for token in episode.tokens)
-            print(f"{'solved' if episode.solved else 'failed'} ({sum(episode.rewards):+.1f}): {tokens}")
-    rate = solved / args.episodes
-    print(f"solve rate: {solved}/{args.episodes} = {rate:.2f} | mean reward: {sum(rewards) / len(rewards):+.3f}")
+            print(f"{entry.name}: {'solved' if episode.solved else 'failed'} ({sum(episode.rewards):+.1f}): {tokens}")
+    rate = solved / len(entries)
+    print(
+        f"exhaustive solve rate: {solved}/{len(entries)} = {rate:.2f}"
+        f" | mean reward: {sum(rewards) / len(rewards):+.3f}"
+    )
 
 
 def _generate(args: argparse.Namespace) -> None:

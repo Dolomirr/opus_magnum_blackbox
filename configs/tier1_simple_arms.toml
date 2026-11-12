@@ -32,9 +32,10 @@ shaping_weight      = 0.5 # delivery-fraction shaping on unsolved COMPLETED
 [[stage]]
 name                = "rl-consolidate"
 kind                = "rl"
-iterations          = 600
+iterations          = 1000 # ceiling, not target
 episodes            = 32
 lr                  = 1e-4
-entropy_coef        = 0.007
-shaping_weight      = 0.0 # solve reward only
+entropy_coef        = 0.001
+shaping_weight      = 0.0   # solve reward only
+eval_patience       = 20    # ~200 iterations without eval-bank improvement ends the stage
 # alpha/beta/gamma stay 0
