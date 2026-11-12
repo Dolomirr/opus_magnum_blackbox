@@ -1,5 +1,7 @@
 """Rollout collection: mask validity, discounted returns, batch alignment, determinism."""
 
+import math
+
 import pytest
 import torch
 from conftest import make_spec
@@ -13,6 +15,7 @@ from opus_magnum_blackbox.rollout import (
     collect_batched,
     collect_episode,
     discounted_returns,
+    mixture_distribution,
     replicate_envs,
 )
 
@@ -172,3 +175,121 @@ def test_seeded_determinism(env, policy):
     assert first.mean_return == second.mean_return
     assert first.solve_rate == second.solve_rate
     assert first.mean_length == second.mean_length
+
+
+# --- mask-uniform exploratory sampling (stage 2 of the discovery plan) ---
+
+
+def test_zero_epsilon_matches_default_rollouts(env, policy):
+    """explore_epsilon=0 reproduces today's seeded trajectories exactly, both collectors."""
+    env.reset(seed=0)
+    torch.manual_seed(0)
+    default_batch = collect_batched([env], policy, 3, "cpu")
+    env.reset(seed=0)
+    torch.manual_seed(0)
+    zero_batch = collect_batched([env], policy, 3, "cpu", explore_epsilon=0.0)
+    assert torch.equal(default_batch.actions, zero_batch.actions)
+    assert torch.equal(default_batch.old_logprobs, zero_batch.old_logprobs)
+
+    env.reset(seed=0)
+    torch.manual_seed(0)
+    default_episode = collect_episode(env, policy, "cpu")
+    env.reset(seed=0)
+    torch.manual_seed(0)
+    zero_episode = collect_episode(env, policy, "cpu", explore_epsilon=0.0)
+    assert default_episode.tokens == zero_episode.tokens
+    assert default_episode.logprobs == zero_episode.logprobs
+
+
+def test_full_epsilon_single_env_uniform_valid(env, policy):
+    """explore_epsilon=1: every token is mask-valid and scored log(u) = -log(num_valid)."""
+    env.reset(seed=0)
+    torch.manual_seed(1)
+    episode = collect_episode(env, policy, "cpu", explore_epsilon=1.0)
+    assert len(episode.tokens) > 0
+    for token, mask, logprob in zip(episode.tokens, episode.masks, episode.logprobs, strict=True):
+        assert mask[token]
+        assert logprob == pytest.approx(-math.log(int(mask.sum())), abs=1e-5)
+
+
+def test_full_epsilon_batched_uniform_valid(env, policy):
+    """Lockstep collector at epsilon=1: mask-valid tokens scored under the uniform-valid logprob."""
+    env.reset(seed=0)
+    torch.manual_seed(1)
+    batch = collect_batched([env], policy, 3, "cpu", explore_epsilon=1.0)
+    for i in range(3):
+        length = int(batch.decoder_length[i])
+        for t in range(length):
+            mask = batch.action_masks[i, t]
+            action = int(batch.actions[i, t])
+            assert mask[action]
+            assert batch.old_logprobs[i, t] == pytest.approx(-math.log(int(mask.sum())))
+
+
+def test_mixture_distribution_hand_computed():
+    """Masked softmax [1, 3, 0, 1]/5 mixed with eps=0.3 uniform over 3 valid tokens."""
+    logits = torch.tensor([[0.0, math.log(3.0), float("-inf"), 0.0]])
+    mask = torch.tensor([[True, True, False, True]])
+    probs = torch.softmax(logits.masked_fill(~mask, float("-inf")), dim=-1)
+    mixture = mixture_distribution(probs, mask, 0.3)
+    expected = torch.tensor([[0.7 * 0.2 + 0.1, 0.7 * 0.6 + 0.1, 0.0, 0.7 * 0.2 + 0.1]])
+    assert torch.allclose(mixture.probs, expected)
+    assert mixture.log_prob(torch.tensor(1)) == pytest.approx(math.log(0.52))
+    assert mixture.probs[0, 2].item() == 0.0  # masked token carries no mixture mass
+
+
+def test_partial_epsilon_records_component_logprobs(env, policy):
+    """
+    With 0 < eps < 1 each recorded logprob belongs to the distribution its token was
+    drawn from: the policy (exploit coin) or the (1-eps) p + eps u mixture (explore coin).
+    Both branches must occur over a seeded run.
+    """
+    epsilon = 0.5
+    env.reset(seed=0)
+    torch.manual_seed(3)
+    episode = collect_episode(env, policy, "cpu", explore_epsilon=epsilon)
+    length = len(episode.tokens)
+
+    with torch.no_grad():
+        padded = torch.zeros(1, env.tokenizer.config.max_decoder_len, dtype=torch.long)
+        padded[0, :length] = torch.tensor(episode.tokens)
+        logits, _ = policy(
+            torch.from_numpy(episode.encoder_input).unsqueeze(0),
+            torch.tensor([episode.encoder_length]),
+            padded,
+            torch.tensor([length]),
+        )
+
+    explored = exploited = 0
+    for t, (token, mask, logprob) in enumerate(zip(episode.tokens, episode.masks, episode.logprobs, strict=True)):
+        mask_tensor = torch.from_numpy(mask)
+        dist = policy.masked_distribution(logits[0, t], mask_tensor)
+        policy_logprob = float(dist.log_prob(torch.tensor(token)))
+        mixture_logprob = float(mixture_distribution(dist.probs, mask_tensor, epsilon).log_prob(torch.tensor(token)))
+        if math.isclose(logprob, policy_logprob, rel_tol=1e-5):
+            exploited += 1
+        elif math.isclose(logprob, mixture_logprob, rel_tol=1e-5):
+            explored += 1
+        else:
+            pytest.fail(f"step {t}: logprob {logprob} matches neither policy nor mixture")
+    assert explored > 0
+    assert exploited > 0
+
+
+def test_greedy_ignores_epsilon(env, policy):
+    """Greedy rollouts (train-bank eval, CLI eval) must be identical under any epsilon."""
+    env.reset(seed=0)
+    torch.manual_seed(4)
+    plain_batch = collect_batched([env], policy, 2, "cpu", greedy=True)
+    env.reset(seed=0)
+    torch.manual_seed(4)
+    explored_batch = collect_batched([env], policy, 2, "cpu", greedy=True, explore_epsilon=1.0)
+    assert torch.equal(plain_batch.actions, explored_batch.actions)
+    assert torch.equal(plain_batch.old_logprobs, explored_batch.old_logprobs)
+
+    env.reset(seed=0)
+    plain_episode = collect_episode(env, policy, "cpu", greedy=True)
+    env.reset(seed=0)
+    explored_episode = collect_episode(env, policy, "cpu", greedy=True, explore_epsilon=1.0)
+    assert plain_episode.tokens == explored_episode.tokens
+    assert plain_episode.logprobs == explored_episode.logprobs

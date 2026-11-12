@@ -416,7 +416,9 @@ def test_autodiscovery_one_is_keyless_behavior(tmp_path):
     dialed_dir, dialed = _run_ad_pipeline(tmp_path / "dialed", 1)
 
     def rows(metrics):
-        return [{key: value for key, value in entry.items() if key not in ("timestamp", "wall_time")} for entry in metrics]
+        return [
+            {key: value for key, value in entry.items() if key not in ("timestamp", "wall_time")} for entry in metrics
+        ]
 
     assert rows(dialed) == rows(keyless)
     # k=1 keeps historical run naming on both runs

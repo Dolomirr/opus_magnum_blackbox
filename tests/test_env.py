@@ -90,6 +90,7 @@ def test_level_reuse_across_episodes(vocab):
 
 # --- progress shaping threading (stage 1 of the discovery plan) ---
 
+
 # fixed-entrypoint d2 level: entrance (2,3), exit (2,1), hex distance 2
 def make_family_env(**kwargs) -> tuple[OpusEnv, LevelSpec]:
     spec = single_atom_spec(Hex(2, 3), Hex(2, 1))
@@ -100,9 +101,7 @@ def make_family_env(**kwargs) -> tuple[OpusEnv, LevelSpec]:
 def arm_solution_tokens(spec, vocab, base, rotation, actions) -> list[int]:
     tokenizer = OpusTokenizer()
     arm = vocab.builtin(vocab.builtin_id("arm"))
-    placement = Placement(
-        builtin=arm, slot=None, template=arm.template, rotation=rotation, q=base.s, r=base.r, pos=0
-    )
+    placement = Placement(builtin=arm, slot=None, template=arm.template, rotation=rotation, q=base.s, r=base.r, pos=0)
     acts = [Action(handle=0, tick=tick, action=action, pos=0) for tick, action in enumerate(actions, 1)]
     sol = Solution(placements=[placement], actions=acts, submitted=True, length=0)
     return tokenizer.encode_solution(sol.placements, sol.actions, spec)
@@ -124,7 +123,9 @@ def test_progress_shaping_partial_credit_for_released_near_miss(vocab):
     plan = arm_plan(spec)
     swing = plan.program[1]
     turns = plan.program[1 : plan.program.index(StepActionType.RELEASE)].count(swing)
-    tokens = arm_solution_tokens(spec, vocab, plan.base, plan.rotation, (StepActionType.GRAB, *[swing] * (turns - 1), StepActionType.RELEASE))
+    tokens = arm_solution_tokens(
+        spec, vocab, plan.base, plan.rotation, (StepActionType.GRAB, *[swing] * (turns - 1), StepActionType.RELEASE)
+    )
     reward, info = run_tokens(env, tokens)
     assert info["status"] == "completed"
     assert not info["solved"]

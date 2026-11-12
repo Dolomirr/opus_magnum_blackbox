@@ -188,8 +188,7 @@ def _eval(args: argparse.Namespace) -> None:
             print(f"{entry.name}: {'solved' if episode.solved else 'failed'} ({sum(episode.rewards):+.1f}): {tokens}")
     rate = solved / len(entries)
     print(
-        f"exhaustive solve rate: {solved}/{len(entries)} = {rate:.2f}"
-        f" | mean reward: {sum(rewards) / len(rewards):+.3f}"
+        f"exhaustive solve rate: {solved}/{len(entries)} = {rate:.2f} | mean reward: {sum(rewards) / len(rewards):+.3f}"
     )
 
 
