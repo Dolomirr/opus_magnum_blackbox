@@ -4,7 +4,10 @@ Pipeline runner: one TOML file managing pretrain and RL stages.
 Config schema:
 
 - `[run]`: `levels` (corpus names or directory groups), optional `eval_levels`
-    (bank for greedy eval), `seed`, `device`.
+    (bank for greedy eval), `seed`, `device`,
+    `autodiscovery` (int 1..10, default 1;
+        scales every pretrain stage's epochs rounded to provided fraction.
+        k=10 zeroes them and the stage is skipped).
 - `[[stage]]`: `name`, `kind` (`pretrain` or `rl`),
     plus keys routed by field name into `PretrainConfig`/`RewardConfig` (pretrain)
     or `TrainConfig`/`RewardConfig` (rl).
@@ -67,6 +70,7 @@ class PipelineConfig:
     stages: tuple[PretrainStage | RLStage, ...]
     profile: bool = False
     eval_levels: tuple[str, ...] = ()
+    autodiscovery: int = 1  # supervision switch: 1 keeps full BC, 10 removes it
 
 
 def load_pipeline(path: str | Path) -> PipelineConfig:
@@ -87,11 +91,20 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
     eval_levels = run.get("eval_levels", [])
     if eval_levels:
         resolve_entries(list(eval_levels))  # corpus validation
-    unknown_run_keys = set(run) - {"levels", "eval_levels", "seed", "device"}
+    unknown_run_keys = set(run) - {"levels", "eval_levels", "seed", "device", "autodiscovery"}
     if unknown_run_keys:
         raise ValueError(
-            f"unknown [run] keys: {sorted(unknown_run_keys)}; known keys: levels, eval_levels, seed, device"
+            f"unknown [run] keys: {sorted(unknown_run_keys)}; known keys: "
+            + "levels, eval_levels, seed, device, autodiscovery"
         )
+    autodiscovery = run.get("autodiscovery", 1)
+    # bro, why toml bool is python's int?
+    if (
+            isinstance(autodiscovery, bool)
+            or not isinstance(autodiscovery, int)
+            or not 1 <= autodiscovery <= 10
+    ):
+        raise ValueError(f"[run] `autodiscovery` must be an integer in 1..10, got {autodiscovery!r}")
 
     profile = data.get("profile", {})
     unknown_profile_keys = set(profile) - {"enabled"}
@@ -103,13 +116,21 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
     stages = data.get("stage")
     if not stages:
         raise ValueError("config must define at least one [[stage]]")
-    parsed = tuple(_parse_stage(raw, train_config) for raw in stages)
+    parsed = []
+    for raw in stages:
+        stage = _parse_stage(raw, train_config)
+        if isinstance(stage, PretrainStage):
+            # supervision scaled at load time, so stage configs still carry epochs
+            epochs = round(stage.config.epochs * (10 - autodiscovery) / 9)
+            stage = replace(stage, config=replace(stage.config, epochs=epochs))
+        parsed.append(stage)
     return PipelineConfig(
         levels=tuple(run["levels"]),
         train_config=train_config,
-        stages=parsed,
+        stages=tuple(parsed),
         profile=bool(profile.get("enabled", False)),
         eval_levels=tuple(eval_levels),
+        autodiscovery=autodiscovery,
     )
 
 
@@ -203,6 +224,7 @@ def run_pipeline(
             envs,
             config.train_config,
             eval_envs=eval_envs,
+            autodiscovery=config.autodiscovery,
         )
         trainer._seed()
         start = 0
@@ -215,11 +237,16 @@ def run_pipeline(
             seed=config.train_config.seed,
             device=config.train_config.device,
         )
+        trainer.autodiscovery = config.autodiscovery
     trainer.profile = ProfiledEnvs(profiled) if profiled else None
 
     for stage in config.stages[start:]:
         if isinstance(stage, PretrainStage):
-            _run_pretrain_stage(trainer, entries, stage, seed=config.train_config.seed)
+            if stage.config.epochs == 0:
+                # Dial-scaled to zero: skip BC entirely, but still checkpoint so resume sees it done.
+                trainer._log_stage_skip(stage.name, f"autodiscovery={config.autodiscovery} scales bc epochs to 0")
+            else:
+                _run_pretrain_stage(trainer, entries, stage, seed=config.train_config.seed)
         else:
             _run_rl_stage(trainer, envs, stage)
         latest = trainer.save_checkpoint()

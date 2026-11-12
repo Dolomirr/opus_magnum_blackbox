@@ -37,6 +37,7 @@ class Trainer:
         reward_config: RewardConfig | None = None,
         model_config: ModelConfig | None = None,
         eval_envs: list[OpusEnv] | None = None,
+        autodiscovery: int | None = None,
     ) -> None:
         self.policy = policy
         self.envs = envs
@@ -51,6 +52,8 @@ class Trainer:
         self.iteration = 0
         # Stage name stamped onto metrics entries while a pipeline stage runs; None outside.
         self.stage: str | None = None
+        # supervision dial (1..10)
+        self.autodiscovery: int | None = autodiscovery
         # Optional `profile.ProfiledEnvs`; when set, `run` writes `profile.jsonl`.
         self.profile = None
         # Stepping-independent env replicas for the lockstep collector, cached per slot count.
@@ -78,7 +81,10 @@ class Trainer:
             common.append(parts[0])
         label = "/".join(common) if common else names[0]
         # Flatten group separators: the label must stay a single path segment.
-        return f"{stamp}-{label.replace('/', '_')}"
+        name = f"{stamp}-{label.replace('/', '_')}"
+        if self.autodiscovery is not None and self.autodiscovery > 1:
+            name += f"-ad{self.autodiscovery}"
+        return name
 
     def run(self, eval_patience: int | None = None) -> None:
         """
@@ -417,6 +423,13 @@ class Trainer:
         for env in [*self.envs, *self.eval_envs]:
             env.reset(seed=seed)
 
+    def _stamp_autodiscovery(self, entry: dict) -> None:
+        """
+        Pipeline supervision dial, stamped onto every metrics row when the run comes from a pipeline.
+        """
+        if self.autodiscovery is not None:
+            entry["autodiscovery"] = self.autodiscovery
+
     def _log_metrics(
         self, batch: RolloutBatch, policy_loss: float, value_loss: float, entropy: float, wall_time: float
     ) -> None:
@@ -432,6 +445,7 @@ class Trainer:
         }
         if self.stage is not None:
             entry["stage"] = self.stage
+        self._stamp_autodiscovery(entry)
         entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
@@ -446,6 +460,7 @@ class Trainer:
             entry["eval_solve_rate"] = eval_solve_rate
         if self.stage is not None:
             entry["stage"] = self.stage
+        self._stamp_autodiscovery(entry)
         timestamp = datetime.now().isoformat()
         entry["timestamp"] = timestamp
         with (self.run_dir / "metrics.jsonl").open("a") as file:
@@ -466,10 +481,28 @@ class Trainer:
         }
         if self.stage is not None:
             entry["stage"] = self.stage
+        self._stamp_autodiscovery(entry)
         entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
         print(f"iter {self.iteration} | stage early stop | best eval {best_rate:.2f} / last {last_rate:.2f}")
+
+    def _log_stage_skip(self, stage: str, reason: str) -> None:
+        """
+        `stage_skip` metrics row: the pipeline skipped this stage before it ran.
+        """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "iteration": self.iteration,
+            "stage": stage,
+            "stage_skip": True,
+            "reason": reason,
+        }
+        self._stamp_autodiscovery(entry)
+        entry["timestamp"] = datetime.now().isoformat()
+        with (self.run_dir / "metrics.jsonl").open("a") as file:
+            file.write(json.dumps(entry) + "\n")
+        print(f"stage {stage} skipped | {reason}")
 
     def _bank_counts(self) -> str:
         """
@@ -498,6 +531,7 @@ class Trainer:
         }
         if eval_solve_rate is not None:
             entry["eval_solve_rate"] = eval_solve_rate
+        self._stamp_autodiscovery(entry)
         entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
