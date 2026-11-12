@@ -103,6 +103,37 @@ entropy_coeff = 0.01
         load_pipeline(path)
 
 
+def test_eval_patience_routes_to_rl_stage_only(tmp_path):
+    text = """
+[run]
+levels = ["tier0_typed_delivery"]
+
+[[stage]]
+name = "rl-consolidate"
+kind = "rl"
+iterations = 5
+eval_patience = 20
+"""
+    path = _write_pipeline(tmp_path, text)
+    stage = load_pipeline(path).stages[0]
+    assert isinstance(stage, RLStage)
+    assert stage.eval_patience == 20
+
+    path.write_text(text.replace("eval_patience = 20\n", ""))
+    assert load_pipeline(path).stages[0].eval_patience is None  # absent key: never stop early
+
+    for bad in ("eval_patience = 0", "eval_patience = -1", "eval_patience = 2.5", "eval_patience = true"):
+        path.write_text(text.replace("eval_patience = 20", bad))
+        with pytest.raises(ValueError, match="eval_patience"):
+            load_pipeline(path)
+
+    # pretrain stages do not take the rl-only key; unknown keys still hard-error
+    pretrain = text.replace('name = "rl-consolidate"\nkind = "rl"\niterations = 5', 'name = "bc"\nkind = "pretrain"')
+    path.write_text(pretrain)
+    with pytest.raises(ValueError, match=r"stage 'bc': unknown key 'eval_patience'"):
+        load_pipeline(path)
+
+
 def test_invalid_kind_and_missing_stages_rejected(tmp_path):
     path = _write_pipeline(
         tmp_path,

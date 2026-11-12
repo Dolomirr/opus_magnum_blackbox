@@ -56,6 +56,11 @@ def test_real_config_loads():
     assert bc.config.augment is True
     assert shape.reward_config.shaping_weight > 0
     assert consolidate.reward_config.shaping_weight == 0
+    # Consolidation is a plateau-bounded ceiling: patience ends it on a stale eval bank,
+    # with entropy throttled below the shaping stage (saturated-objective drift removal).
+    assert isinstance(consolidate.eval_patience, int)
+    assert consolidate.eval_patience > 0
+    assert consolidate.train_config.entropy_coef < shape.train_config.entropy_coef
     # cost/area/cycles optimization is out of scope for this curriculum.
     assert shape.reward_config.alpha == shape.reward_config.beta == shape.reward_config.gamma == 0
 

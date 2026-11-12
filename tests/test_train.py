@@ -205,6 +205,54 @@ def test_resume_restores_best_eval_rate(tmp_path):
     assert resumed._best_eval_rate == 0.5
 
 
+def test_eval_patience_stops_after_constant_evals(tmp_path):
+    """
+    Constant eval rate: `run(eval_patience=k)` ends the loop after exactly k evals with one
+    `stage_early_stop` row; without patience the full iteration target runs.
+    """
+    spec = make_spec()
+    env = OpusEnv([LevelEntry(source=spec, cost_max=50, name="bank/train")])
+    eval_env = OpusEnv([LevelEntry(source=spec, cost_max=50, name="bank/eval")])
+    config = TrainConfig(
+        iterations=8,
+        episodes_per_iteration=2,
+        eval_interval=2,
+        checkpoint_interval=10,
+        device="cpu",
+        run_dir=str(tmp_path / "early"),
+    )
+
+    trainer = Trainer(_script_policy(env, spec), [env], config, eval_envs=[eval_env])
+    trainer.run(eval_patience=2)
+
+    assert trainer.iteration == 4  # evals at iterations 2 and 4; the second stale eval ends the stage
+    entries = read_metrics(trainer.run_dir)
+    stops = [entry for entry in entries if entry.get("stage_early_stop")]
+    assert len(stops) == 1
+    assert stops[0]["iteration"] == 4
+    assert stops[0]["best_eval_rate"] == stops[0]["eval_solve_rate"] == 1.0
+    assert [entry["iteration"] for entry in entries if "policy_loss" in entry] == [1, 2, 3, 4]
+    assert torch.load(trainer.run_dir / "latest.pt", weights_only=False)["iteration"] == 4
+
+    full = Trainer(_script_policy(env, spec), [env], config, eval_envs=[eval_env])
+    full.run()
+    assert full.iteration == 8
+    assert not [entry for entry in read_metrics(full.run_dir) if entry.get("stage_early_stop")]
+
+
+def test_eval_patience_ignored_without_eval_envs(tmp_path):
+    """
+    Patience falls back to never stopping when there is no eval bank to measure.
+    """
+    env = make_env()
+    config = make_config(tmp_path, iterations=3, eval_interval=1)
+    trainer = Trainer(OpusPolicy(env.tokenizer.config, TINY), [env], config)
+    trainer.run(eval_patience=1)
+
+    assert trainer.iteration == 3
+    assert not [entry for entry in read_metrics(trainer.run_dir) if entry.get("stage_early_stop")]
+
+
 def test_slot_pool_seeding_stable_across_trainers(tmp_path):
     """
     Pool replicas are seeded from (train seed, slot count): two fresh trainers with the
