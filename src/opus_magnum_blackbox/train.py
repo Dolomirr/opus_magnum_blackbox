@@ -80,13 +80,20 @@ class Trainer:
         # Flatten group separators: the label must stay a single path segment.
         return f"{stamp}-{label.replace('/', '_')}"
 
-    def run(self) -> None:
+    def run(self, eval_patience: int | None = None) -> None:
         """
         Collect, update, log, evaluate and checkpoint until the iteration target is reached.
+
+        Ends loop early after `eval_patience` many consecutive evals without
+        `eval_solve_rate` improvement over best rate seen.
+        Needs eval envs; None runs full iteration target).
         """
         self.run_dir.mkdir(parents=True, exist_ok=True)
         if self.iteration == 0:
             self._seed()
+        # Patience bookkeeping, seeded from the best rate earlier stages reached.
+        best_eval_rate = self._best_eval_rate
+        stale_evals = 0
         while self.iteration < self.train_config.iterations:
             self.iteration += 1
             started = time.time()
@@ -112,6 +119,16 @@ class Trainer:
                     eval_solve_rate = self._greedy_solve_rate(self.eval_envs) if self.eval_envs else None
                 self._log_eval(solve_rate, eval_solve_rate)
                 self._track_best_eval(eval_solve_rate)
+                if eval_patience is not None and eval_solve_rate is not None:
+                    if best_eval_rate is not None and eval_solve_rate > best_eval_rate:
+                        stale_evals = 0
+                        best_eval_rate = eval_solve_rate
+                    else:
+                        stale_evals += 1
+                        best_eval_rate = eval_solve_rate if best_eval_rate is None else best_eval_rate
+                    if stale_evals >= eval_patience:
+                        self._log_stage_early_stop(best_eval_rate, eval_solve_rate)
+                        break
 
             if self.iteration % self.train_config.checkpoint_interval == 0:
                 self.save_checkpoint(numbered=True)
@@ -436,6 +453,23 @@ class Trainer:
         rates = f"{greedy_solve_rate:.2f}" + ("" if eval_solve_rate is None else f" / eval-bank {eval_solve_rate:.2f}")
         counts = self._bank_counts()
         print(f"iter {self.iteration} | greedy solve {rates} over {counts} | {timestamp}")
+
+    def _log_stage_early_stop(self, best_rate: float, last_rate: float) -> None:
+        """
+        `stage_early_stop` metrics row: eval patience exhausted at this iteration.
+        """
+        entry = {
+            "iteration": self.iteration,
+            "stage_early_stop": True,
+            "best_eval_rate": best_rate,
+            "eval_solve_rate": last_rate,
+        }
+        if self.stage is not None:
+            entry["stage"] = self.stage
+        entry["timestamp"] = datetime.now().isoformat()
+        with (self.run_dir / "metrics.jsonl").open("a") as file:
+            file.write(json.dumps(entry) + "\n")
+        print(f"iter {self.iteration} | stage early stop | best eval {best_rate:.2f} / last {last_rate:.2f}")
 
     def _bank_counts(self) -> str:
         """

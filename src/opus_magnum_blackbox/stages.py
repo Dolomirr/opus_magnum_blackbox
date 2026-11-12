@@ -9,7 +9,8 @@ Config schema:
     plus keys routed by field name into `PretrainConfig`/`RewardConfig` (pretrain)
     or `TrainConfig`/`RewardConfig` (rl).
     Unknown keys are a hard error naming the stage;
-    `episodes` is alias for `episodes_per_iteration`.
+    `episodes` is alias for `episodes_per_iteration`;
+    `eval_patience` is an rl-only stage-level key (early stop on eval plateau).
 
 Stages execute in order against one `Trainer` (one run dir).
 Each rl stage's `iterations` is absolute target over the global iteration counter,
@@ -56,6 +57,7 @@ class RLStage:
     iterations: int  # stage length; absolutized over the global counter at execution
     train_config: TrainConfig  # run-level values (seed, device) overlaid with the routed keys
     reward_config: RewardConfig
+    eval_patience: int | None = None  # end the stage after this many evals without eval-rate improvement
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,7 @@ def _parse_stage(raw: dict, run_config: TrainConfig) -> PretrainStage | RLStage:
         routed = _route_keys(keys, (PretrainConfig, RewardConfig), name)
         config = replace(PretrainConfig(), **routed.get(PretrainConfig, {}))
         return PretrainStage(name=name, config=config)
+    eval_patience = _parse_eval_patience(keys, name)
     routed = _route_keys(keys, (RewardConfig, TrainConfig), name)
     train_fields = routed.get(TrainConfig, {})
     if "iterations" not in train_fields:
@@ -132,8 +135,25 @@ def _parse_stage(raw: dict, run_config: TrainConfig) -> PretrainStage | RLStage:
     train_config = replace(run_config, **train_fields)
     reward_config = replace(RewardConfig(), **routed.get(RewardConfig, {}))
     return RLStage(
-        name=name, iterations=train_fields["iterations"], train_config=train_config, reward_config=reward_config
+        name=name,
+        iterations=train_fields["iterations"],
+        train_config=train_config,
+        reward_config=reward_config,
+        eval_patience=eval_patience,
     )
+
+
+def _parse_eval_patience(raw: dict, stage_name: str) -> int | None:
+    """
+    Stage-level rl key: evals without eval-rate improvement before the stage ends early.
+    """
+    value = raw.pop("eval_patience", None)
+    if value is None:
+        return None
+    # TOML booleans arrive as Python ints' subclasses; reject them explicitly.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"stage {stage_name!r}: `eval_patience` must be a positive integer, got {value!r}")
+    return value
 
 
 def _route_keys(keys: dict, targets: tuple[type, ...], stage_name: str) -> dict[type, dict]:
@@ -262,7 +282,7 @@ def _run_rl_stage(trainer: Trainer, envs: list[OpusEnv], stage: RLStage) -> None
     trainer.train_config = replace(stage.train_config, iterations=trainer.iteration + stage.iterations)
     for group in trainer.optimizer.param_groups:
         group["lr"] = trainer.train_config.lr
-    trainer.run()
+    trainer.run(eval_patience=stage.eval_patience)
 
 
 def _entry_spec(entry: LevelEntry) -> LevelSpec:
