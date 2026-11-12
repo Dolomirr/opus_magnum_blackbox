@@ -28,16 +28,18 @@ class Trainer:
     Owns policy, optimizer, envs, configs, run directory and rng.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         policy: OpusPolicy,
         envs: list[OpusEnv],
         train_config: TrainConfig | None = None,
         reward_config: RewardConfig | None = None,
         model_config: ModelConfig | None = None,
+        eval_envs: list[OpusEnv] | None = None,
     ) -> None:
         self.policy = policy
         self.envs = envs
+        self.eval_envs = eval_envs or []
         self.train_config = train_config or TrainConfig()
         self.reward_config = reward_config or RewardConfig()
         self.model_config = model_config or policy.model_config
@@ -52,6 +54,7 @@ class Trainer:
         self.profile = None
         # Stepping-independent env replicas for the lockstep collector, cached per slot count.
         self._slot_env_pool: dict[int, list[OpusEnv]] = {}
+        self._eval_slot_env_pool: dict[int, list[OpusEnv]] = {}
         # Sub-second precision: trainer + resume within one second must not share a run dir.
         # The directory is created lazily on the first write, so resumes can target an existing one.
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
@@ -62,8 +65,16 @@ class Trainer:
 
     def _run_name(self) -> str:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        levels = sorted({entry.name for env in self.envs for entry in env.levels})
-        return f"{stamp}-{'-'.join(levels)}"
+        names = sorted({entry.name for env in self.envs for entry in env.levels})
+        # bank resolves to one common group prefix instead of joining every variant
+        common: list[str] = []
+        for parts in zip(*(name.split("/") for name in names), strict=False):
+            if len(set(parts)) != 1:
+                break
+            common.append(parts[0])
+        label = "/".join(common) if common else names[0]
+        # Flatten group separators: the label must stay a single path segment.
+        return f"{stamp}-{label.replace('/', '_')}"
 
     def run(self) -> None:
         """
@@ -94,7 +105,8 @@ class Trainer:
             if self.iteration % self.train_config.eval_interval == 0:
                 with self._timed("eval"):
                     solve_rate = self.evaluate()
-                self._log_eval(solve_rate)
+                    eval_solve_rate = self._greedy_solve_rate(self.eval_envs) if self.eval_envs else None
+                self._log_eval(solve_rate, eval_solve_rate)
 
             if self.iteration % self.train_config.checkpoint_interval == 0:
                 self.save_checkpoint(numbered=True)
@@ -181,11 +193,14 @@ class Trainer:
 
     def evaluate(self) -> float:
         """
-        Greedy solve rate over eval_episodes, with envs round-robining.
+        Greedy solve rate over eval_episodes on the train envs, with envs round-robining.
         """
+        return self._greedy_solve_rate(self.envs)
+
+    def _greedy_solve_rate(self, envs: list[OpusEnv]) -> float:
         self.policy.eval()
         batch = collect_batched(
-            self._slot_env_pool_for(self.train_config.eval_episodes),
+            self._slot_env_pool_for(self.train_config.eval_episodes, envs),
             self.policy,
             self.train_config.eval_episodes,
             self.device,
@@ -193,16 +208,23 @@ class Trainer:
         )
         return batch.solve_rate
 
-    def _slot_env_pool_for(self, n: int) -> list[OpusEnv]:
+    def _slot_env_pool_for(self, n: int, envs: list[OpusEnv] | None = None) -> list[OpusEnv]:
         """
         Step lock env replicas for `n` slots, built on first use.
+        Train and eval envs cached separately.
         """
-        pool = self._slot_env_pool.get(n)
+        envs = self.envs if envs is None else envs
+        cache = (
+            self._slot_env_pool
+            if envs is self.envs
+            else self._eval_slot_env_pool
+        )  # fmt: skip
+        pool = cache.get(n)
         if pool is None:
-            pool = replicate_envs(self.envs, n)
+            pool = replicate_envs(envs, n)
             if self.profile is not None:
                 self.profile.envs.extend(pool)
-            self._slot_env_pool[n] = pool
+            cache[n] = pool
         return pool
 
     def pretrain(self, batches: list[RolloutBatch], config: PretrainConfig, stage: str | None = None) -> None:
@@ -310,9 +332,11 @@ class Trainer:
         envs: list[OpusEnv],
         train_config: TrainConfig | None = None,
         reward_config: RewardConfig | None = None,
+        eval_envs: list[OpusEnv] | None = None,
     ) -> Trainer:
         """
         Rebuild trainer from checkpoint.
+        Eval envs come from the caller's config, not the checkpoint payload.
         """
         payload = torch.load(path, map_location="cpu", weights_only=False)
         model_config = ModelConfig(**payload["model_config"])
@@ -321,7 +345,7 @@ class Trainer:
 
         policy = OpusPolicy(envs[0].tokenizer.config, model_config)
         policy.load_state_dict(payload["model_state"])
-        trainer = cls(policy, envs, train_config, reward_config, model_config)
+        trainer = cls(policy, envs, train_config, reward_config, model_config, eval_envs=eval_envs)
         trainer.optimizer.load_state_dict(payload["optimizer_state"])
         # load_state_dict restores lr; overrideing with resotred
         # (identity for exact resume, where train_config comes from the same checkpoint)
@@ -340,7 +364,7 @@ class Trainer:
         seed = self.train_config.seed
         torch.manual_seed(seed)
         np.random.seed(seed)
-        for env in self.envs:
+        for env in [*self.envs, *self.eval_envs]:
             env.reset(seed=seed)
 
     def _log_metrics(
@@ -366,16 +390,19 @@ class Trainer:
             f"| len {batch.mean_length:.1f} | pl {policy_loss:+.4f} | vl {value_loss:.4f} | ent {entropy:.3f}"
         )
 
-    def _log_eval(self, greedy_solve_rate: float) -> None:
+    def _log_eval(self, greedy_solve_rate: float, eval_solve_rate: float | None = None) -> None:
         entry = {"iteration": self.iteration, "greedy_solve_rate": greedy_solve_rate}
+        if eval_solve_rate is not None:
+            entry["eval_solve_rate"] = eval_solve_rate
         if self.stage is not None:
             entry["stage"] = self.stage
         timestamp = datetime.now().isoformat()
         entry["timestamp"] = timestamp
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
+        rates = f"{greedy_solve_rate:.2f}" + ("" if eval_solve_rate is None else f" / eval-bank {eval_solve_rate:.2f}")
         print(
-            f"iter {self.iteration} | greedy solve {greedy_solve_rate:.2f} over {self.train_config.eval_episodes} episodes | {timestamp}"
+            f"iter {self.iteration} | greedy solve {rates} over {self.train_config.eval_episodes} episodes | {timestamp}"
         )
 
     def _log_pretrain(self, stage: str, epoch: int, loss: float, accuracy: float, greedy_solve_rate: float) -> None:

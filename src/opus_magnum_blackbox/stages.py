@@ -3,7 +3,8 @@ Pipeline runner: one TOML file managing pretrain and RL stages.
 
 Config schema:
 
-- `[run]`: `levels` (corpus names), `seed`, `device`.
+- `[run]`: `levels` (corpus names or directory groups), optional `eval_levels`
+    (bank for greedy eval), `seed`, `device`.
 - `[[stage]]`: `name`, `kind` (`pretrain` or `rl`),
     plus keys routed by field name into `PretrainConfig`/`RewardConfig` (pretrain)
     or `TrainConfig`/`RewardConfig` (rl).
@@ -63,6 +64,7 @@ class PipelineConfig:
     train_config: TrainConfig
     stages: tuple[PretrainStage | RLStage, ...]
     profile: bool = False
+    eval_levels: tuple[str, ...] = ()
 
 
 def load_pipeline(path: str | Path) -> PipelineConfig:
@@ -79,10 +81,15 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
     run = data.get("run")
     if not isinstance(run, dict) or not run.get("levels"):
         raise ValueError("config must define a [run] table with a non-empty `levels` list")
-    resolve_entries(run["levels"])  # corpus validation
-    unknown_run_keys = set(run) - {"levels", "seed", "device"}
+    resolve_entries(list(run["levels"]))  # corpus validation
+    eval_levels = run.get("eval_levels", [])
+    if eval_levels:
+        resolve_entries(list(eval_levels))  # corpus validation
+    unknown_run_keys = set(run) - {"levels", "eval_levels", "seed", "device"}
     if unknown_run_keys:
-        raise ValueError(f"unknown [run] keys: {sorted(unknown_run_keys)}; known keys: levels, seed, device")
+        raise ValueError(
+            f"unknown [run] keys: {sorted(unknown_run_keys)}; known keys: levels, eval_levels, seed, device"
+        )
 
     profile = data.get("profile", {})
     unknown_profile_keys = set(profile) - {"enabled"}
@@ -100,6 +107,7 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         train_config=train_config,
         stages=parsed,
         profile=bool(profile.get("enabled", False)),
+        eval_levels=tuple(eval_levels),
     )
 
 
@@ -148,30 +156,38 @@ def _route_keys(keys: dict, targets: tuple[type, ...], stage_name: str) -> dict[
 def run_pipeline(
     config: PipelineConfig,
     entries: list[LevelEntry] | None = None,
+    eval_entries: list[LevelEntry] | None = None,
     resume_dir: str | Path | None = None,
 ) -> Path:
     """
     Execute all stages in order against one Trainer; returns the run directory.
 
-    `entries` overrides corpus resolution (tests pass in-memory specs).
+    `entries`/`eval_entries` override corpus resolution.
     `resume_dir` continues an existing run (see module docstring).
     `config.profile` swaps in `ProfiledEnv`; RL stages then also write
     `profile.jsonl` and the CLI prints the attribution summary afterwards.
+    Train entries share one env (per-reset weighted sampling);
+    eval bank, gets its own env.
     """
     entries = entries if entries is not None else resolve_entries(list(config.levels))
-    if config.profile:
-        profiled: list[ProfiledEnv] = [ProfiledEnv([entry]) for entry in entries]
-        envs: list[OpusEnv] = list(profiled)
-    else:
-        profiled = []
-        envs = [OpusEnv([entry]) for entry in entries]
+    if eval_entries is None:
+        eval_entries = resolve_entries(list(config.eval_levels)) if config.eval_levels else []
+    env_cls = ProfiledEnv if config.profile else OpusEnv
+    envs: list[OpusEnv] = [env_cls(entries)]
+    eval_envs: list[OpusEnv] = [env_cls(eval_entries)] if eval_entries else []
+    profiled = [env for env in (*envs, *eval_envs) if isinstance(env, ProfiledEnv)]
     if resume_dir is None:
         torch.manual_seed(config.train_config.seed)
-        trainer = Trainer(OpusPolicy(envs[0].tokenizer.config, ModelConfig()), envs, config.train_config)
+        trainer = Trainer(
+            OpusPolicy(envs[0].tokenizer.config, ModelConfig()),
+            envs,
+            config.train_config,
+            eval_envs=eval_envs,
+        )
         trainer._seed()
         start = 0
     else:
-        trainer, start = _resume_trainer(config, envs, Path(resume_dir))
+        trainer, start = _resume_trainer(config, envs, eval_envs, Path(resume_dir))
         # Resumes restore the checkpoint's stored config; the new run-level one wins.
         trainer.train_config = replace(
             trainer.train_config,
@@ -191,7 +207,12 @@ def run_pipeline(
     return trainer.run_dir
 
 
-def _resume_trainer(config: PipelineConfig, envs: list[OpusEnv], resume_dir: Path) -> tuple[Trainer, int]:
+def _resume_trainer(
+    config: PipelineConfig,
+    envs: list[OpusEnv],
+    eval_envs: list[OpusEnv],
+    resume_dir: Path,
+) -> tuple[Trainer, int]:
     """
     Trainer restored from latest stage checkpoint in `resume_dir`,
     as well as index of the first stage that has not completed yet.
@@ -207,7 +228,7 @@ def _resume_trainer(config: PipelineConfig, envs: list[OpusEnv], resume_dir: Pat
         raise ValueError(f"resume: every stage of the config already completed in {resume_dir}")
 
     checkpoint = resume_dir / f"stage_{config.stages[start].name}.pt"
-    trainer = Trainer.resume(checkpoint, envs)
+    trainer = Trainer.resume(checkpoint, envs, eval_envs=eval_envs)
     # Current config wins for run-level values: writes land in the resumed dir,
     # seed/device may have changed since the checkpoint.
     trainer.run_dir = resume_dir
