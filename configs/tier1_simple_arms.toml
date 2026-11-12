@@ -1,0 +1,39 @@
+# Tier-1 generalization pipeline: BC bootstrap on the simple-arms train bank,
+# then RL with delivery shaping, then consolidation without it.
+# Run: `just train-tier1`
+
+[run]
+levels          = ["tier1_simple_arms/train"]
+eval_levels     = ["tier1_simple_arms/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 100
+lr                  = 1e-3
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5 # prevent overfit
+
+[[stage]]
+name                = "rl-shape"
+kind                = "rl"
+iterations          = 400
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.005
+shaping_weight      = 0.5 # delivery-fraction shaping on unsolved COMPLETED
+
+[[stage]]
+name                = "rl-consolidate"
+kind                = "rl"
+iterations          = 600
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.007
+shaping_weight      = 0.0 # solve reward only
+# alpha/beta/gamma stay 0
