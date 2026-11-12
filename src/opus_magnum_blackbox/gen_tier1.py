@@ -28,6 +28,7 @@ from opus_magnum_sym import AtomType, Hex, Level, LevelSpec
 from opus_magnum_blackbox.corpus import LEVELS_DIR
 from opus_magnum_blackbox.env import LevelEntry
 from opus_magnum_blackbox.families import (
+    BoardSize,
     FamilyError,
     hex_distance,
     reference_oms,
@@ -45,6 +46,15 @@ MANIFEST_WEIGHT = 1.0
 
 # hex distances a single arm can serve; anything else is out of family by construction
 FAMILY_DISTANCES = (1, 2)
+
+# fmt: off
+type EntranceExit      = tuple[Hex, Hex]                               # (entrance, exit) cells of one family pair
+type PairKey           = tuple[int, int, int, int]                     # entrance (r, s) + exit (r, s)
+type DistanceClasses   = dict[int, list[EntranceExit]]                 # kept pairs keyed by hex distance
+type DistanceCounts    = dict[int, int]                                # per-distance-class pair counts (e.g. rejects)
+type PairSplit         = tuple[list[EntranceExit], list[EntranceExit]] # (train, eval) pairs
+type DistanceBreakdown = dict[int, dict[str, int]]                     # class -> {"train", "eval"} counts
+# fmt: on
 
 
 class BankMode(StrEnum):
@@ -75,7 +85,7 @@ class BankParams:
     eval_fraction: float = 0.2
     target: int = 2
     steps: int = 30
-    size: tuple[int, int] = (6, 6)
+    size: BoardSize = (6, 6)
     atom: AtomType = AtomType.WATER
 
 
@@ -91,7 +101,7 @@ class Variant:
     exit: Hex
 
     @property
-    def key(self) -> tuple[int, int, int, int]:
+    def key(self) -> PairKey:
         return (self.entrance.r, self.entrance.s, self.exit.r, self.exit.s)
 
 
@@ -107,7 +117,7 @@ class Bank:
     train: list[Variant]
     eval: list[Variant]
     manifest: Path
-    rejected: dict[int, int] | None = None
+    rejected: DistanceCounts | None = None
 
     @property
     def variants(self) -> list[Variant]:
@@ -118,9 +128,9 @@ def enumerate_pairs(
     *,
     target: int = 2,
     steps: int = 30,
-    size: tuple[int, int] = (6, 6),
+    size: BoardSize = (6, 6),
     atom: AtomType = AtomType.WATER,
-) -> tuple[dict[int, list[tuple[Hex, Hex]]], dict[int, int]]:
+) -> tuple[DistanceClasses, DistanceCounts]:
     """
     Every family-verifiable entrance/exit pair, keyed by hex distance, plus rejects.
 
@@ -130,8 +140,8 @@ def enumerate_pairs(
     """
     rows, cols = size
     cells = [Hex(r, s) for r in range(rows) for s in range(cols)]
-    classes: dict[int, list[tuple[Hex, Hex]]] = {distance: [] for distance in FAMILY_DISTANCES}
-    rejected: dict[int, int] = dict.fromkeys(FAMILY_DISTANCES, 0)
+    classes: DistanceClasses = {distance: [] for distance in FAMILY_DISTANCES}
+    rejected: DistanceCounts = dict.fromkeys(FAMILY_DISTANCES, 0)
     for entrance in cells:
         for exit_ in cells:
             distance = hex_distance(entrance, exit_)
@@ -147,17 +157,17 @@ def enumerate_pairs(
 
 
 def stratified_split(
-    classes: dict[int, list[tuple[Hex, Hex]]],
+    classes: DistanceClasses,
     rng: random.Random,
     eval_fraction: float,
-) -> tuple[list[tuple[Hex, Hex]], list[tuple[Hex, Hex]]]:
+) -> PairSplit:
     """
     Seeded shuffle within each distance class, ~`eval_fraction` of every class to eval.
 
     Deterministic for given rng state; every pair goes to exactly one split.
     """
-    train: list[tuple[Hex, Hex]] = []
-    eval_: list[tuple[Hex, Hex]] = []
+    train: list[EntranceExit] = []
+    eval_: list[EntranceExit] = []
     for distance in sorted(classes):
         pairs = list(classes[distance])
         rng.shuffle(pairs)
@@ -176,8 +186,8 @@ def sample_pairs(
     rng: random.Random,
     train_count: int,
     eval_count: int,
-    size: tuple[int, int],
-) -> tuple[list[tuple[Hex, Hex]], list[tuple[Hex, Hex]]]:
+    size: BoardSize,
+) -> PairSplit:
     """
     Seeded entrance/exit pairs.
 
@@ -194,8 +204,8 @@ def sample_pairs(
         raise ValueError(
             f"{train_count} + {eval_count} variants requested, but the {rows}x{cols} board only has {pool} pairs"
         )
-    taken: set[tuple[int, int, int, int]] = set()
-    pairs: list[tuple[Hex, Hex]] = []
+    taken: set[PairKey] = set()
+    pairs: list[EntranceExit] = []
     while len(pairs) < total:
         entrance = rng.choice(cells)
         exit_ = rng.choice(near[entrance])
@@ -378,11 +388,11 @@ def _clean_stale(directory: Path, keep: list[Path]) -> None:
             path.unlink()
 
 
-def _distance_breakdown(train: list[Variant], eval_: list[Variant]) -> dict[int, dict[str, int]]:
+def _distance_breakdown(train: list[Variant], eval_: list[Variant]) -> DistanceBreakdown:
     """
     Kept pair counts per distance class and split, classes in sorted order.
     """
-    breakdown: dict[int, dict[str, int]] = {}
+    breakdown: DistanceBreakdown = {}
     for split, variants in (("train", train), ("eval", eval_)):
         for variant in variants:
             distance = hex_distance(variant.entrance, variant.exit)
@@ -392,7 +402,7 @@ def _distance_breakdown(train: list[Variant], eval_: list[Variant]) -> dict[int,
 
 
 def _manifest_text(
-    params: BankParams, train_count: int, eval_count: int, breakdown: dict[int, dict[str, int]] | None = None
+    params: BankParams, train_count: int, eval_count: int, breakdown: DistanceBreakdown | None = None
 ) -> str:
     """
     Per-family manifest consumed by the corpus scanner (stage 3): cost/weight

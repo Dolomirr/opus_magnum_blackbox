@@ -84,13 +84,17 @@ def hex_distance(a: Hex, b: Hex) -> int:
     return (abs(a.r - b.r) + abs(a.s - b.s) + abs(a.r + a.s - b.r - b.s)) // 2
 
 
+# rows, cols of the rectangular board a spec is cut from
+type BoardSize = tuple[int, int]
+
+
 def single_atom_spec(  # noqa: PLR0913
     entrance: Hex,
     exit: Hex,
     *,
     target: int = 2,
     steps: int = 30,
-    size: tuple[int, int] = (6, 6),
+    size: BoardSize = (6, 6),
     atom: AtomType = AtomType.WATER,
 ) -> LevelSpec:
     """
