@@ -4,13 +4,15 @@ import math
 
 import pytest
 import torch
-from conftest import make_spec
+from conftest import known_solution_tokens, make_spec
 
 from opus_magnum_blackbox.config import ModelConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.rollout import (
+    Episode,
     build_batch,
+    build_supervised,
     collect_batch,
     collect_batched,
     collect_episode,
@@ -293,3 +295,41 @@ def test_greedy_ignores_epsilon(env, policy):
     explored_episode = collect_episode(env, policy, "cpu", greedy=True, explore_epsilon=1.0)
     assert plain_episode.tokens == explored_episode.tokens
     assert plain_episode.logprobs == explored_episode.logprobs
+
+
+# --- per-episode solve flags and level names (stage 3 of the discovery plan) ---
+
+
+def test_batch_solved_flags_and_levels_align(env, policy, tokenizer, masker):
+    """episode_solved mirrors Episode.solved, level_names mirror Episode.level, per row."""
+    spec = env.levels[0].source
+    vocab = env.tokenizer.vocab
+    padded, encoder_length = tokenizer.encode_level_spec(spec)
+    good = known_solution_tokens(vocab)
+
+    def episode(tokens, solved, level):
+        return Episode(
+            encoder_input=padded,
+            encoder_length=encoder_length,
+            tokens=tokens,
+            masks=[masker.mask(tokens[:t], spec) for t in range(len(tokens))],
+            logprobs=[0.0] * len(tokens),
+            values=[0.0] * len(tokens),
+            rewards=[0.0] * len(tokens),
+            returns=[0.0] * len(tokens),
+            solved=solved,
+            terminated=True,
+            level=level,
+        )
+
+    episodes = [episode(good, True, "lvl/a"), episode([vocab.special_id("[SUBMIT]")], False, "lvl/b")]
+    batch = build_batch(episodes, vocab.pad_id)
+    assert batch.episode_solved.tolist() == [True, False]
+    assert batch.level_names == ["lvl/a", "lvl/b"]
+    assert batch.mean_return == pytest.approx(episodes[0].returns[0])
+
+    supervised = build_supervised([good], spec, tokenizer, masker)
+    assert supervised.episode_solved.tolist() == [False]
+    assert supervised.level_names == [""]
+
+    assert collect_episode(env, policy, "cpu").level == "tier0_test"
