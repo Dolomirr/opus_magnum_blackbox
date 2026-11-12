@@ -35,6 +35,7 @@ class Episode:
     returns        : list[float]      # G_t, from rewards and gamma
     solved         : bool
     terminated     : bool             # False for truncated episodes
+    level          : str = ""         # source level name (per-level dedup key)
     # fmt: on
 
 
@@ -54,6 +55,8 @@ class RolloutBatch:
     old_values     : torch.Tensor # [B, T] float
     returns        : torch.Tensor # [B, T] float
     valid          : torch.Tensor # [B, T] bool, positions below decoder_length
+    episode_solved : torch.Tensor # [B] bool, per-episode solve flag
+    level_names    : list[str]    # per-row source level (SIL dedup key)
 
     mean_return    : float
     solve_rate     : float
@@ -157,6 +160,7 @@ def collect_episode(  # noqa: PLR0913, PLR0917
         returns=discounted_returns(rewards, gamma),
         solved=solved,
         terminated=terminated,
+        level=str(info.get("level", "")),
     )
 
 
@@ -206,6 +210,7 @@ class _Slot:
             returns=discounted_returns(self.rewards, gamma),
             solved=bool(info.get("solved", False)),
             terminated=terminated,
+            level=str(info.get("level", "")),
         )
 
 
@@ -444,6 +449,8 @@ def build_batch(episodes: list[Episode], pad_id: int) -> RolloutBatch:
         old_values=old_values,
         returns=returns,
         valid=valid,
+        episode_solved=torch.tensor([e.solved for e in episodes], dtype=torch.bool),
+        level_names=[e.level for e in episodes],
         mean_return=sum(e.returns[0] for e in episodes) / batch_size,
         solve_rate=sum(e.solved for e in episodes) / batch_size,
         mean_length=sum(len(e.tokens) for e in episodes) / batch_size,
@@ -492,6 +499,8 @@ def build_supervised(
         old_values=zeros,
         returns=zeros,
         valid=valid,
+        episode_solved=torch.zeros(batch_size, dtype=torch.bool),
+        level_names=[""] * batch_size,
         mean_return=0.0,
         solve_rate=0.0,
         mean_length=sum(len(tokens) for tokens in sequences) / batch_size,

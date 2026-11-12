@@ -9,7 +9,7 @@ import json
 import time
 import zlib
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +22,38 @@ from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import Timer
 from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched, replicate_envs
+
+
+@dataclass(frozen=True)
+class SILRow:
+    """
+    Replayable solved-episode row: exactly the batch fields the BC loss consumes,
+    trimmed to the episode length. `level` is the dedup key.
+    """
+
+    # fmt: off
+    level          : str
+    encoder_input  : torch.Tensor # [E] int64
+    encoder_length : int
+    actions        : torch.Tensor # [T] int64
+    action_masks   : torch.Tensor # [T, V] bool
+    valid          : torch.Tensor # [T] bool
+    # fmt: on
+
+
+def _sil_row(batch: RolloutBatch, row: int) -> SILRow:
+    """
+    Slice one solved episode out of a batch.
+    """
+    length = int(batch.decoder_length[row])
+    return SILRow(
+        level=batch.level_names[row],
+        encoder_input=batch.encoder_input[row],
+        encoder_length=int(batch.encoder_length[row]),
+        actions=batch.actions[row, :length],
+        action_masks=batch.action_masks[row, :length],
+        valid=batch.valid[row, :length],
+    )
 
 
 class Trainer:
@@ -62,6 +94,8 @@ class Trainer:
         self._entry_env_pools: dict[tuple[OpusEnv, ...], dict[str, OpusEnv]] = {}
         # Best eval-bank solve rate seen so far; drives `best_eval.pt`.
         self._best_eval_rate: float | None = None
+        # Self-imitation buffer: latest solved episode per level name (see `_sil_step`).
+        self._sil_buffer: dict[str, SILRow] = {}
         # Sub-second precision: trainer + resume within one second must not share a run dir.
         # The directory is created lazily on the first write, so resumes can target an existing one.
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
@@ -116,8 +150,9 @@ class Trainer:
                 )
             with self._timed("update"):
                 policy_loss, value_loss, entropy = self.update(batch)
+                sil_loss, sil_new_levels = self._sil_step(batch)
             iteration_wall = time.time() - started
-            self._log_metrics(batch, policy_loss, value_loss, entropy, iteration_wall)
+            self._log_metrics(batch, policy_loss, value_loss, entropy, iteration_wall, sil_loss, sil_new_levels)
             self._log_profile(batch, iteration_wall)
 
             if self.iteration % self.train_config.eval_interval == 0:
@@ -194,6 +229,80 @@ class Trainer:
         nn.utils.clip_grad_norm_(self.policy.parameters(), self.train_config.grad_clip)
         self.optimizer.step()
         return policy_loss.item(), value_loss.item(), entropy.item()
+
+    def _sil_step(self, batch: RolloutBatch) -> tuple[float | None, list[str]]:
+        """
+        Self-imitation: fold solved rollout rows into the buffer, then run one
+        `_bc_update` step over a sampled minibatch, loss scaled by `sil_coef`.
+
+        The buffer keeps the latest solve per level name, capped at `sil_buffer_cap`
+        (oldest levels evicted first); it is in-memory only, so resumed runs refill
+        within a few iterations.
+        Returns  no step and no metrics keys when `sil_coef` is 0 or the buffer is still empty.
+
+        Returns:
+            Tuple:
+                - the scaled BC loss, or None when no step ran
+                - level names newly added to the buffer this iteration
+
+        """
+        config = self.train_config
+        if config.sil_coef <= 0.0:
+            return None, []
+        new_levels: list[str] = []
+        for row in batch.episode_solved.nonzero(as_tuple=True)[0].tolist():
+            entry = _sil_row(batch, int(row))
+            # pop-then-set keeps a refreshed solve newest, so cap eviction drops stale levels first
+            if self._sil_buffer.pop(entry.level, None) is None:
+                new_levels.append(entry.level)
+            self._sil_buffer[entry.level] = entry
+            while len(self._sil_buffer) > config.sil_buffer_cap:
+                self._sil_buffer.pop(next(iter(self._sil_buffer)))
+
+        if not self._sil_buffer:
+            return None, new_levels
+        picks = set(
+            torch.randperm(len(self._sil_buffer))[: min(config.sil_batch_size, len(self._sil_buffer))].tolist()
+        )
+        rows = [row for index, row in enumerate(self._sil_buffer.values()) if index in picks]
+        minibatch = self._sil_minibatch(rows)
+        loss, _accuracy = self._bc_update(minibatch, torch.arange(len(rows)), loss_scale=config.sil_coef)
+        return loss, new_levels
+
+    def _sil_minibatch(self, rows: list[SILRow]) -> RolloutBatch:
+        """
+        Pad buffered rows into one `RolloutBatch` layout for `_bc_update`.
+        """
+        batch_size = len(rows)
+        max_len = max(row.actions.shape[0] for row in rows)
+        vocab_size = rows[0].action_masks.shape[1]
+
+        actions = torch.full((batch_size, max_len), self.pad_id, dtype=torch.long)
+        action_masks = torch.zeros((batch_size, max_len, vocab_size), dtype=torch.bool)
+        valid = torch.zeros((batch_size, max_len), dtype=torch.bool)
+        for i, row in enumerate(rows):
+            length = row.actions.shape[0]
+            actions[i, :length] = row.actions
+            action_masks[i, :length] = row.action_masks
+            valid[i, :length] = row.valid
+
+        zeros = torch.zeros(batch_size, max_len)
+        return RolloutBatch(
+            encoder_input=torch.stack([row.encoder_input for row in rows]),
+            encoder_length=torch.tensor([row.encoder_length for row in rows], dtype=torch.long),
+            actions=actions,
+            decoder_length=torch.tensor([row.actions.shape[0] for row in rows], dtype=torch.long),
+            action_masks=action_masks,
+            old_logprobs=zeros,
+            old_values=zeros,
+            returns=zeros,
+            valid=valid,
+            episode_solved=torch.ones(batch_size, dtype=torch.bool),
+            level_names=[row.level for row in rows],
+            mean_return=0.0,
+            solve_rate=0.0,
+            mean_length=float(max_len),
+        )
 
     def _timed(self, name: str):
         """
@@ -314,7 +423,7 @@ class Trainer:
         for group in self.optimizer.param_groups:
             group["lr"] = previous_lr
 
-    def _bc_update(self, batch: RolloutBatch, rows: torch.Tensor) -> tuple[float, float]:
+    def _bc_update(self, batch: RolloutBatch, rows: torch.Tensor, loss_scale: float = 1.0) -> tuple[float, float]:
         """
         One gradient step over given batch rows.
 
@@ -342,7 +451,7 @@ class Trainer:
         logprobs = dist.log_prob(actions)
         accuracy = dist.probs.argmax(dim=-1)[valid].eq(actions[valid]).float().mean()
 
-        loss = -logprobs[valid].mean()
+        loss = -logprobs[valid].mean() * loss_scale
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.policy.parameters(), self.train_config.grad_clip)
@@ -393,6 +502,8 @@ class Trainer:
         """
         Rebuild trainer from checkpoint.
         Eval envs come from the caller's config, not the checkpoint payload.
+        The SIL buffer is in-memory only and starts empty on resume;
+        it repopulates from solved episodes within a few iterations.
         """
         payload = torch.load(path, map_location="cpu", weights_only=False)
         model_config = ModelConfig(**payload["model_config"])
@@ -431,8 +542,15 @@ class Trainer:
         if self.autodiscovery is not None:
             entry["autodiscovery"] = self.autodiscovery
 
-    def _log_metrics(
-        self, batch: RolloutBatch, policy_loss: float, value_loss: float, entropy: float, wall_time: float
+    def _log_metrics(  # noqa: PLR0913, PLR0917
+        self,
+        batch: RolloutBatch,
+        policy_loss: float,
+        value_loss: float,
+        entropy: float,
+        wall_time: float,
+        sil_loss: float | None = None,
+        sil_new_levels: list[str] | None = None,
     ) -> None:
         entry = {
             "iteration": self.iteration,
@@ -444,6 +562,10 @@ class Trainer:
             "entropy": entropy,
             "wall_time": wall_time,
         }
+        if sil_loss is not None:
+            entry["sil_loss"] = sil_loss
+            entry["sil_buffer"] = len(self._sil_buffer)
+            entry["sil_new_levels"] = sil_new_levels or []
         if self.stage is not None:
             entry["stage"] = self.stage
         self._stamp_autodiscovery(entry)
