@@ -73,10 +73,11 @@ class TrainConfig:
     episodes_per_iteration : int   = 32
     lr                     : float = 3e-4
     entropy_coef           : float = 0.01
-    explore_epsilon        : float = 0.0  # per-step mask-uniform exploration on sampled rollouts
-    sil_coef               : float = 0.0  # self-imitation BC weight over buffered solved episodes
-    sil_batch_size         : int   = 8    # rows per SIL minibatch
-    sil_buffer_cap         : int   = 256  # buffered solved episodes, deduped per level (latest kept)
+    explore_epsilon        : float = 0.0   # per-step mask-uniform exploration on sampled rollouts
+    sil_coef               : float = 0.0   # self-imitation BC weight over buffered solved episodes
+    sil_batch_size         : int   = 8     # rows per SIL minibatch
+    sil_buffer_cap         : int   = 256   # buffered solved episodes, deduped per level (latest kept)
+    sil_stratify           : bool  = False # half of each SIL minibatch drawn from buffered d1 rows
     value_coef             : float = 0.5
     gamma                  : float = 1.0
     grad_clip              : float = 1.0
@@ -84,7 +85,7 @@ class TrainConfig:
     eval_episodes          : int   = 8
     checkpoint_interval    : int   = 50
     seed                   : int   = 0
-    device                 : str   = ""     # auto-resolves to cuda then avaliable
+    device                 : str   = ""    # auto-resolves to cuda then avaliable
     run_dir                : str   = "runs"
     # fmt: on
 

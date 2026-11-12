@@ -15,10 +15,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from opus_magnum_sym import ComponentType, Level
 from torch import nn
 
 from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfig, TrainConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
+from opus_magnum_blackbox.families import hex_distance
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import Timer
 from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched, replicate_envs
@@ -28,7 +30,9 @@ from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched, replicat
 class SILRow:
     """
     Replayable solved-episode row: exactly the batch fields the BC loss consumes,
-    trimmed to the episode length. `level` is the dedup key.
+    trimmed to the episode length.
+    `level` is dedup key;
+    `distance` is level's entrance->exit hex distance.
     """
 
     # fmt: off
@@ -38,10 +42,11 @@ class SILRow:
     actions        : torch.Tensor # [T] int64
     action_masks   : torch.Tensor # [T, V] bool
     valid          : torch.Tensor # [T] bool
+    distance       : int
     # fmt: on
 
 
-def _sil_row(batch: RolloutBatch, row: int) -> SILRow:
+def _sil_row(batch: RolloutBatch, row: int, distance: int) -> SILRow:
     """
     Slice one solved episode out of a batch.
     """
@@ -53,6 +58,7 @@ def _sil_row(batch: RolloutBatch, row: int) -> SILRow:
         actions=batch.actions[row, :length],
         action_masks=batch.action_masks[row, :length],
         valid=batch.valid[row, :length],
+        distance=distance,
     )
 
 
@@ -96,6 +102,8 @@ class Trainer:
         self._best_eval_rate: float | None = None
         # Self-imitation buffer: latest solved episode per level name (see `_sil_step`).
         self._sil_buffer: dict[str, SILRow] = {}
+        # Level name to entrance->exit hex distance.
+        self._sil_distances: dict[str, int] | None = None
         # Sub-second precision: trainer + resume within one second must not share a run dir.
         # The directory is created lazily on the first write, so resumes can target an existing one.
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
@@ -237,7 +245,9 @@ class Trainer:
 
         The buffer keeps the latest solve per level name, capped at `sil_buffer_cap`
         (oldest levels evicted first); it is in-memory only, so resumed runs refill
-        within a few iterations.
+        within a few iterations. Rows carry their level's distance class (see
+        `_sil_distance`); with `sil_stratify` on, half of each minibatch is drawn
+        from buffered d1 rows.
         Returns  no step and no metrics keys when `sil_coef` is 0 or the buffer is still empty.
 
         Returns:
@@ -251,7 +261,8 @@ class Trainer:
             return None, []
         new_levels: list[str] = []
         for row in batch.episode_solved.nonzero(as_tuple=True)[0].tolist():
-            entry = _sil_row(batch, int(row))
+            level = batch.level_names[int(row)]
+            entry = _sil_row(batch, int(row), self._sil_distance(level))
             # pop-then-set keeps a refreshed solve newest, so cap eviction drops stale levels first
             if self._sil_buffer.pop(entry.level, None) is None:
                 new_levels.append(entry.level)
@@ -261,13 +272,52 @@ class Trainer:
 
         if not self._sil_buffer:
             return None, new_levels
-        picks = set(
-            torch.randperm(len(self._sil_buffer))[: min(config.sil_batch_size, len(self._sil_buffer))].tolist()
-        )
-        rows = [row for index, row in enumerate(self._sil_buffer.values()) if index in picks]
+        rows = self._sample_sil_rows()
         minibatch = self._sil_minibatch(rows)
         loss, _accuracy = self._bc_update(minibatch, torch.arange(len(rows)), loss_scale=config.sil_coef)
         return loss, new_levels
+
+    def _sample_sil_rows(self) -> list[SILRow]:
+        """
+        SIL minibatch draw: uniform over the buffer, or - with `sil_stratify` and
+        half of `sil_batch_size` from d1 rows (with replacement, since its small number)
+        and half from the rest.
+        """
+        config = self.train_config
+        all_rows = list(self._sil_buffer.values())
+        size = min(config.sil_batch_size, len(all_rows))
+        d1_rows = [row for row in all_rows if row.distance == 1]
+        rest_rows = [row for row in all_rows if row.distance != 1]
+        if not config.sil_stratify or not d1_rows or not rest_rows:
+            picks = set(torch.randperm(len(all_rows))[:size].tolist())
+            return [row for index, row in enumerate(all_rows) if index in picks]
+        half = size // 2
+        d1 = [d1_rows[i] for i in torch.randint(0, len(d1_rows), (half,)).tolist()]
+        rest = [rest_rows[i] for i in torch.randint(0, len(rest_rows), (size - half,)).tolist()]
+        return d1 + rest
+
+    def _sil_distance(self, name: str) -> int:
+        """
+        Entrance->exit hex distance for level name, from the level spec.
+
+        Built once per trainer over all env pools; 0 when entrypoints are unfixed
+        or the name is unknown, so such rows never count as d1 for stratification.
+        """
+        if self._sil_distances is None:
+            table: dict[str, int] = {}
+            for env in self.envs:
+                for entry in env.levels:
+                    level = Level.from_file(entry.source) if isinstance(entry.source, Path) else Level(entry.source)
+                    entrance = exit_ = None
+                    for ep in level.spec.entrypoints:
+                        if ep.kind is ComponentType.ENTRANCE:
+                            entrance = ep.pos
+                        elif ep.kind is ComponentType.EXIT:
+                            exit_ = ep.pos
+                    if entrance is not None and exit_ is not None:
+                        table[entry.name] = hex_distance(entrance, exit_)
+            self._sil_distances = table
+        return self._sil_distances.get(name, 0)
 
     def _sil_minibatch(self, rows: list[SILRow]) -> RolloutBatch:
         """
