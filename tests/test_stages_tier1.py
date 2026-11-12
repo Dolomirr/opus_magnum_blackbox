@@ -67,8 +67,8 @@ def test_tier1_pipeline_smoke(tmp_path):
     )
     entries = resolve_entries(["tier1_simple_arms/train"], levels_dir=levels_root)
     eval_entries = resolve_entries(["tier1_simple_arms/eval"], levels_dir=levels_root)
-    assert [entry.name for entry in entries] == ["tier1_simple_arms/train/v00", "tier1_simple_arms/train/v01"]
-    assert [entry.name for entry in eval_entries] == ["tier1_simple_arms/eval/v00"]
+    assert [entry.name for entry in entries] == ["tier1_simple_arms/train/v000", "tier1_simple_arms/train/v001"]
+    assert [entry.name for entry in eval_entries] == ["tier1_simple_arms/eval/v000"]
 
     config = tmp_path / "tier1.toml"
     config.write_text(TINY_TOML)

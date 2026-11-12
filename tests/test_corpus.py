@@ -1,10 +1,16 @@
 """Corpus scanner: recursive discovery, manifests, single/group resolution."""
 
+import tomllib
+
 import pytest
 
 from opus_magnum_blackbox import gen_tier1
 from opus_magnum_blackbox.config import RewardConfig
 from opus_magnum_blackbox.corpus import LEVELS_DIR, TIER0_LEVELS, resolve_entries, scan_levels
+
+
+def _bank_provenance() -> dict:
+    return tomllib.loads((gen_tier1.BANK_DIR / "manifest.toml").read_text())["provenance"]
 
 
 @pytest.fixture
@@ -42,39 +48,42 @@ def test_scan_registry_contains_tier0_and_bank():
     registry = scan_levels()
     assert registry["tier0_typed_delivery"] == TIER0_LEVELS[0]
     bank_names = {name for name in registry if name.startswith(gen_tier1.FAMILY_NAME)}
-    assert len(bank_names) == 48 + 16
-    assert "tier1_simple_arms/train/v00" in registry
+    provenance = _bank_provenance()
+    assert len(bank_names) == provenance["train_count"] + provenance["eval_count"]
+    assert "tier1_simple_arms/train/v000" in registry
 
 
 def test_bank_levels_use_family_manifest():
-    [train, eval_] = resolve_entries(["tier1_simple_arms/train/v00", "tier1_simple_arms/eval/v15"])
+    [train, eval_] = resolve_entries(["tier1_simple_arms/train/v000", "tier1_simple_arms/eval/v085"])
     for entry in (train, eval_):
         assert entry.cost_max == gen_tier1.MANIFEST_COST_MAX
         assert entry.weight == gen_tier1.MANIFEST_WEIGHT
-    assert train.solutions == (LEVELS_DIR / "tier1_simple_arms/train/v00.oms",)
-    assert eval_.solutions == (LEVELS_DIR / "tier1_simple_arms/eval/v15.oms",)
+    assert train.solutions == (LEVELS_DIR / "tier1_simple_arms/train/v000.oms",)
+    assert eval_.solutions == (LEVELS_DIR / "tier1_simple_arms/eval/v085.oms",)
 
 
 def test_group_resolves_sorted_and_unique():
     train = resolve_entries(["tier1_simple_arms/train"])
     names = [entry.name for entry in train]
-    assert len(train) == 48
+    train_count = _bank_provenance()["train_count"]
+    assert len(train) == train_count
     assert names == sorted(set(names))
-    assert names[0] == "tier1_simple_arms/train/v00"
-    assert names[-1] == "tier1_simple_arms/train/v47"
+    assert names[0] == "tier1_simple_arms/train/v000"
+    assert names[-1] == f"tier1_simple_arms/train/v{train_count - 1:03d}"
 
 
 def test_family_group_spans_subdirs():
     names = [entry.name for entry in resolve_entries(["tier1_simple_arms"])]
-    assert len(names) == 64
+    provenance = _bank_provenance()
+    assert len(names) == provenance["train_count"] + provenance["eval_count"]
     assert names == sorted(set(names))
-    assert sum(name.startswith("tier1_simple_arms/train/") for name in names) == 48
-    assert sum(name.startswith("tier1_simple_arms/eval/") for name in names) == 16
+    assert sum(name.startswith("tier1_simple_arms/train/") for name in names) == provenance["train_count"]
+    assert sum(name.startswith("tier1_simple_arms/eval/") for name in names) == provenance["eval_count"]
 
 
 def test_mixed_names_keep_order():
-    entries = resolve_entries(["tier1_simple_arms/eval/v03", "tier0_typed_delivery"])
-    assert [entry.name for entry in entries] == ["tier1_simple_arms/eval/v03", "tier0_typed_delivery"]
+    entries = resolve_entries(["tier1_simple_arms/eval/v000", "tier0_typed_delivery"])
+    assert [entry.name for entry in entries] == ["tier1_simple_arms/eval/v000", "tier0_typed_delivery"]
 
 
 # --- tmp tree: manifests, fallback, error paths ---
