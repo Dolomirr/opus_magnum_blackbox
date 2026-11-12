@@ -1,5 +1,6 @@
 # Tier-1 generalization pipeline: BC bootstrap on the simple-arms train bank,
 # then RL with delivery shaping, then consolidation without it.
+# Bank: full enumerated 6x6 task space, split 80/20 by hex-distance.
 # Run: `just train-tier1`
 
 [run]
