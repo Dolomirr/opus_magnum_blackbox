@@ -67,6 +67,7 @@ def _build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--count", "-n", type=int, default=1,                  help="number of independent solutions")
     generate.add_argument("--seed",        type=int, default=TrainConfig().seed, help="base seed; solution i is seeded with seed + i")
     generate.add_argument("--out-dir",               default="solutions",        help="directory for generated .oms files")
+    generate.add_argument("--temperature", type=float, default=1.0,              help="sampling temperature; >1 fattens the tail")
     generate.add_argument("--device",                default=None)
     # fmt: on
 
@@ -212,7 +213,7 @@ def _generate(args: argparse.Namespace) -> None:
         # reseed both rngs so each solution is independent
         torch.manual_seed(args.seed + i)
         env.reset(seed=args.seed + i)
-        episode = collect_episode(env, policy, device)
+        episode = collect_episode(env, policy, device, sample_temperature=args.temperature)
 
         sol = decode_solution(episode.tokens, spec, vocab)
         if isinstance(sol, GrammarError):
