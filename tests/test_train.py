@@ -1,6 +1,8 @@
 """Trainer smoke: iterations run, metrics and checkpoints land, resume restores state, eval is exhaustive per bank entry."""
 
+import inspect
 import json
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from conftest import known_solution_tokens, make_spec
 from opus_magnum_sym import Hex, LevelSpec
 from torch import nn
 
+from opus_magnum_blackbox import train as train_module
 from opus_magnum_blackbox.config import ModelConfig, TrainConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.families import reference_tokens, single_atom_spec
@@ -305,88 +308,82 @@ def make_solved_batch(env: OpusEnv, levels: list[tuple[object, str]]) -> Rollout
     )
 
 
-def test_sil_rows_carry_distance_class(tmp_path):
-    """Buffer rows record their level's entrance->exit hex distance at insert."""
-    d1_spec = single_atom_spec(Hex(2, 3), Hex(2, 2))
-    d2_spec = single_atom_spec(Hex(2, 3), Hex(2, 1))
+def test_sil_scarcity_draw_hits_first_time_levels_most(tmp_path):
+    """
+    Level A buffered once, level B five times: the weighted draw hits A ~5x more often
+    (probability proportional to 1/counter); a fixed seed reproduces the exact counts.
+    """
+    spec_a = single_atom_spec(Hex(2, 3), Hex(2, 2))
+    spec_b = single_atom_spec(Hex(3, 3), Hex(3, 2))
     env = OpusEnv(
         [
-            LevelEntry(source=d1_spec, cost_max=100, name="bank/d1"),
-            LevelEntry(source=d2_spec, cost_max=100, name="bank/d2"),
+            LevelEntry(source=spec_a, cost_max=100, name="bank/a"),
+            LevelEntry(source=spec_b, cost_max=100, name="bank/b"),
         ]
     )
     torch.manual_seed(0)
     policy = OpusPolicy(env.tokenizer.config, TINY)
-    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1))
-    batch = make_solved_batch(env, [(d1_spec, "bank/d1"), (d2_spec, "bank/d2")])
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=2, sil_weighting="scarcity"))
+    trainer._sil_step(make_solved_batch(env, [(spec_a, "bank/a")]))
+    for _ in range(5):
+        trainer._sil_step(make_solved_batch(env, [(spec_b, "bank/b")]))
+    assert trainer._sil_solves == {"bank/a": 1, "bank/b": 5}
 
-    trainer._sil_step(batch)
+    def draw_counts() -> Counter:
+        torch.manual_seed(7)
+        counts: Counter = Counter()
+        for _ in range(500):
+            for row in trainer._sample_sil_rows():
+                counts[row.level] += 1
+        return counts
 
-    assert trainer._sil_buffer["bank/d1"].distance == 1
-    assert trainer._sil_buffer["bank/d2"].distance == 2
+    counts = draw_counts()
+    assert counts == draw_counts()  # fixed seed: exact, reproducible counts
+    total = counts["bank/a"] + counts["bank/b"]
+    assert counts["bank/a"] == pytest.approx((5 / 6) * total, abs=0.1 * total)
+    assert counts["bank/a"] > 2 * counts["bank/b"]
 
 
-def test_sil_unfixed_entrypoints_count_as_rest(tmp_path):
-    """Unfixed entrypoints have no computable distance: 0, never the d1 stratum."""
-    env = make_env()  # conftest spec: entrypoints unfixed (pos None)
+def test_sil_uniform_weighting_reproduces_legacy_draw(tmp_path):
+    """
+    `sil_weighting="uniform"` is exactly the unstratified draw: seeded randperm over the
+    buffer's insertion order, without replacement.
+    """
+    specs = [
+        (single_atom_spec(Hex(2, 3), Hex(2, 2)), "bank/a"),
+        (single_atom_spec(Hex(3, 3), Hex(3, 2)), "bank/b"),
+        (single_atom_spec(Hex(2, 4), Hex(2, 3)), "bank/c"),
+    ]
+    env = OpusEnv([LevelEntry(source=spec, cost_max=100, name=name) for spec, name in specs])
     torch.manual_seed(0)
     policy = OpusPolicy(env.tokenizer.config, TINY)
-    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1))
-    batch = build_batch([make_sil_episode(env, env.levels[0].source, known_solution_tokens(env.tokenizer.vocab), True, "tier0_test")], env.tokenizer.vocab.pad_id)
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=2))
+    trainer._sil_step(make_solved_batch(env, specs))
+    buffer_rows = list(trainer._sil_buffer.values())
 
-    trainer._sil_step(batch)
-
-    assert trainer._sil_buffer["tier0_test"].distance == 0
-
-
-def test_sil_stratified_minibatch_halves(tmp_path):
-    """sil_stratify: half the draw comes from d1 rows (with replacement), half from the rest."""
-    d1_spec = single_atom_spec(Hex(2, 3), Hex(2, 2))
-    d2_pairs = [((2, 3), (2, 1)), ((3, 3), (3, 1)), ((2, 4), (2, 2)), ((3, 4), (3, 2))]
-    entries = [LevelEntry(source=d1_spec, cost_max=100, name="bank/d1")]
-    for index, (entrance, exit_) in enumerate(d2_pairs):
-        entries.append(LevelEntry(source=single_atom_spec(Hex(*entrance), Hex(*exit_)), cost_max=100, name=f"bank/r{index}"))
-    env = OpusEnv(entries)
-    torch.manual_seed(0)
-    policy = OpusPolicy(env.tokenizer.config, TINY)
-    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=5, sil_stratify=True))
-    trainer._sil_step(
-        make_solved_batch(env, [(entry.source, entry.name) for entry in entries])
-    )
-
-    torch.manual_seed(7)
+    torch.manual_seed(3)
     rows = trainer._sample_sil_rows()
 
-    assert len(rows) == 5
-    d1_picked = [row.level for row in rows if row.distance == 1]
-    rest_picked = [row.level for row in rows if row.distance != 1]
-    assert len(d1_picked) == 2  # half the batch; only one d1 level exists, so it repeats
-    assert set(d1_picked) == {"bank/d1"}
-    assert len(rest_picked) == 3
-    assert set(rest_picked) <= {entry.name for entry in entries[1:]}
+    torch.manual_seed(3)
+    picks = set(torch.randperm(len(buffer_rows))[:2].tolist())
+    expected = [row for index, row in enumerate(buffer_rows) if index in picks]
+    assert [row.level for row in rows] == [row.level for row in expected]
 
 
-def test_sil_stratify_falls_back_to_uniform(tmp_path):
-    """Empty stratum: uniform draw over the whole buffer (distinct rows, no stratification)."""
-    d2_spec = single_atom_spec(Hex(2, 3), Hex(2, 1))
-    d2b_spec = single_atom_spec(Hex(3, 3), Hex(3, 1))
-    env = OpusEnv(
-        [
-            LevelEntry(source=d2_spec, cost_max=100, name="bank/d2"),
-            LevelEntry(source=d2b_spec, cost_max=100, name="bank/d2b"),
-        ]
-    )
-    torch.manual_seed(0)
-    policy = OpusPolicy(env.tokenizer.config, TINY)
-    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=4, sil_stratify=True))
-    trainer._sil_step(make_solved_batch(env, [(d2_spec, "bank/d2"), (d2b_spec, "bank/d2b")]))
+def test_sil_unknown_weighting_is_a_hard_error(tmp_path):
+    """A typo'd sil_weighting must not silently degrade to uniform."""
+    trainer = make_trainer(tmp_path)
+    trainer.train_config = replace(trainer.train_config, sil_weighting="stratified")
+    with pytest.raises(ValueError, match="sil_weighting"):
+        trainer._sample_sil_rows()
 
-    torch.manual_seed(7)
-    rows = trainer._sample_sil_rows()
 
-    assert len(rows) == 2  # capped at buffer size: uniform path draws without replacement
-    assert {row.level for row in rows} == {"bank/d2", "bank/d2b"}
-    assert all(row.distance == 2 for row in rows)
+def test_sil_path_has_no_distance_labels():
+    """
+    Guard: the SIL replay path is label-free — the trainer module never references
+    distance/geometry classes; replay weights derive from solve counters alone.
+    """
+    assert "distance" not in inspect.getsource(train_module)
 
 
 def test_sil_buffer_dedupes_per_level_and_caps(tmp_path):
@@ -410,11 +407,13 @@ def test_sil_buffer_dedupes_per_level_and_caps(tmp_path):
     assert set(trainer._sil_buffer) == {"lvl/a", "lvl/c"}  # failed row never buffered
     assert new_levels == ["lvl/a", "lvl/c"]  # the refresh is not a new level
     assert int(trainer._sil_buffer["lvl/a"].actions.shape[0]) == len(good)  # latest solve kept
+    assert trainer._sil_solves == {"lvl/a": 2, "lvl/c": 1}  # refreshes count toward scarcity
 
     capped = make_trainer(tmp_path / "cap")
     capped.train_config = replace(capped.train_config, sil_coef=0.1, sil_buffer_cap=1)
     capped._sil_step(batch)
     assert set(capped._sil_buffer) == {"lvl/c"}  # oldest levels evicted first
+    assert capped._sil_solves == {"lvl/a": 2, "lvl/c": 1}  # counters outlive cap eviction
 
 
 def test_sil_disabled_is_inert(tmp_path):
@@ -488,6 +487,7 @@ def test_sil_metrics_logged_only_when_enabled(tmp_path):
     entry = read_metrics(off.run_dir)[0]
     assert "sil_loss" not in entry
     assert "sil_buffer" not in entry
+    assert "sil_replay_top" not in entry
 
     on = Trainer(_script_policy(env, spec), [env], replace(base, sil_coef=0.1))
     on.run()
@@ -495,3 +495,4 @@ def test_sil_metrics_logged_only_when_enabled(tmp_path):
     assert entry["sil_loss"] >= 0.0
     assert entry["sil_buffer"] == 1  # both episodes play the same level: one deduped entry
     assert entry["sil_new_levels"] == ["bank/train"]
+    assert entry["sil_replay_top"] == [["bank/train", 1]]  # one buffered level: the draw's single pick
