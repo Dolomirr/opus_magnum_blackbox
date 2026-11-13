@@ -1,5 +1,7 @@
 """OpusEnv: gymnasium compliance, determinism, truncation, full solve."""
 
+import numpy as np
+import torch
 from conftest import known_solution_tokens, make_spec
 from gymnasium.utils.env_checker import check_env
 from opus_magnum_sym import Hex, LevelSpec, StepActionType
@@ -76,6 +78,60 @@ def test_static_failure_episode(vocab):
     assert terminated
     assert reward == -1.0
     assert info["status"] == "static_failure"
+
+
+# --- grammar dead-end termination (stage 2.5 of the hardening plan) ---
+
+
+def test_dead_end_terminates_as_failure():
+    """
+    Greedy-first arm spam on the unfixed-entrypoint spec fills the board mid-layout
+    before [END_LAYOUT] becomes legal: the env terminates the episode itself, before
+    the length cap, with the failure reward and a PAD-only mask (147-token repro).
+    """
+    env = make_env()
+    obs, _ = env.reset(seed=0)
+    steps = 0
+    while True:
+        assert int(obs["action_mask"].sum()) >= 1  # no collector ever sees an empty mask row
+        action = int(np.argmax(obs["action_mask"]))
+        obs, reward, terminated, truncated, info = env.step(action)
+        steps += 1
+        if terminated or truncated:
+            break
+    assert info.get("dead_end") is True
+    assert terminated  # dead end, not length truncation
+    assert not truncated
+    assert steps < env.tokenizer.config.max_decoder_len
+    assert reward == -1.0  # failure penalty via the standard finish path
+    assert info["solved"] is False  # a dead end never submitted: not a solve
+    assert info["episode"]["solved"] is False
+    assert obs["action_mask"].sum() == 1  # PAD-only, like DONE/error paths
+    assert obs["action_mask"][env.tokenizer.vocab.pad_id] == 1
+
+
+def test_masks_never_empty_across_episodes():
+    """
+    Mask invariant on fixed and unfixed specs: random-ish policies step full episodes
+    and every returned observation keeps >= 1 valid token.
+    """
+    levels = [
+        LevelEntry(source=make_spec(), cost_max=50, name="tier0_test"),
+        LevelEntry(source=single_atom_spec(Hex(2, 3), Hex(2, 2)), cost_max=100, name="tier1_fixed"),
+    ]
+    torch.manual_seed(3)
+    for entry in levels:
+        env = OpusEnv([entry])
+        for episode in range(3):
+            obs, _ = env.reset(seed=episode)
+            while True:
+                assert int(obs["action_mask"].sum()) >= 1
+                valid = np.flatnonzero(obs["action_mask"])
+                action = int(valid[torch.randint(0, len(valid), (1,)).item()])
+                obs, _, terminated, truncated, _ = env.step(action)
+                if terminated or truncated:
+                    break
+            assert int(obs["action_mask"].sum()) >= 1  # terminal observation is PAD-only, never empty
 
 
 def test_level_reuse_across_episodes(vocab):

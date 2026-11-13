@@ -483,3 +483,41 @@ def test_old_logprob_is_the_tempered_logprob(env):
     assert tempered_matches == length
     assert discriminating > 0
     assert untempered_matches < length
+
+
+# --- grammar dead-end termination (stage 2.5 of the hardening plan) ---
+
+
+def test_dead_end_episodes_flow_through_collectors(env):
+    """
+    The all-zeros greedy policy spams layout quads into a grammar dead end: both
+    collectors complete, the episode lands as an env-forced failure with finite,
+    correct returns, and the batch counts it.
+    """
+    policy = _ScriptedPolicy(len(env.tokenizer.vocab), torch.zeros(len(env.tokenizer.vocab)))
+
+    episode = collect_episode(env, policy, "cpu", greedy=True)
+    assert episode.dead_end is True
+    assert episode.terminated is True
+    assert episode.solved is False  # spam never counts as a solve
+    assert episode.rewards[-1] == -1.0  # failure penalty on the dead-end step
+    assert episode.returns[-1] == -1.0
+
+    batch = collect_batched([env], policy, 3, "cpu", greedy=True)
+    assert batch.dead_ends == 3
+    assert batch.solve_rate == 0.0
+    assert batch.mean_return == pytest.approx(-1.0)
+    assert torch.isfinite(batch.returns).all()
+
+
+def test_temperature_batch_survives_dead_ends(env):
+    """
+    Stage-3 concern closed: a seeded sampled batch at sample_temperature = 2.0 on the
+    unfixed spec completes without raising, whatever the grammar does mid-episode.
+    """
+    policy = make_scripted_policy(env.tokenizer.vocab)
+    env.reset(seed=0)
+    torch.manual_seed(5)
+    batch = collect_batched([env], policy, 8, "cpu", sample_temperature=2.0)
+    assert batch.actions.shape[0] == 8
+    assert torch.isfinite(batch.returns).all()

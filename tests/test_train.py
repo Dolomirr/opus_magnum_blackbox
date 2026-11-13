@@ -577,3 +577,28 @@ def test_update_importance_ratio_unit_and_clamped(tmp_path):
     loss_cold = cold.update(cold_batch)[0]
     assert math.isfinite(loss_cold)
     assert abs(loss_cold) < 1e-6
+
+
+# --- grammar dead-end metrics (stage 2.5 of the hardening plan) ---
+
+
+def test_dead_ends_logged_only_when_present(tmp_path):
+    """`dead_ends` appears in the metrics row only when the batch contains dead ends."""
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    tokens = known_solution_tokens(vocab)
+
+    def episode(dead_end: bool) -> Episode:
+        built = make_sil_episode(env, env.levels[0].source, tokens, True, "lvl/a")
+        built.dead_end = dead_end
+        return built
+
+    clean = make_trainer(tmp_path / "clean")
+    clean.run_dir.mkdir(parents=True, exist_ok=True)
+    clean._log_metrics(build_batch([episode(False)], vocab.pad_id), 0.0, 0.0, 0.0, 0.0)
+    assert "dead_ends" not in read_metrics(clean.run_dir)[0]
+
+    spammed = make_trainer(tmp_path / "spammed")
+    spammed.run_dir.mkdir(parents=True, exist_ok=True)
+    spammed._log_metrics(build_batch([episode(True)], vocab.pad_id), 0.0, 0.0, 0.0, 0.0)
+    assert read_metrics(spammed.run_dir)[0]["dead_ends"] == 1
