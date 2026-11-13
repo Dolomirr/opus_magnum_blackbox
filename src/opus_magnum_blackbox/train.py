@@ -15,12 +15,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from opus_magnum_sym import ComponentType, Level
 from torch import nn
 
 from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfig, TrainConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
-from opus_magnum_blackbox.families import hex_distance
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import Timer
 from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched, replicate_envs
@@ -31,8 +29,7 @@ class SILRow:
     """
     Replayable solved-episode row: exactly the batch fields the BC loss consumes,
     trimmed to the episode length.
-    `level` is dedup key;
-    `distance` is level's entrance->exit hex distance.
+    `level` is dedup key; its solve counter is in `Trainer._sil_solves`.
     """
 
     # fmt: off
@@ -42,11 +39,10 @@ class SILRow:
     actions        : torch.Tensor # [T] int64
     action_masks   : torch.Tensor # [T, V] bool
     valid          : torch.Tensor # [T] bool
-    distance       : int
     # fmt: on
 
 
-def _sil_row(batch: RolloutBatch, row: int, distance: int) -> SILRow:
+def _sil_row(batch: RolloutBatch, row: int) -> SILRow:
     """
     Slice one solved episode out of a batch.
     """
@@ -58,7 +54,6 @@ def _sil_row(batch: RolloutBatch, row: int, distance: int) -> SILRow:
         actions=batch.actions[row, :length],
         action_masks=batch.action_masks[row, :length],
         valid=batch.valid[row, :length],
-        distance=distance,
     )
 
 
@@ -88,12 +83,13 @@ class Trainer:
         self.policy.to(self.device)  # apply Module to com. device
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.train_config.lr)
         self.iteration = 0
-        # Stage name stamped onto metrics entries while a pipeline stage runs; None outside.
         self.stage: str | None = None
-        # supervision dial (1..10)
+        """Stage name stamped onto metrics entries while a pipeline stage runs; None outside."""
         self.autodiscovery: int | None = autodiscovery
-        # Optional `profile.ProfiledEnvs`; when set, `run` writes `profile.jsonl`.
+        """Supervision dial (1..10)"""
         self.profile = None
+        """Optional `profile.ProfiledEnvs`; when set, `run` writes `profile.jsonl`."""
+
         # Stepping-independent env replicas for the lockstep collector, cached per slot count.
         self._slot_env_pool: dict[int, list[OpusEnv]] = {}
         # Single-level envs for exhaustive greedy eval, cached per env pool + entry name.
@@ -102,11 +98,14 @@ class Trainer:
         self._best_eval_rate: float | None = None
         # Self-imitation buffer: latest solved episode per level name (see `_sil_step`).
         self._sil_buffer: dict[str, SILRow] = {}
-        # Level name to entrance->exit hex distance.
-        self._sil_distances: dict[str, int] | None = None
-        # Sub-second precision: trainer + resume within one second must not share a run dir.
-        # The directory is created lazily on the first write, so resumes can target an existing one.
+        # Buffered solve counters per level name; drives replay weighting.
+        self._sil_solves: dict[str, int] = {}
+        # Per-level picks of latest SIL minibatch; logged as `sil_replay_top`.
+        self._sil_replay_counts: dict[str, int] = {}
+
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
+        """Sub-second precision: trainer + resume within one second must not share a run dir.
+        The directory is created lazily on the first write, so resumes can target an existing one."""
 
     @staticmethod
     def _auto_device() -> str:
@@ -245,9 +244,10 @@ class Trainer:
 
         The buffer keeps the latest solve per level name, capped at `sil_buffer_cap`
         (oldest levels evicted first); it is in-memory only, so resumed runs refill
-        within a few iterations. Rows carry their level's distance class (see
-        `_sil_distance`); with `sil_stratify` on, half of each minibatch is drawn
-        from buffered d1 rows.
+        within a few iterations.
+        Every buffered solve increments level's counter.
+        Minibatch levels are drawn proportionally to 1/counter,
+        so first-time levels dominate and re-solved levels opear less often.
         Returns  no step and no metrics keys when `sil_coef` is 0 or the buffer is still empty.
 
         Returns:
@@ -261,17 +261,18 @@ class Trainer:
             return None, []
         new_levels: list[str] = []
         for row in batch.episode_solved.nonzero(as_tuple=True)[0].tolist():
-            level = batch.level_names[int(row)]
-            entry = _sil_row(batch, int(row), self._sil_distance(level))
+            entry = _sil_row(batch, int(row))
             # pop-then-set keeps a refreshed solve newest, so cap eviction drops stale levels first
             if self._sil_buffer.pop(entry.level, None) is None:
                 new_levels.append(entry.level)
             self._sil_buffer[entry.level] = entry
+            self._sil_solves[entry.level] = self._sil_solves.get(entry.level, 0) + 1
             while len(self._sil_buffer) > config.sil_buffer_cap:
                 self._sil_buffer.pop(next(iter(self._sil_buffer)))
 
         if not self._sil_buffer:
             return None, new_levels
+        self._sil_replay_counts = {}
         rows = self._sample_sil_rows()
         minibatch = self._sil_minibatch(rows)
         loss, _accuracy = self._bc_update(minibatch, torch.arange(len(rows)), loss_scale=config.sil_coef)
@@ -279,45 +280,30 @@ class Trainer:
 
     def _sample_sil_rows(self) -> list[SILRow]:
         """
-        SIL minibatch draw: uniform over the buffer, or - with `sil_stratify` and
-        half of `sil_batch_size` from d1 rows (with replacement, since its small number)
-        and half from the rest.
+        SIL minibatch draw.
+
+        "uniform": seeded shuffle over the buffer, without replacement.
+        "scarcity": levels drawn propotionally to 1/solve counter,
+        with replacement (the buffer keeps one row per level),
+        so rarely solved levels replayed most often.
+        Records per-level picks into `_sil_replay_counts` for the `sil_replay_top` metric.
         """
         config = self.train_config
+        if config.sil_weighting not in ("uniform", "scarcity"):
+            raise ValueError(f"unknown sil_weighting: {config.sil_weighting!r}; expected 'uniform' or 'scarcity'")
         all_rows = list(self._sil_buffer.values())
         size = min(config.sil_batch_size, len(all_rows))
-        d1_rows = [row for row in all_rows if row.distance == 1]
-        rest_rows = [row for row in all_rows if row.distance != 1]
-        if not config.sil_stratify or not d1_rows or not rest_rows:
+        if config.sil_weighting == "scarcity":
+            levels = list(self._sil_buffer)
+            probs = torch.tensor([1.0 / self._sil_solves[name] for name in levels])
+            picks = torch.multinomial(probs, size, replacement=True).tolist()
+            rows = [self._sil_buffer[levels[pick]] for pick in picks]
+        else:
             picks = set(torch.randperm(len(all_rows))[:size].tolist())
-            return [row for index, row in enumerate(all_rows) if index in picks]
-        half = size // 2
-        d1 = [d1_rows[i] for i in torch.randint(0, len(d1_rows), (half,)).tolist()]
-        rest = [rest_rows[i] for i in torch.randint(0, len(rest_rows), (size - half,)).tolist()]
-        return d1 + rest
-
-    def _sil_distance(self, name: str) -> int:
-        """
-        Entrance->exit hex distance for level name, from the level spec.
-
-        Built once per trainer over all env pools; 0 when entrypoints are unfixed
-        or the name is unknown, so such rows never count as d1 for stratification.
-        """
-        if self._sil_distances is None:
-            table: dict[str, int] = {}
-            for env in self.envs:
-                for entry in env.levels:
-                    level = Level.from_file(entry.source) if isinstance(entry.source, Path) else Level(entry.source)
-                    entrance = exit_ = None
-                    for ep in level.spec.entrypoints:
-                        if ep.kind is ComponentType.ENTRANCE:
-                            entrance = ep.pos
-                        elif ep.kind is ComponentType.EXIT:
-                            exit_ = ep.pos
-                    if entrance is not None and exit_ is not None:
-                        table[entry.name] = hex_distance(entrance, exit_)
-            self._sil_distances = table
-        return self._sil_distances.get(name, 0)
+            rows = [row for index, row in enumerate(all_rows) if index in picks]
+        for row in rows:
+            self._sil_replay_counts[row.level] = self._sil_replay_counts.get(row.level, 0) + 1
+        return rows
 
     def _sil_minibatch(self, rows: list[SILRow]) -> RolloutBatch:
         """
@@ -616,6 +602,9 @@ class Trainer:
             entry["sil_loss"] = sil_loss
             entry["sil_buffer"] = len(self._sil_buffer)
             entry["sil_new_levels"] = sil_new_levels or []
+            # most-replayed levels of this iteration's draw, as [name, picks] pairs
+            ranked = sorted(self._sil_replay_counts.items(), key=lambda item: (-item[1], item[0]))
+            entry["sil_replay_top"] = [[name, count] for name, count in ranked[:5]]
         if self.stage is not None:
             entry["stage"] = self.stage
         self._stamp_autodiscovery(entry)
