@@ -36,6 +36,7 @@ class Episode:
     solved         : bool
     terminated     : bool             # False for truncated episodes
     level          : str = ""         # source level name (per-level dedup key)
+    dead_end       : bool = False     # terminated by an empty grammar mask (env-forced failure)
     # fmt: on
 
 
@@ -61,6 +62,7 @@ class RolloutBatch:
     mean_return    : float
     solve_rate     : float
     mean_length    : float
+    dead_ends      : int = 0      # episodes terminated by an empty grammar mask
     # fmt: on
 
 
@@ -125,6 +127,7 @@ def collect_episode(  # noqa: PLR0913, PLR0917
     encoder_length = int(obs["encoder_length"])
     tokens, masks, logprobs, values, rewards = [], [], [], [], []
     solved = terminated = False
+    dead_end = False
 
     with torch.no_grad():
         while True:
@@ -153,6 +156,7 @@ def collect_episode(  # noqa: PLR0913, PLR0917
             rewards.append(float(reward))
             if terminated or truncated:
                 solved = bool(info.get("solved", False))
+                dead_end = bool(info.get("dead_end", False))
                 break
 
     return Episode(
@@ -167,6 +171,7 @@ def collect_episode(  # noqa: PLR0913, PLR0917
         solved=solved,
         terminated=terminated,
         level=str(info.get("level", "")),
+        dead_end=dead_end,
     )
 
 
@@ -194,12 +199,13 @@ class _Slot:
     logprobs: list[float]
     values: list[float]
     rewards: list[float]
+    dead_end: bool
 
     def reset(self) -> None:
         self.obs, _ = self.env.reset()
         self.encoder_input = self.obs["encoder_input"]
         self.encoder_length = int(self.obs["encoder_length"])
-        self.tokens, self.masks, self.logprobs, self.values, self.rewards = [], [], [], [], []
+        self.tokens, self.masks, self.logprobs, self.values, self.rewards, self.dead_end = [], [], [], [], [], False
 
     def episode(self, terminated: bool, info: dict, gamma: float) -> Episode:
         """
@@ -217,6 +223,7 @@ class _Slot:
             solved=bool(info.get("solved", False)),
             terminated=terminated,
             level=str(info.get("level", "")),
+            dead_end=bool(info.get("dead_end", False)),
         )
 
 
@@ -357,6 +364,7 @@ def collect_batched(  # noqa: PLR0913, PLR0917
             logprobs=[],
             values=[],
             rewards=[],
+            dead_end=False,
         )
         for i in range(n)
     ]
@@ -467,6 +475,7 @@ def build_batch(episodes: list[Episode], pad_id: int) -> RolloutBatch:
         mean_return=sum(e.returns[0] for e in episodes) / batch_size,
         solve_rate=sum(e.solved for e in episodes) / batch_size,
         mean_length=sum(len(e.tokens) for e in episodes) / batch_size,
+        dead_ends=sum(e.dead_end for e in episodes),
     )
 
 

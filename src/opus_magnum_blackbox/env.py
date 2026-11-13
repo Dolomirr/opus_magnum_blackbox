@@ -151,10 +151,23 @@ class OpusEnv(gym.Env):
 
         reward = 0.0 if valid else self.reward_config.invalid_action_penalty
         info: dict = {"level": self._current.name}
-        if terminated or truncated:
+        obs = self._observation()
+        if not terminated and int(self._mask.sum()) == 0:
+            # empty mask is true: no legal token exists, so finish over the normal path
             reward, info = self._finish(info)
             info["level"] = self._current.name
-        return self._observation(), reward, terminated, truncated, info
+            info["dead_end"] = True
+            # dead end never submitted, so it is not a solve
+            info["solved"] = False
+            info["episode"]["solved"] = False
+            terminated = True
+            truncated = False
+            obs["action_mask"][:] = 0
+            obs["action_mask"][self.tokenizer.vocab.pad_id] = 1
+        elif terminated or truncated:
+            reward, info = self._finish(info)
+            info["level"] = self._current.name
+        return obs, reward, terminated, truncated, info
 
     def _finish(self, info: dict) -> tuple[float, dict]:
         level = self._level_cache[self._current.name]

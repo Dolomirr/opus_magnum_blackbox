@@ -606,6 +606,8 @@ class Trainer:
             "entropy": entropy,
             "wall_time": wall_time,
         }
+        if batch.dead_ends:
+            entry["dead_ends"] = batch.dead_ends  # grammar dead ends: env-forced failures
         if sil_loss is not None:
             entry["sil_loss"] = sil_loss
             entry["sil_buffer"] = len(self._sil_buffer)
