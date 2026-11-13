@@ -78,7 +78,7 @@ class TrainConfig:
     sil_coef               : float = 0.0       # self-imitation BC weight over buffered solved episodes
     sil_batch_size         : int   = 8         # rows per SIL minibatch
     sil_buffer_cap         : int   = 256       # buffered solved episodes, deduped per level (latest kept)
-    sil_weighting          : str   = "uniform" # SIL minibatch draw: "uniform" or "scarcity" (replay ∝ 1/solve count)
+    sil_weighting          : str   = "uniform" # SIL draw: "uniform" | "scarcity" (proporional to 1/n) | "fail" (half from failed)
     value_coef             : float = 0.5
     gamma                  : float = 1.0
     grad_clip              : float = 1.0

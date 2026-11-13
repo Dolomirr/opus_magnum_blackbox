@@ -105,6 +105,10 @@ class Trainer:
         self._sil_solves: dict[str, int] = {}
         # Per-level picks of latest SIL minibatch; logged as `sil_replay_top`.
         self._sil_replay_counts: dict[str, int] = {}
+        # Latest exhaustive greedy pass per train level name; drives the "fail" SIL weighting.
+        self._greedy_passes: dict[str, bool] = {}
+        # Failed-and-buffered group size of the latest "fail" draw; logged as `sil_fail_group`.
+        self._sil_fail_group: int | None = None
 
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
         """Sub-second precision: trainer + resume within one second must not share a run dir.
@@ -299,21 +303,42 @@ class Trainer:
         "scarcity": levels drawn propotionally to 1/solve counter,
         with replacement (the buffer keeps one row per level),
         so rarely solved levels replayed most often.
-        Records per-level picks into `_sil_replay_counts` for the `sil_replay_top` metric.
+        "fail": half from buffered levels whose latest greedy eval failed, half from
+        the rest, both with replacement; falls back to uniform while either group
+        is empty (also before the first eval).
+        Records per-level picks into `_sil_replay_counts` for the `sil_replay_top` metric,
+        and the failed-group size into `_sil_fail_group` for the `sil_fail_group` metric.
         """
         config = self.train_config
-        if config.sil_weighting not in ("uniform", "scarcity"):
-            raise ValueError(f"unknown sil_weighting: {config.sil_weighting!r}; expected 'uniform' or 'scarcity'")
+        if config.sil_weighting not in ("uniform", "scarcity", "fail"):
+            raise ValueError(
+                f"unknown sil_weighting: {config.sil_weighting!r}; expected 'uniform', 'scarcity' or 'fail'"
+            )
         all_rows = list(self._sil_buffer.values())
         size = min(config.sil_batch_size, len(all_rows))
+
+        def uniform_rows() -> list[SILRow]:
+            picks = set(torch.randperm(len(all_rows))[:size].tolist())
+            return [row for index, row in enumerate(all_rows) if index in picks]
+
         if config.sil_weighting == "scarcity":
             levels = list(self._sil_buffer)
             probs = torch.tensor([1.0 / self._sil_solves[name] for name in levels])
             picks = torch.multinomial(probs, size, replacement=True).tolist()
             rows = [self._sil_buffer[levels[pick]] for pick in picks]
+        elif config.sil_weighting == "fail":
+            failed = [row for name, row in self._sil_buffer.items() if self._greedy_passes.get(name) is False]
+            rest = [row for name, row in self._sil_buffer.items() if self._greedy_passes.get(name) is not False]
+            self._sil_fail_group = len(failed)
+            if failed and rest:
+                half = size // 2
+                failed_picks = torch.randint(len(failed), (half,))
+                rest_picks = torch.randint(len(rest), (size - half,))
+                rows = [failed[pick] for pick in failed_picks.tolist()] + [rest[pick] for pick in rest_picks.tolist()]
+            else:
+                rows = uniform_rows()
         else:
-            picks = set(torch.randperm(len(all_rows))[:size].tolist())
-            rows = [row for index, row in enumerate(all_rows) if index in picks]
+            rows = uniform_rows()
         for row in rows:
             self._sil_replay_counts[row.level] = self._sil_replay_counts.get(row.level, 0) + 1
         return rows
@@ -381,16 +406,21 @@ class Trainer:
     def evaluate(self) -> float:
         """
         Exhaustive greedy solve rate over the train bank: one episode per level entry.
+        Keeps the per-level pass/fail outcome on the trainer for the "fail" SIL weighting.
         """
-        return self._greedy_solve_rate(self.envs)
+        return self._greedy_solve_rate(self.envs, record=True)
 
-    def _greedy_solve_rate(self, envs: list[OpusEnv]) -> float:
+    def _greedy_solve_rate(self, envs: list[OpusEnv], record: bool = False) -> float:
         """
         One deterministic greedy episode per level entry across `envs` banks.
+        With `record`, per-level outcomes are kept as name → bool in `_greedy_passes`;
+        the eval-bank pass stays aggregate-only.
         """
         self.policy.eval()
         entry_envs = [self._entry_env(envs, entry) for env in envs for entry in env.levels]
         batch = collect_batched(entry_envs, self.policy, len(entry_envs), self.device, greedy=True)
+        if record:
+            self._greedy_passes.update(zip(batch.level_names, batch.episode_solved.tolist(), strict=True))
         return batch.solve_rate
 
     def _entry_env(self, pool: list[OpusEnv], entry: LevelEntry) -> OpusEnv:
@@ -620,6 +650,8 @@ class Trainer:
             # most-replayed levels of this iteration's draw, as [name, picks] pairs
             ranked = sorted(self._sil_replay_counts.items(), key=lambda item: (-item[1], item[0]))
             entry["sil_replay_top"] = [[name, count] for name, count in ranked[:5]]
+            if self._sil_fail_group is not None:
+                entry["sil_fail_group"] = self._sil_fail_group
         if self.stage is not None:
             entry["stage"] = self.stage
         self._stamp_autodiscovery(entry)
