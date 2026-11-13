@@ -2,6 +2,7 @@
 
 import inspect
 import json
+import math
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -496,3 +497,83 @@ def test_sil_metrics_logged_only_when_enabled(tmp_path):
     assert entry["sil_buffer"] == 1  # both episodes play the same level: one deduped entry
     assert entry["sil_new_levels"] == ["bank/train"]
     assert entry["sil_replay_top"] == [["bank/train", 1]]  # one buffered level: the draw's single pick
+
+
+# --- sampling temperature (stage 2 of the hardening plan) ---
+
+
+def test_sample_temperature_one_run_matches_default(tmp_path):
+    """
+    Explicit sample_temperature=1.0 runs byte-identical to the default (knob unset):
+    same seeded trajectories, losses and eval rates (modulo wall time / timestamps).
+    """
+    run_metrics = []
+    for config in (
+        make_config(tmp_path / "default", iterations=2, eval_interval=2, checkpoint_interval=10),
+        replace(make_config(tmp_path / "explicit", iterations=2, eval_interval=2, checkpoint_interval=10), sample_temperature=1.0),
+    ):
+        env = make_env()
+        torch.manual_seed(0)
+        policy = OpusPolicy(env.tokenizer.config, TINY)
+        trainer = Trainer(policy, [env], config)
+        trainer.run()
+        run_metrics.append([{k: v for k, v in entry.items() if k not in ("timestamp", "wall_time")} for entry in read_metrics(trainer.run_dir)])
+    assert run_metrics[0] == run_metrics[1]
+
+
+def test_update_importance_ratio_unit_and_clamped(tmp_path):
+    """
+    `update()` weights each step by exp(fresh - old) clamped to [0, 2], detached:
+    old == fresh (T = 1 replay) gives the plain REINFORCE loss bit-for-bit;
+    a 200-nat stale gap clamps at the bounds and stays finite.
+    """
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    spec = env.levels[0].source
+    tokens = known_solution_tokens(vocab)
+    padded, encoder_length = env.tokenizer.encode_level_spec(spec)
+    episode = Episode(
+        encoder_input=padded,
+        encoder_length=encoder_length,
+        tokens=tokens,
+        masks=[env.masker.mask(tokens[:t], spec) for t in range(len(tokens))],
+        logprobs=[0.0] * len(tokens),
+        values=[0.0] * len(tokens),
+        rewards=[0.0] * len(tokens),
+        returns=[1.0] * len(tokens),  # nonzero advantages
+        solved=True,
+        terminated=True,
+        level="lvl/a",
+    )
+    batch = build_batch([episode], vocab.pad_id)
+
+    def fresh_forward(policy: OpusPolicy, rollout: RolloutBatch) -> tuple[torch.Tensor, torch.Tensor]:
+        """Teacher-forced fresh logprobs and values, mirroring `update`'s masking."""
+        action_masks = rollout.action_masks.clone()
+        action_masks[~rollout.valid, vocab.pad_id] = True
+        with torch.no_grad():
+            logits, values = policy(rollout.encoder_input, rollout.encoder_length, rollout.actions, rollout.decoder_length)
+            dist = policy.masked_distribution(logits[:, :-1], action_masks)
+            return dist.log_prob(rollout.actions), values[:, :-1]
+
+    def make() -> tuple[Trainer, torch.Tensor, torch.Tensor]:
+        torch.manual_seed(0)  # identical weights for every case
+        policy = OpusPolicy(env.tokenizer.config, TINY)
+        trainer = Trainer(policy, [env], make_config(tmp_path / f"case{len(list(tmp_path.iterdir()))}"))
+        return trainer, *fresh_forward(policy, batch)
+
+    unit, fresh, values = make()
+    advantages = batch.returns - values  # update computes (returns - values).detach(); same numbers
+    expected = -(fresh * advantages)[batch.valid].mean()
+    unit_batch = replace(batch, old_logprobs=fresh, old_values=values)
+    assert unit.update(unit_batch)[0] == expected.item()  # ratio exactly 1
+
+    hot, fresh, _ = make()
+    hot_batch = replace(batch, old_logprobs=fresh - 200.0)  # exp(+200) overflows: clamps at 2
+    assert hot.update(hot_batch)[0] == pytest.approx(2.0 * expected.item(), rel=1e-9)
+
+    cold, fresh, _ = make()
+    cold_batch = replace(batch, old_logprobs=fresh + 200.0)  # exp(-200): finite, contribution vanishes
+    loss_cold = cold.update(cold_batch)[0]
+    assert math.isfinite(loss_cold)
+    assert abs(loss_cold) < 1e-6

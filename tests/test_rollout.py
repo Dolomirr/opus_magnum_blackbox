@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 from conftest import known_solution_tokens, make_spec
+from torch import nn
 
 from opus_magnum_blackbox.config import ModelConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
@@ -333,3 +334,152 @@ def test_batch_solved_flags_and_levels_align(env, policy, tokenizer, masker):
     assert supervised.level_names == [""]
 
     assert collect_episode(env, policy, "cpu").level == "tier0_test"
+
+
+# --- sampling temperature (stage 2 of the hardening plan) ---
+
+
+class _ScriptedPolicy(nn.Module):
+    """
+    Test double scoring every position with one frozen per-token logits vector:
+    spread over the whole vocabulary (so per-step distributions are non-uniform
+    wherever the mask allows a choice) and boosted on structural tokens (so episodes
+    terminate cleanly). Deterministic and reproducible; matches the collectors' two
+    call shapes: `encode`, then forward with precomputed memory.
+    """
+
+    def __init__(self, vocab_size: int, logits: torch.Tensor):
+        super().__init__()
+        assert logits.shape == (vocab_size,)
+        self.model_config = ModelConfig()
+        self.vocab_size = vocab_size
+        self.register_buffer("logits_row", logits)
+
+    def encode(self, encoder_input, encoder_length):
+        batch = encoder_input.shape[0]
+        return torch.zeros(batch, 4, 8), torch.zeros(batch, 4, dtype=torch.bool)
+
+    def masked_distribution(self, logits, action_mask):
+        return torch.distributions.Categorical(logits=logits.masked_fill(~action_mask.bool(), float("-inf")))
+
+    def forward(  # noqa: PLR0913, PLR0917
+        self, encoder_input, encoder_length, decoder_history, decoder_length, memory=None, memory_pad_mask=None
+    ):
+        batch, steps = decoder_history.shape
+        logits = self.logits_row.to(decoder_history.device).view(1, 1, -1).expand(batch, steps + 1, -1)
+        return logits, torch.zeros(batch, steps + 1)
+
+
+def make_scripted_policy(vocab) -> _ScriptedPolicy:
+    """
+    Fixed logits vector: N(0, 2) per token, plus a boost on [END_LAYOUT]/[SUBMIT] and
+    every entry-slot token so sampled episodes terminate instead of filling the board.
+    """
+    torch.manual_seed(11)
+    logits = torch.randn(len(vocab)) * 2.0
+    logits[vocab.special_id("[END_LAYOUT]")] += 5.0
+    logits[vocab.special_id("[SUBMIT]")] += 5.0
+    for token in range(vocab.ranges["entry_slot"].start, vocab.ranges["entry_slot"].stop):
+        logits[token] += 3.0
+    return _ScriptedPolicy(len(vocab), logits)
+
+
+
+def test_unit_temperature_matches_default_rollouts(env, policy):
+    """sample_temperature=1.0 reproduces today's seeded trajectories exactly, both collectors."""
+    env.reset(seed=0)
+    torch.manual_seed(0)
+    default_batch = collect_batched([env], policy, 3, "cpu")
+    env.reset(seed=0)
+    torch.manual_seed(0)
+    unit_batch = collect_batched([env], policy, 3, "cpu", sample_temperature=1.0)
+    assert torch.equal(default_batch.actions, unit_batch.actions)
+    assert torch.equal(default_batch.old_logprobs, unit_batch.old_logprobs)
+
+    env.reset(seed=0)
+    torch.manual_seed(0)
+    default_episode = collect_episode(env, policy, "cpu")
+    env.reset(seed=0)
+    torch.manual_seed(0)
+    unit_episode = collect_episode(env, policy, "cpu", sample_temperature=1.0)
+    assert default_episode.tokens == unit_episode.tokens
+    assert default_episode.logprobs == unit_episode.logprobs
+
+
+def test_greedy_ignores_temperature(env, policy):
+    """Greedy rollouts (train-bank eval, CLI eval) must be identical under any temperature."""
+    env.reset(seed=0)
+    torch.manual_seed(4)
+    plain_batch = collect_batched([env], policy, 2, "cpu", greedy=True)
+    env.reset(seed=0)
+    torch.manual_seed(4)
+    hot_batch = collect_batched([env], policy, 2, "cpu", greedy=True, sample_temperature=5.0)
+    assert torch.equal(plain_batch.actions, hot_batch.actions)
+    assert torch.equal(plain_batch.old_logprobs, hot_batch.old_logprobs)
+
+    env.reset(seed=0)
+    plain_episode = collect_episode(env, policy, "cpu", greedy=True)
+    env.reset(seed=0)
+    hot_episode = collect_episode(env, policy, "cpu", greedy=True, sample_temperature=5.0)
+    assert plain_episode.tokens == hot_episode.tokens
+    assert plain_episode.logprobs == hot_episode.logprobs
+
+
+def test_high_temperature_widens_sampled_tokens(env):
+    """
+    T = 2 fattens the tail: the same seeded batch of scripted episodes visits more
+    distinct token ids at T = 2 than at T = 1; fixed seed reproduces the exact sizes.
+    """
+    policy = make_scripted_policy(env.tokenizer.vocab)
+
+    def distinct_tokens(temperature: float) -> int:
+        env.reset(seed=0)
+        torch.manual_seed(5)
+        batch = collect_batched([env], policy, 8, "cpu", sample_temperature=temperature)
+        return len({int(token) for row in batch.actions for token in row})
+
+    cold = distinct_tokens(1.0)
+    hot = distinct_tokens(2.0)
+    assert hot > cold
+    assert hot == distinct_tokens(2.0)  # fixed seed: exact, reproducible
+
+
+def test_old_logprob_is_the_tempered_logprob(env):
+    """
+    Hand fixture, T = 2: every recorded logprob equals log softmax(logits / 2) of the
+    scripted policy at the sampled token, and measurably differs from the untempered
+    logprob on at least one step — so the recording provably came from the tempered
+    distribution.
+    """
+    policy = make_scripted_policy(env.tokenizer.vocab)
+    env.reset(seed=0)
+    torch.manual_seed(2)
+    episode = collect_episode(env, policy, "cpu", sample_temperature=2.0)
+    length = len(episode.tokens)
+    assert length > 0
+
+    with torch.no_grad():
+        padded = torch.zeros(1, env.tokenizer.config.max_decoder_len, dtype=torch.long)
+        padded[0, :length] = torch.tensor(episode.tokens)
+        logits, _ = policy(
+            torch.from_numpy(episode.encoder_input).unsqueeze(0),
+            torch.tensor([episode.encoder_length]),
+            padded,
+            torch.tensor([length]),
+        )
+
+    tempered_matches = untempered_matches = discriminating = 0
+    for t, (token, mask, logprob) in enumerate(zip(episode.tokens, episode.masks, episode.logprobs, strict=True)):
+        invalid = torch.from_numpy(~mask)
+        tempered = logits[0, t] / 2.0
+        tempered[invalid] = float("-inf")
+        untempered = logits[0, t].clone()
+        untempered[invalid] = float("-inf")
+        tempered_logprob = float(tempered.log_softmax(dim=-1)[token])
+        untempered_logprob = float(untempered.log_softmax(dim=-1)[token])
+        tempered_matches += math.isclose(logprob, tempered_logprob, rel_tol=1e-5)
+        untempered_matches += math.isclose(logprob, untempered_logprob, rel_tol=1e-5)
+        discriminating += abs(tempered_logprob - untempered_logprob) > 0.05
+    assert tempered_matches == length
+    assert discriminating > 0
+    assert untempered_matches < length
