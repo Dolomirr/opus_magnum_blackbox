@@ -154,6 +154,7 @@ class Trainer:
                     self.device,
                     gamma=self.train_config.gamma,
                     explore_epsilon=self.train_config.explore_epsilon,
+                    sample_temperature=self.train_config.sample_temperature,
                 )
             with self._timed("update"):
                 policy_loss, value_loss, entropy = self.update(batch)
@@ -203,6 +204,7 @@ class Trainer:
         actions        = batch.actions.to(self.device)
         decoder_length = batch.decoder_length.to(self.device)
         action_masks   = batch.action_masks.to(self.device)
+        old_logprobs   = batch.old_logprobs.to(self.device)
         returns        = batch.returns.to(self.device)
         valid          = batch.valid.to(self.device)
         # fmt:on
@@ -222,7 +224,13 @@ class Trainer:
         entropy = dist.entropy()
         advantages = (returns - values).detach()
 
-        policy_loss = -(logprobs * advantages)[valid].mean()
+        # Off-policy correction: rollout actions came from collection-time policy,
+        # possibly with temperature.
+        # Weight gradient, clamped Pso stale or overflowing ratios cannot blow up the step.
+        # Impossible samples have 0 ratio.
+        ratio = (logprobs - old_logprobs).exp().clamp(min=0.0, max=2.0).detach()
+        contributions = torch.where(ratio > 0.0, logprobs * advantages * ratio, torch.zeros_like(ratio))
+        policy_loss = -contributions[valid].mean()
         value_loss = ((values - returns) ** 2)[valid].mean()
         entropy = entropy[valid].mean()
 

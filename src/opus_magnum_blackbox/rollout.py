@@ -107,6 +107,7 @@ def collect_episode(  # noqa: PLR0913, PLR0917
     greedy: bool = False,
     gamma: float = 1.0,
     explore_epsilon: float = 0.0,
+    sample_temperature: float = 1.0,
 ) -> Episode:
     """
     Roll-out one episode for masked policy (sampled, or argmax when greedy).
@@ -114,7 +115,10 @@ def collect_episode(  # noqa: PLR0913, PLR0917
     `explore_epsilon` applies to sampled steps only: a per-step Bernoulli(epsilon)
     picks between the plain policy sample (recorded under the policy) and the
     `(1 - epsilon) * p + epsilon * u` mixture (recorded under the mixture).
+    `sample_temperature` divides logits by `T` before softmax on sampled
+    steps only.
     Greedy rollouts ignore it.
+    Logprob always belongs to the distribution token was drawn from.
     """
     obs, _ = env.reset()
     encoder_input = obs["encoder_input"]
@@ -127,6 +131,8 @@ def collect_episode(  # noqa: PLR0913, PLR0917
             mask = obs["action_mask"].astype(bool)
             mask_tensor = torch.from_numpy(mask).to(device)
             logits, value = _forward_observation(policy, obs, device)
+            if not greedy and sample_temperature != 1.0:
+                logits = logits / sample_temperature
             dist = policy.masked_distribution(logits, mask_tensor)
             if greedy:
                 action = int(dist.probs.argmax())
@@ -249,6 +255,7 @@ def _batched_step(  # noqa: PLR0913, PLR0917
     memory_pad_mask: torch.Tensor,
     greedy: bool,
     explore_epsilon: float = 0.0,
+    sample_temperature: float = 1.0,
 ) -> tuple[list[int], list[float], list[float]]:
     """
     One policy decision for `rows` stacked observations
@@ -259,6 +266,8 @@ def _batched_step(  # noqa: PLR0913, PLR0917
 
     With `explore_epsilon` > 0 on sampled steps, every row samples: mixture
     over valid tokens mask and scores it; greedy steps are unaffected.
+    `sample_temperature` divides masked logits by T on sampled steps only;
+    greedy steps are unaffected.
     """
     buffer = staging[:rows].to(device, non_blocking=True)
     decoder_history = buffer[:, :max_dec]
@@ -271,6 +280,8 @@ def _batched_step(  # noqa: PLR0913, PLR0917
     step_values = values.gather(1, decoder_length.view(-1, 1)).squeeze(1)
 
     masked = step_logits.masked_fill(~action_mask, float("-inf"))
+    if not greedy and sample_temperature != 1.0:
+        masked = masked / sample_temperature
     logsumexp = masked.logsumexp(dim=-1)
     probs = masked.softmax(dim=-1)
     action = probs.argmax(dim=-1) if greedy else torch.multinomial(probs, 1).squeeze(1)
@@ -312,6 +323,7 @@ def collect_batched(  # noqa: PLR0913, PLR0917
     greedy: bool = False,
     gamma: float = 1.0,
     explore_epsilon: float = 0.0,
+    sample_temperature: float = 1.0,
 ) -> RolloutBatch:
     """
     N episodes over `n` lockstep slots,
@@ -319,7 +331,7 @@ def collect_batched(  # noqa: PLR0913, PLR0917
 
     Each token-step issues one batched policy forward across the active slots.
     `explore_epsilon` mixes mask-uniform exploration into sampled slots.
-    Greedy runs ignore it.
+    `sample_temperature` tempers sampled slots' softmax; greedy runs ignore both.
 
     Finished slot refills only while "demand" is begger then other slots capacity,
     otherwise retires from active set;
@@ -384,6 +396,7 @@ def collect_batched(  # noqa: PLR0913, PLR0917
                 memory_pad_mask,
                 greedy,
                 explore_epsilon,
+                sample_temperature,
             )
 
             # Snapshot: finishing slots may retire from `active` below.
