@@ -384,7 +384,8 @@ episodes = 2
 def test_autodiscovery_scales_bc_and_stamps_run(tmp_path):
     run_dir, metrics = _run_ad_pipeline(tmp_path, 5)
 
-    assert run_dir.name.endswith("-ad5")  # sweep runs are distinguishable by name
+    # derived tag: config stem + dial + non-default rl knobs (episodes 2)
+    assert run_dir.name.endswith("-pipeline-ad5-ep2")
     assert all(entry["autodiscovery"] == 5 for entry in metrics)  # stamped on every row
     # round(9 * 5 / 9) = 5 bc epochs, logged on eval epoch 3 and the final epoch 5
     bc = [entry for entry in metrics if entry.get("stage") == "bc"]
@@ -424,3 +425,129 @@ def test_autodiscovery_one_is_keyless_behavior(tmp_path):
     # k=1 keeps historical run naming on both runs
     assert "-ad" not in keyless_dir.name
     assert "-ad" not in dialed_dir.name
+
+
+def test_run_tag_derivation_from_knobs(tmp_path):
+    path = _write_pipeline(
+        tmp_path,
+        """
+[run]
+levels = ["tier0_typed_delivery"]
+autodiscovery = 9
+
+[[stage]]
+name = "rl-shape"
+kind = "rl"
+iterations = 400
+episodes = 32
+lr = 1e-4
+entropy_coef = 0.005
+shaping_weight = 0.5
+progress_weight = 0.3
+sil_coef = 0.4
+sil_batch_size = 32
+sil_weighting = "scarcity"
+sample_temperature = 2.0
+
+[[stage]]
+name = "rl-consolidate"
+kind = "rl"
+iterations = 2000
+episodes = 32
+lr = 1e-4
+entropy_coef = 0.001
+progress_weight = 0.3
+sil_coef = 0.4
+sil_batch_size = 32
+sil_weighting = "scarcity"
+sample_temperature = 2.0
+eval_patience = 20
+""",
+    )
+    # stem first, then the dial, then per-stage deltas in field order, deduped across stages
+    assert load_pipeline(path).tag == "pipeline-ad9-lr0001-ent005-t2-sil4-silb32-silwscarcity-sh5-pg3-ent001"
+    path.write_text(path.read_text().replace("autodiscovery = 9\n", ""))
+    assert load_pipeline(path).tag == "pipeline-lr0001-ent005-t2-sil4-silb32-silwscarcity-sh5-pg3-ent001"
+
+
+def test_run_tag_override_wins(tmp_path):
+    path = _write_pipeline(
+        tmp_path,
+        """
+[run]
+levels = ["tier0_typed_delivery"]
+tag = "custom-arm"
+
+[[stage]]
+name = "rl-a"
+kind = "rl"
+iterations = 1
+episodes = 2
+""",
+    )
+    assert load_pipeline(path).tag == "custom-arm"
+
+    for bad in ('tag = ""', 'tag = "a/b"', 'tag = "a\\\\b"', "tag = 7"):
+        path.write_text(path.read_text().replace('tag = "custom-arm"', bad))
+        with pytest.raises(ValueError, match=r"tag` must be a non-empty string without path separators"):
+            load_pipeline(path)
+
+
+def test_config_toml_copied_to_run_dir(tmp_path):
+    oms = tmp_path / "tier0_test.oms"
+    oms.write_text(TIER0_OMS.read_text())
+    path = _write_pipeline(
+        tmp_path,
+        """
+[run]
+levels = ["tier0_typed_delivery"]
+seed = 0
+device = "cpu"
+tag = "custom-arm"
+
+[[stage]]
+name = "rl-a"
+kind = "rl"
+iterations = 1
+episodes = 2
+""",
+    )
+    pipeline = load_pipeline(path)
+    pipeline = replace(pipeline, train_config=replace(pipeline.train_config, run_dir=str(tmp_path)))
+    entries = [LevelEntry(source=make_spec(), cost_max=50, name="tier0_test", solutions=(oms,))]
+
+    run_dir = run_pipeline(pipeline, entries=entries)
+    assert run_dir.name.endswith("-custom-arm")  # override wins over derivation
+    assert (run_dir / "config.toml").read_bytes() == path.read_bytes()
+
+    # programmatic configs carry no source: no provenance copy
+    bare_run = run_pipeline(replace(pipeline, source=None), entries=entries)
+    assert not (bare_run / "config.toml").exists()
+
+
+def test_same_config_reruns_get_unique_dirs(tmp_path):
+    oms = tmp_path / "tier0_test.oms"
+    oms.write_text(TIER0_OMS.read_text())
+    path = _write_pipeline(
+        tmp_path,
+        """
+[run]
+levels = ["tier0_typed_delivery"]
+seed = 0
+device = "cpu"
+
+[[stage]]
+name = "rl-a"
+kind = "rl"
+iterations = 1
+episodes = 2
+""",
+    )
+    pipeline = load_pipeline(path)
+    pipeline = replace(pipeline, train_config=replace(pipeline.train_config, run_dir=str(tmp_path)))
+    entries = [LevelEntry(source=make_spec(), cost_max=50, name="tier0_test", solutions=(oms,))]
+
+    first = run_pipeline(pipeline, entries=entries)
+    second = run_pipeline(pipeline, entries=entries)
+    assert first != second  # timestamp prefix keeps same-config reruns unique
+    assert first.name.split("-", 3)[3] == second.name.split("-", 3)[3]  # same levels label + derived tag

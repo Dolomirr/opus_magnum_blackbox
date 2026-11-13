@@ -71,6 +71,7 @@ class Trainer:
         model_config: ModelConfig | None = None,
         eval_envs: list[OpusEnv] | None = None,
         autodiscovery: int | None = None,
+        tag: str = "",
     ) -> None:
         self.policy = policy
         self.envs = envs
@@ -87,6 +88,8 @@ class Trainer:
         """Stage name stamped onto metrics entries while a pipeline stage runs; None outside."""
         self.autodiscovery: int | None = autodiscovery
         """Supervision dial (1..10)"""
+        self.tag = tag
+        """Run-dir suffix tag (config stem + knobs); empty falls back to the `-adN` suffix."""
         self.profile = None
         """Optional `profile.ProfiledEnvs`; when set, `run` writes `profile.jsonl`."""
 
@@ -123,7 +126,9 @@ class Trainer:
         label = "/".join(common) if common else names[0]
         # Flatten group separators: the label must stay a single path segment.
         name = f"{stamp}-{label.replace('/', '_')}"
-        if self.autodiscovery is not None and self.autodiscovery > 1:
+        if self.tag:
+            name += f"-{self.tag}"
+        elif self.autodiscovery is not None and self.autodiscovery > 1:
             name += f"-ad{self.autodiscovery}"
         return name
 

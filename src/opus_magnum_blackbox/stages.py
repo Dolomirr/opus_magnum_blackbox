@@ -7,7 +7,10 @@ Config schema:
     (bank for greedy eval), `seed`, `device`,
     `autodiscovery` (int 1..10, default 1;
         scales every pretrain stage's epochs rounded to provided fraction.
-        k=10 zeroes them and the stage is skipped).
+        k=10 zeroes them and the stage is skipped),
+    `tag` (optional run-dir suffix override; default derives the tag from the
+        config plus RL config)
+        defaults, e.g. `tier1_scarcity_t2-ad9-sil4-scarcity-t2`).
 - `[[stage]]`: `name`, `kind` (`pretrain` or `rl`),
     plus keys routed by field name into `PretrainConfig`/`RewardConfig` (pretrain)
     or `TrainConfig`/`RewardConfig` (rl).
@@ -23,6 +26,7 @@ and every stage writes `stage_<name>.pt` with the usual checkpoint payload.
 the latest `stage_<name>.pt` matching config stage is restored,
 that stage and all earlier ones are skipped,
 and remaining stages run against the restored trainer, writing into the same run dir.
+The resolved TOML is copied into the run dir as `config.toml`.
 """
 
 # here we go again...
@@ -46,6 +50,40 @@ from opus_magnum_blackbox.train import Trainer
 
 # TOML stage keys that differ from the config field names they set.
 _ALIASES = {"episodes": "episodes_per_iteration"}
+
+# Run-bookkeeping fields: never part of the derived knob tag.
+_TAG_SKIP = {"iterations", "seed", "device", "run_dir"}
+
+# "smort"
+_TAG_ABBREV = {
+    ("TrainConfig", "lr"): "lr",
+    ("TrainConfig", "episodes_per_iteration"): "ep",
+    ("TrainConfig", "entropy_coef"): "ent",
+    ("TrainConfig", "explore_epsilon"): "eps",
+    ("TrainConfig", "sample_temperature"): "t",
+    ("TrainConfig", "sil_coef"): "sil",
+    ("TrainConfig", "sil_batch_size"): "silb",
+    ("TrainConfig", "sil_buffer_cap"): "silcap",
+    ("TrainConfig", "sil_weighting"): "silw",
+    ("TrainConfig", "value_coef"): "vl",
+    ("TrainConfig", "gamma"): "ga",
+    ("TrainConfig", "grad_clip"): "gc",
+    ("TrainConfig", "eval_interval"): "ei",
+    ("TrainConfig", "checkpoint_interval"): "ci",
+    ("RewardConfig", "solve_reward"): "sr",
+    ("RewardConfig", "failure_penalty"): "fp",
+    ("RewardConfig", "error_base"): "eb",
+    ("RewardConfig", "error_progress"): "eprog",
+    ("RewardConfig", "unsolved_reward"): "ur",
+    ("RewardConfig", "alpha"): "a",
+    ("RewardConfig", "beta"): "b",
+    ("RewardConfig", "gamma"): "cy",
+    ("RewardConfig", "shaping_weight"): "sh",
+    ("RewardConfig", "progress_weight"): "pg",
+    ("RewardConfig", "placement_reward"): "plc",
+    ("RewardConfig", "invalid_action_penalty"): "invp",
+    ("RewardConfig", "cost_max"): "cost",
+}
 
 
 @dataclass(frozen=True)
@@ -71,6 +109,8 @@ class PipelineConfig:
     profile: bool = False
     eval_levels: tuple[str, ...] = ()
     autodiscovery: int = 1  # supervision switch: 1 keeps full BC, 10 removes it
+    tag: str = ""  # run-dir suffix; empty derives from the source stem + non-default knobs
+    source: Path | None = None  # resolved TOML path; copied into the run dir as config.toml
 
 
 def load_pipeline(path: str | Path) -> PipelineConfig:
@@ -91,11 +131,11 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
     eval_levels = run.get("eval_levels", [])
     if eval_levels:
         resolve_entries(list(eval_levels))  # corpus validation
-    unknown_run_keys = set(run) - {"levels", "eval_levels", "seed", "device", "autodiscovery"}
+    unknown_run_keys = set(run) - {"levels", "eval_levels", "seed", "device", "autodiscovery", "tag"}
     if unknown_run_keys:
         raise ValueError(
             f"unknown [run] keys: {sorted(unknown_run_keys)}; known keys: "
-            + "levels, eval_levels, seed, device, autodiscovery"
+            + "levels, eval_levels, seed, device, autodiscovery, tag"
         )
     autodiscovery = run.get("autodiscovery", 1)
     # bro, why toml bool is python's int?
@@ -105,6 +145,11 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         or not 1 <= autodiscovery <= 10
     ): # fmt: skip
         raise ValueError(f"[run] `autodiscovery` must be an integer in 1..10, got {autodiscovery!r}")
+
+    tag = run.get("tag")
+    if tag is not None and (not isinstance(tag, str) or not tag or "/" in tag or "\\" in tag):
+        # the tag becomes one run-dir path segment; keep it a single safe component
+        raise ValueError(f"[run] `tag` must be a non-empty string without path separators, got {tag!r}")
 
     profile = data.get("profile", {})
     unknown_profile_keys = set(profile) - {"enabled"}
@@ -131,7 +176,47 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         profile=bool(profile.get("enabled", False)),
         eval_levels=tuple(eval_levels),
         autodiscovery=autodiscovery,
+        tag=tag if tag is not None else _derive_tag(Path(path), tuple(parsed), autodiscovery),
+        source=Path(path),
     )
+
+
+def _derive_tag(source: Path, stages: tuple[PretrainStage | RLStage, ...], autodiscovery: int) -> str:
+    """
+    Run-dir suffix: config stem + autodiscovery dial + RL knobs that differ from
+    `TrainConfig`/`RewardConfig` defaults, deduped in stage order. Config stems are
+    unique per config file, so two configs can never produce indistinguishable run dirs.
+    """
+    tokens = [source.stem]
+    if autodiscovery > 1:
+        tokens.append(f"ad{autodiscovery}")
+    seen = set(tokens)
+    for stage in stages:
+        if not isinstance(stage, RLStage):
+            continue
+        for cls, config in ((TrainConfig, stage.train_config), (RewardConfig, stage.reward_config)):
+            for item in fields(cls):
+                if item.name in _TAG_SKIP:
+                    continue
+                value = getattr(config, item.name)
+                if value == item.default:
+                    continue
+                token = _tag_token(cls.__name__, item.name, value)
+                if token not in seen:
+                    seen.add(token)
+                    tokens.append(token)
+    return "-".join(tokens)
+
+
+def _tag_token(cls_name: str, field_name: str, value: object) -> str:
+    name = _TAG_ABBREV.get((cls_name, field_name), field_name.replace("_", ""))
+    if isinstance(value, bool):
+        return name  # non-default bool: presence is the token
+    if isinstance(value, float):
+        text = f"{value:g}"
+        # 0.4 -> "4", 2.0 -> "2", 1.5 -> "15", 3e-4 -> "0003"
+        return name + (text[2:] if text.startswith("0.") else text.replace(".", ""))
+    return f"{name}{value}"
 
 
 def _parse_stage(raw: dict, run_config: TrainConfig) -> PretrainStage | RLStage:
@@ -225,6 +310,7 @@ def run_pipeline(
             config.train_config,
             eval_envs=eval_envs,
             autodiscovery=config.autodiscovery,
+            tag=config.tag,
         )
         trainer._seed()
         start = 0
@@ -239,6 +325,9 @@ def run_pipeline(
         )
         trainer.autodiscovery = config.autodiscovery
     trainer.profile = ProfiledEnvs(profiled) if profiled else None
+    if config.source is not None:
+        trainer.run_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(config.source, trainer.run_dir / "config.toml")  # provenance
 
     for stage in config.stages[start:]:
         if isinstance(stage, PretrainStage):
