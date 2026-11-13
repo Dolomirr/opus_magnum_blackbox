@@ -382,9 +382,12 @@ def test_sil_unknown_weighting_is_a_hard_error(tmp_path):
 def test_sil_path_has_no_distance_labels():
     """
     Guard: the SIL replay path is label-free — the trainer module never references
-    distance/geometry classes; replay weights derive from solve counters alone.
+    distance/geometry classes; replay weights derive from solve counters and greedy
+    pass outcomes alone.
     """
-    assert "distance" not in inspect.getsource(train_module)
+    source = inspect.getsource(train_module)
+    assert "distance" not in source
+    assert "geometry" not in source
 
 
 def test_sil_buffer_dedupes_per_level_and_caps(tmp_path):
@@ -497,6 +500,152 @@ def test_sil_metrics_logged_only_when_enabled(tmp_path):
     assert entry["sil_buffer"] == 1  # both episodes play the same level: one deduped entry
     assert entry["sil_new_levels"] == ["bank/train"]
     assert entry["sil_replay_top"] == [["bank/train", 1]]  # one buffered level: the draw's single pick
+
+
+# --- failure-driven SIL replay weighting (stage 1 of the tier1 retry plan) ---
+
+
+def make_fail_trainer(tmp_path: Path, specs: list[tuple[object, str]], sil_batch_size: int = 4) -> Trainer:
+    """Trainer with sil_weighting="fail" and one buffered solved row per (spec, level name)."""
+    env = OpusEnv([LevelEntry(source=spec, cost_max=100, name=name) for spec, name in specs])
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(
+        policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=sil_batch_size, sil_weighting="fail")
+    )
+    trainer._sil_step(make_solved_batch(env, specs))
+    return trainer
+
+
+def test_sil_fail_draw_gives_failed_levels_half_the_minibatch(tmp_path):
+    """
+    Synthetic pass/fail table: exactly half of each minibatch comes from buffered levels
+    whose latest greedy pass failed, half from the rest (with replacement — the rest group
+    holds a single level, so both rest picks must hit it); a fixed seed reproduces the draw.
+    """
+    specs = [
+        (single_atom_spec(Hex(2, 3), Hex(2, 2)), "bank/pass"),
+        (single_atom_spec(Hex(3, 3), Hex(3, 2)), "bank/fail_a"),
+        (single_atom_spec(Hex(2, 4), Hex(2, 3)), "bank/fail_b"),
+        (single_atom_spec(Hex(3, 4), Hex(3, 3)), "bank/fail_c"),
+    ]
+    trainer = make_fail_trainer(tmp_path, specs)
+    trainer._greedy_passes = {name: not name.startswith("bank/fail") for _, name in specs}
+
+    torch.manual_seed(11)
+    rows = trainer._sample_sil_rows()
+    counts = Counter("failed" if trainer._greedy_passes[row.level] is False else "rest" for row in rows)
+    assert counts == {"failed": 2, "rest": 2}  # exact halves at sil_batch_size=4
+    assert Counter(row.level for row in rows if trainer._greedy_passes[row.level]) == {"bank/pass": 2}
+    assert trainer._sil_fail_group == 3  # failed-and-buffered group size
+
+    torch.manual_seed(11)
+    assert [row.level for row in trainer._sample_sil_rows()] == [row.level for row in rows]
+
+
+def test_sil_fail_falls_back_to_uniform_on_degenerate_groups(tmp_path):
+    """
+    No table yet (pre-first-eval), an all-passed table (empty failure group) and an
+    all-failed table (empty rest group) each fall back to exactly the legacy uniform pick.
+    """
+    specs = [
+        (single_atom_spec(Hex(2, 3), Hex(2, 2)), "bank/a"),
+        (single_atom_spec(Hex(3, 3), Hex(3, 2)), "bank/b"),
+        (single_atom_spec(Hex(2, 4), Hex(2, 3)), "bank/c"),
+    ]
+    trainer = make_fail_trainer(tmp_path, specs, sil_batch_size=2)
+    buffer_rows = list(trainer._sil_buffer.values())
+
+    def assert_uniform_pick(fail_group: int) -> None:
+        torch.manual_seed(3)
+        rows = trainer._sample_sil_rows()
+        torch.manual_seed(3)
+        picks = set(torch.randperm(len(buffer_rows))[:2].tolist())
+        expected = [row.level for index, row in enumerate(buffer_rows) if index in picks]
+        assert [row.level for row in rows] == expected
+        assert trainer._sil_fail_group == fail_group
+
+    assert_uniform_pick(0)  # pre-first-eval: empty table, failure group empty
+    trainer._greedy_passes = {name: True for _, name in specs}
+    assert_uniform_pick(0)  # all passed: failure group empty
+    trainer._greedy_passes = {name: False for _, name in specs}
+    assert_uniform_pick(3)  # all failed: rest group empty
+
+
+def test_sil_fail_table_leaves_uniform_draw_unchanged(tmp_path):
+    """
+    Uniform mode ignores the pass table: with failures recorded the draw is still the
+    legacy randperm pick, and `sil_fail_group` stays unset (no metric key).
+    """
+    specs = [
+        (single_atom_spec(Hex(2, 3), Hex(2, 2)), "bank/a"),
+        (single_atom_spec(Hex(3, 3), Hex(3, 2)), "bank/b"),
+        (single_atom_spec(Hex(2, 4), Hex(2, 3)), "bank/c"),
+    ]
+    env = OpusEnv([LevelEntry(source=spec, cost_max=100, name=name) for spec, name in specs])
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=2))
+    trainer._sil_step(make_solved_batch(env, specs))
+    trainer._greedy_passes = {name: False for _, name in specs}
+    buffer_rows = list(trainer._sil_buffer.values())
+
+    torch.manual_seed(3)
+    rows = trainer._sample_sil_rows()
+    torch.manual_seed(3)
+    picks = set(torch.randperm(len(buffer_rows))[:2].tolist())
+    expected = [row.level for index, row in enumerate(buffer_rows) if index in picks]
+    assert [row.level for row in rows] == expected
+    assert trainer._sil_fail_group is None
+
+
+def test_greedy_eval_records_per_level_pass_table(tmp_path):
+    """
+    The train-bank greedy eval keeps pass/fail per level name, aligned with the entries;
+    the eval-bank pass stays aggregate-only and touches no train level's outcome.
+    """
+    solved = make_spec()
+    entries = [
+        LevelEntry(source=solved, cost_max=50, name="bank/solved"),
+        LevelEntry(source=make_spec(target=2, cycling=False), cost_max=50, name="bank/target2"),
+        LevelEntry(source=make_spec(steps=5), cost_max=50, name="bank/short"),
+    ]
+    env = OpusEnv(entries)
+    eval_env = OpusEnv([LevelEntry(source=solved, cost_max=50, name="bank/eval")])
+    trainer = Trainer(
+        _script_policy(env, solved), [env], TrainConfig(device="cpu", run_dir=str(tmp_path)), eval_envs=[eval_env]
+    )
+
+    assert trainer.evaluate() == pytest.approx(1 / 3)
+    assert trainer._greedy_passes == {"bank/solved": True, "bank/target2": False, "bank/short": False}
+
+    trainer._greedy_solve_rate(trainer.eval_envs)
+    assert trainer._greedy_passes == {"bank/solved": True, "bank/target2": False, "bank/short": False}
+
+
+def test_sil_fail_group_metric_logged_on_fail_rows(tmp_path):
+    """
+    `fail` mode stamps `sil_fail_group` (failed-and-buffered group size) onto SIL rows —
+    0 before the first eval, then the group size; uniform rows carry no such key.
+    """
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    batch = build_batch([make_sil_episode(env, env.levels[0].source, known_solution_tokens(vocab), True, "lvl/a")], vocab.pad_id)
+
+    uniform = make_trainer(tmp_path / "uniform")
+    uniform.train_config = replace(uniform.train_config, sil_coef=0.1)
+    uniform._sil_step(batch)
+    uniform.run_dir.mkdir(parents=True, exist_ok=True)
+    uniform._log_metrics(batch, 0.0, 0.0, 0.0, 0.0, sil_loss=0.0)
+    assert "sil_fail_group" not in read_metrics(uniform.run_dir)[0]
+
+    fail = make_trainer(tmp_path / "fail")
+    fail.train_config = replace(fail.train_config, sil_coef=0.1, sil_weighting="fail")
+    fail._sil_step(batch)  # no table yet: fallback draw with an empty failure group
+    assert fail._sil_fail_group == 0
+    fail.run_dir.mkdir(parents=True, exist_ok=True)
+    fail._log_metrics(batch, 0.0, 0.0, 0.0, 0.0, sil_loss=0.0)
+    assert read_metrics(fail.run_dir)[0]["sil_fail_group"] == 0
 
 
 # --- sampling temperature (stage 2 of the hardening plan) ---
