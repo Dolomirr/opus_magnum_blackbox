@@ -45,6 +45,10 @@ train:
 train-tier1:
     uv run opus-magnum-blackbox run configs/tier1_simple_arms.toml
 
+# Run tier-2 anywhere curriculum pipeline
+train-tier2:
+    uv run opus-magnum-blackbox run configs/tier2_anywhere.toml
+
 # Run the canonical tier-1 discovery recipe (BC seed + stratified self-imitation)
 train-tier1-discovery:
     uv run opus-magnum-blackbox run configs/tier1_discovery.toml
