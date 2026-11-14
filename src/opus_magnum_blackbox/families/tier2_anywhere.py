@@ -105,6 +105,25 @@ def anywhere_spec(  # noqa: PLR0913
     deliveries, 1 for handoffs. Raises `FamilyError` for every pair outside the
     family: out of board, degenerate, over a cap, or with no verified plan.
     """
+    return anywhere_spec_plan(entrance, exit, target=target, steps=steps, size=size, atom=atom)[0]
+
+
+def anywhere_spec_plan(  # noqa: PLR0913, PLR0917
+    entrance: Hex,
+    exit: Hex,
+    *,
+    target: int | None = None,
+    steps: int = 30,
+    size: BoardSize = (6, 6),
+    atom: AtomType = AtomType.WATER,
+) -> tuple[LevelSpec, AnywherePlan]:
+    """
+    `anywhere_spec` together with the winning plan that shaped it: the spec's
+    `target` is the plan's class rule (2 for single-arm deliveries, 1 for
+    handoffs), so callers get the verified plan without a second ranked search.
+
+    Raises `FamilyError` under the same conditions as `anywhere_spec`.
+    """
     rows, cols = size
     for name, cell in (("entrance", entrance), ("exit", exit)):
         if not (0 <= cell.r < rows and 0 <= cell.s < cols):
@@ -118,7 +137,7 @@ def anywhere_spec(  # noqa: PLR0913
         raise FamilyError(f"entrance {tuple(entrance)} and exit {tuple(exit)} have no verified delivery plan")
     spec = _anywhere_level_spec(entrance, exit, plan.target, steps, size, atom)
     _assert_caps(plan, steps)
-    return spec
+    return spec, plan
 
 
 def anywhere_plan(spec: LevelSpec) -> AnywherePlan | None:

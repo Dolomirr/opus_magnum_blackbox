@@ -33,6 +33,7 @@ from opus_magnum_blackbox.families.tier2_anywhere import (
     anywhere_reference_solution,
     anywhere_reference_tokens,
     anywhere_spec,
+    anywhere_spec_plan,
 )
 
 __all__ = [
@@ -51,6 +52,7 @@ __all__ = [
     "anywhere_reference_solution",
     "anywhere_reference_tokens",
     "anywhere_spec",
+    "anywhere_spec_plan",
     "arm_plan",
     "hex_distance",
     "reference_oms",
