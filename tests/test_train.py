@@ -17,7 +17,7 @@ from torch import nn
 from opus_magnum_blackbox import train as train_module
 from opus_magnum_blackbox.config import ModelConfig, TrainConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
-from opus_magnum_blackbox.families import reference_tokens, single_atom_spec
+from opus_magnum_blackbox.families import anywhere_reference_tokens, anywhere_spec, reference_tokens, single_atom_spec
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.rollout import Episode, RolloutBatch, build_batch
 from opus_magnum_blackbox.train import Trainer
@@ -646,6 +646,132 @@ def test_sil_fail_group_metric_logged_on_fail_rows(tmp_path):
     fail.run_dir.mkdir(parents=True, exist_ok=True)
     fail._log_metrics(batch, 0.0, 0.0, 0.0, 0.0, sil_loss=0.0)
     assert read_metrics(fail.run_dir)[0]["sil_fail_group"] == 0
+
+
+# --- class-stratified SIL replay (tier-2 stage 3) ---
+
+
+def make_anywhere_batch(env: OpusEnv, levels: list[tuple[object, str]]) -> RolloutBatch:
+    """Batch of solved anywhere-family episodes, one per (spec, level name)."""
+    return build_batch(
+        [make_sil_episode(env, spec, anywhere_reference_tokens(spec), True, name) for spec, name in levels],
+        env.tokenizer.vocab.pad_id,
+    )
+
+
+def make_stratify_trainer(tmp_path: Path, levels: list[tuple[object, str]], sil_batch_size: int = 4) -> Trainer:
+    """Trainer with sil_weighting="stratify" and one buffered anywhere-family solve per (spec, level name)."""
+    env = OpusEnv([LevelEntry(source=spec, cost_max=100, name=name) for spec, name in levels])
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(
+        policy,
+        [env],
+        replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=sil_batch_size, sil_weighting="stratify"),
+    )
+    trainer._sil_step(make_anywhere_batch(env, levels))
+    return trainer
+
+
+def test_sil_handoff_label_counts_arm_placements(tmp_path):
+    """
+    The stratification label reads the buffered tokens: a layout with two or more arm
+    placements is a handoff; one arm — plain or piston-length — is single-arm class.
+    """
+    levels = [
+        (anywhere_spec(Hex(0, 0), Hex(4, 3)), "bank/handoff"),  # d7: two arms
+        (anywhere_spec(Hex(2, 1), Hex(0, 5)), "bank/piston_single"),  # d4: one arm_piston
+        (anywhere_spec(Hex(0, 0), Hex(0, 1)), "bank/single"),  # d1: one arm
+    ]
+    trainer = make_stratify_trainer(tmp_path, levels)
+
+    assert trainer._row_handoff(trainer._sil_buffer["bank/handoff"]) is True
+    assert trainer._row_handoff(trainer._sil_buffer["bank/piston_single"]) is False
+    assert trainer._row_handoff(trainer._sil_buffer["bank/single"]) is False
+
+
+def test_sil_stratify_draw_gives_handoff_half_the_minibatch(tmp_path):
+    """
+    One handoff-class solve and three single-arm solves: exactly half of each minibatch
+    replays the handoff row (with replacement — the group holds one level), half the rest;
+    a fixed seed reproduces the draw, and `sil_handoff_group` reports the class size.
+    """
+    levels = [
+        (anywhere_spec(Hex(0, 0), Hex(4, 3)), "bank/handoff"),
+        (anywhere_spec(Hex(2, 1), Hex(0, 5)), "bank/single_a"),
+        (anywhere_spec(Hex(0, 0), Hex(0, 1)), "bank/single_b"),
+        (anywhere_spec(Hex(0, 0), Hex(0, 3)), "bank/single_c"),
+    ]
+    trainer = make_stratify_trainer(tmp_path, levels)
+
+    torch.manual_seed(11)
+    rows = trainer._sample_sil_rows()
+    counts = Counter("handoff" if row.level == "bank/handoff" else "single" for row in rows)
+    assert counts == {"handoff": 2, "single": 2}  # exact halves at sil_batch_size=4
+    assert trainer._sil_handoff_group == 1
+
+    torch.manual_seed(11)
+    assert [row.level for row in trainer._sample_sil_rows()] == [row.level for row in rows]
+
+
+def test_sil_stratify_falls_back_to_uniform_on_single_class_buffers(tmp_path):
+    """
+    All-single and all-handoff buffers each fall back to exactly the legacy uniform pick;
+    `sil_handoff_group` still reports the buffered handoff-class size.
+    """
+    singles = [
+        (anywhere_spec(Hex(0, 0), Hex(0, 1)), "bank/a"),
+        (anywhere_spec(Hex(2, 1), Hex(0, 5)), "bank/b"),
+        (anywhere_spec(Hex(0, 0), Hex(0, 3)), "bank/c"),
+    ]
+    trainer = make_stratify_trainer(tmp_path, singles, sil_batch_size=2)
+    buffer_rows = list(trainer._sil_buffer.values())
+
+    torch.manual_seed(3)
+    rows = trainer._sample_sil_rows()
+    torch.manual_seed(3)
+    picks = set(torch.randperm(len(buffer_rows))[:2].tolist())
+    assert [row.level for row in rows] == [row.level for index, row in enumerate(buffer_rows) if index in picks]
+    assert trainer._sil_handoff_group == 0
+
+    handoffs = [
+        (anywhere_spec(Hex(0, 0), Hex(4, 3)), "bank/h1"),  # d7 handoff
+        (anywhere_spec(Hex(0, 0), Hex(5, 5)), "bank/h2"),  # d10 handoff
+    ]
+    trainer = make_stratify_trainer(tmp_path / "all_handoff", handoffs, sil_batch_size=2)
+    buffer_rows = list(trainer._sil_buffer.values())
+
+    torch.manual_seed(3)
+    rows = trainer._sample_sil_rows()
+    torch.manual_seed(3)
+    picks = set(torch.randperm(len(buffer_rows))[:2].tolist())
+    assert [row.level for row in rows] == [row.level for index, row in enumerate(buffer_rows) if index in picks]
+    assert trainer._sil_handoff_group == 2
+
+
+def test_sil_handoff_group_metric_logged_on_stratify_rows(tmp_path):
+    """
+    `stratify` mode stamps `sil_handoff_group` (buffered handoff-class rows) onto SIL rows;
+    uniform rows carry no such key. A tier-0 solve buffers into the single-arm class.
+    """
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    batch = build_batch([make_sil_episode(env, env.levels[0].source, known_solution_tokens(vocab), True, "lvl/a")], vocab.pad_id)
+
+    uniform = make_trainer(tmp_path / "uniform")
+    uniform.train_config = replace(uniform.train_config, sil_coef=0.1)
+    uniform._sil_step(batch)
+    uniform.run_dir.mkdir(parents=True, exist_ok=True)
+    uniform._log_metrics(batch, 0.0, 0.0, 0.0, 0.0, sil_loss=0.0)
+    assert "sil_handoff_group" not in read_metrics(uniform.run_dir)[0]
+
+    stratify = make_trainer(tmp_path / "stratify")
+    stratify.train_config = replace(stratify.train_config, sil_coef=0.1, sil_weighting="stratify")
+    stratify._sil_step(batch)
+    assert stratify._sil_handoff_group == 0  # the buffered solve holds a single arm
+    stratify.run_dir.mkdir(parents=True, exist_ok=True)
+    stratify._log_metrics(batch, 0.0, 0.0, 0.0, 0.0, sil_loss=0.0)
+    assert read_metrics(stratify.run_dir)[0]["sil_handoff_group"] == 0
 
 
 # --- sampling temperature (stage 2 of the hardening plan) ---

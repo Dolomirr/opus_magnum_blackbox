@@ -1,16 +1,19 @@
 """Stage runner: TOML parsing/routing and a bc + rl pipeline smoke."""
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
+from pathlib import Path
 
 import pytest
 import torch
 from conftest import make_spec
 
-from opus_magnum_blackbox.config import RewardConfig
+from opus_magnum_blackbox.config import ModelConfig, RewardConfig, TrainConfig
 from opus_magnum_blackbox.corpus import LEVELS_DIR
-from opus_magnum_blackbox.env import LevelEntry
+from opus_magnum_blackbox.env import LevelEntry, OpusEnv
+from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.stages import PretrainStage, RLStage, load_pipeline, resolve_entries, run_pipeline
+from opus_magnum_blackbox.train import Trainer
 
 TIER0_OMS = LEVELS_DIR / "tier0_typed_delivery.oms"
 
@@ -551,3 +554,119 @@ episodes = 2
     second = run_pipeline(pipeline, entries=entries)
     assert first != second  # timestamp prefix keeps same-config reruns unique
     assert first.name.split("-", 3)[3] == second.name.split("-", 3)[3]  # same levels label + derived tag
+
+
+# --- [run] init_from: weights-only warm start (tier-2 stage 3) ---
+
+
+def _warm_start_checkpoint(tmp_path: Path, model_config: ModelConfig | None = None) -> Path:
+    """
+    Checkpoint for warm-start tests: real policy weights offset so they cannot match
+    a fresh init, plus the stored model config.
+    """
+    env = OpusEnv([LevelEntry(source=make_spec(), cost_max=50, name="tier0_test")])
+    policy = OpusPolicy(env.tokenizer.config, model_config or ModelConfig())
+    for parameter in policy.parameters():
+        parameter.data.add_(1.0)
+    path = tmp_path / "warm.pt"
+    torch.save({"model_state": policy.state_dict(), "model_config": asdict(model_config or ModelConfig())}, path)
+    return path
+
+
+def _fresh_trainer(tmp_path: Path) -> Trainer:
+    env = OpusEnv([LevelEntry(source=make_spec(), cost_max=50, name="tier0_test")])
+    torch.manual_seed(0)
+    return Trainer(
+        OpusPolicy(env.tokenizer.config, ModelConfig()), [env], TrainConfig(device="cpu", run_dir=str(tmp_path))
+    )
+
+
+def test_warm_start_loads_weights_only(tmp_path):
+    """
+    `warm_start` copies the checkpoint's model weights into the fresh policy;
+    optimizer state, iteration counter and eval bookkeeping stay untouched.
+    """
+    checkpoint = _warm_start_checkpoint(tmp_path)
+    trainer = _fresh_trainer(tmp_path / "run")
+    fresh = {key: value.clone() for key, value in trainer.policy.state_dict().items()}
+
+    trainer.warm_start(checkpoint)
+
+    loaded = torch.load(checkpoint, weights_only=False)["model_state"]
+    current = trainer.policy.state_dict()
+    for key, value in loaded.items():
+        assert torch.equal(current[key], value)
+        assert not torch.equal(fresh[key], value)  # the offset makes warm-started weights ≠ fresh
+    assert trainer.iteration == 0
+    assert trainer.optimizer.state_dict()["state"] == {}  # no optimizer state came along
+    assert trainer._best_eval_rate is None
+
+
+def test_warm_start_rejects_model_config_mismatch(tmp_path):
+    checkpoint = _warm_start_checkpoint(tmp_path, ModelConfig(d_model=64))
+    trainer = _fresh_trainer(tmp_path / "run")
+    with pytest.raises(ValueError, match="model config"):
+        trainer.warm_start(checkpoint)
+
+
+def test_init_from_pipeline_warm_starts_and_logs(tmp_path):
+    """
+    `[run] init_from` warm-starts the fresh run: a `warm_start` metrics row at iteration 0
+    names the source, and the stage counter starts from zero.
+    """
+    checkpoint = _warm_start_checkpoint(tmp_path)
+    oms = tmp_path / "tier0_test.oms"
+    oms.write_text(TIER0_OMS.read_text())
+    path = _write_pipeline(
+        tmp_path,
+        f"""
+[run]
+levels = ["tier0_typed_delivery"]
+seed = 0
+device = "cpu"
+init_from = "{checkpoint}"
+
+[[stage]]
+name = "rl-a"
+kind = "rl"
+iterations = 1
+episodes = 2
+""",
+    )
+    pipeline = load_pipeline(path)
+    assert pipeline.init_from == checkpoint
+    pipeline = replace(pipeline, train_config=replace(pipeline.train_config, run_dir=str(tmp_path)))
+    entries = [LevelEntry(source=make_spec(), cost_max=50, name="tier0_test", solutions=(oms,))]
+
+    run_dir = run_pipeline(pipeline, entries=entries)
+
+    metrics = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
+    warm = [entry for entry in metrics if "warm_start" in entry]
+    assert [entry["iteration"] for entry in warm] == [0]
+    assert warm[0]["warm_start"] == str(checkpoint)
+    # fresh iteration counter: the first (and only) rl stage lands on iteration 1
+    assert torch.load(run_dir / "stage_rl-a.pt", weights_only=False)["iteration"] == 1
+
+
+def test_init_from_run_key_validation(tmp_path):
+    """
+    `init_from` must be a non-empty string path; absent key parses to None;
+    unknown [run] keys stay hard errors next to the new known key.
+    """
+    template = (
+        '[run]\nlevels = ["tier0_typed_delivery"]\n{key}\n[[stage]]\nname = "rl-a"\nkind = "rl"\niterations = 1\n'
+    )
+    path = _write_pipeline(tmp_path, template.format(key=""))
+    assert load_pipeline(path).init_from is None
+
+    path.write_text(template.format(key='init_from = "runs/warm.pt"'))
+    assert load_pipeline(path).init_from == Path("runs/warm.pt")
+
+    for bad in ("init_from = 7", 'init_from = ""', "init_from = true"):
+        path.write_text(template.format(key=bad))
+        with pytest.raises(ValueError, match="init_from"):
+            load_pipeline(path)
+
+    path.write_text(template.format(key="init_form = 'runs/warm.pt'"))
+    with pytest.raises(ValueError, match=r"unknown \[run\] keys"):
+        load_pipeline(path)
