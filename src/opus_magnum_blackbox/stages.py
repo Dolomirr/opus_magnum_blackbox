@@ -10,7 +10,10 @@ Config schema:
         k=10 zeroes them and the stage is skipped),
     `tag` (optional run-dir suffix override; default derives the tag from the
         config plus RL config)
-        defaults, e.g. `tier1_scarcity_t2-ad9-sil4-scarcity-t2`).
+        defaults, e.g. `tier1_scarcity_t2-ad9-sil4-scarcity-t2`),
+    `init_from` (optional checkpoint path; a fresh run loads the checkpoint's
+        model weights before stage 1 - fresh optimizer, iteration counter and
+        run dir; model-config mismatch is a hard error. Ignored on resume).
 - `[[stage]]`: `name`, `kind` (`pretrain` or `rl`),
     plus keys routed by field name into `PretrainConfig`/`RewardConfig` (pretrain)
     or `TrainConfig`/`RewardConfig` (rl).
@@ -110,6 +113,7 @@ class PipelineConfig:
     eval_levels: tuple[str, ...] = ()
     autodiscovery: int = 1  # supervision switch: 1 keeps full BC, 10 removes it
     tag: str = ""  # run-dir suffix; empty derives from the source stem + non-default knobs
+    init_from: Path | None = None  # warm-start checkpoint; model weights only
     source: Path | None = None  # resolved TOML path; copied into the run dir as config.toml
 
 
@@ -131,12 +135,15 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
     eval_levels = run.get("eval_levels", [])
     if eval_levels:
         resolve_entries(list(eval_levels))  # corpus validation
-    unknown_run_keys = set(run) - {"levels", "eval_levels", "seed", "device", "autodiscovery", "tag"}
+    unknown_run_keys = set(run) - {"levels", "eval_levels", "seed", "device", "autodiscovery", "tag", "init_from"}
     if unknown_run_keys:
         raise ValueError(
             f"unknown [run] keys: {sorted(unknown_run_keys)}; known keys: "
-            + "levels, eval_levels, seed, device, autodiscovery, tag"
+            + "levels, eval_levels, seed, device, autodiscovery, tag, init_from"
         )
+    init_from = run.get("init_from")
+    if init_from is not None and (not isinstance(init_from, str) or not init_from):
+        raise ValueError(f"[run] `init_from` must be a non-empty checkpoint path string, got {init_from!r}")
     autodiscovery = run.get("autodiscovery", 1)
     # bro, why toml bool is python's int?
     if (
@@ -177,6 +184,7 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         eval_levels=tuple(eval_levels),
         autodiscovery=autodiscovery,
         tag=tag if tag is not None else _derive_tag(Path(path), tuple(parsed), autodiscovery),
+        init_from=Path(init_from) if init_from else None,
         source=Path(path),
     )
 
@@ -313,6 +321,9 @@ def run_pipeline(
             tag=config.tag,
         )
         trainer._seed()
+        if config.init_from is not None:
+            trainer.warm_start(config.init_from)
+            trainer._log_warm_start(str(config.init_from))
         start = 0
     else:
         trainer, start = _resume_trainer(config, envs, eval_envs, Path(resume_dir))

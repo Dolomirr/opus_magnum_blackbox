@@ -19,6 +19,7 @@ from torch import nn
 
 from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfig, TrainConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
+from opus_magnum_blackbox.grammar import LAYOUT_GROUP
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import Timer
 from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched, replicate_envs
@@ -109,6 +110,8 @@ class Trainer:
         self._greedy_passes: dict[str, bool] = {}
         # Failed-and-buffered group size of the latest "fail" draw; logged as `sil_fail_group`.
         self._sil_fail_group: int | None = None
+        # Buffered handoff-class row count of the latest "stratify" draw; logged as `sil_handoff_group`.
+        self._sil_handoff_group: int | None = None
 
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
         """Sub-second precision: trainer + resume within one second must not share a run dir.
@@ -306,13 +309,18 @@ class Trainer:
         "fail": half from buffered levels whose latest greedy eval failed, half from
         the rest, both with replacement; falls back to uniform while either group
         is empty (also before the first eval).
+        "stratify": half from buffered handoff-class solutions (two or more arm
+        placements in the layout), half from the single-arm rest, both with
+        replacement; falls back to uniform while either class is empty.
         Records per-level picks into `_sil_replay_counts` for the `sil_replay_top` metric,
-        and the failed-group size into `_sil_fail_group` for the `sil_fail_group` metric.
+        the failed-group size into `_sil_fail_group` for the `sil_fail_group` metric,
+        and the buffered handoff-class count into `_sil_handoff_group` for the
+        `sil_handoff_group` metric.
         """
         config = self.train_config
-        if config.sil_weighting not in ("uniform", "scarcity", "fail"):
+        if config.sil_weighting not in ("uniform", "scarcity", "fail", "stratify"):
             raise ValueError(
-                f"unknown sil_weighting: {config.sil_weighting!r}; expected 'uniform', 'scarcity' or 'fail'"
+                f"unknown sil_weighting: {config.sil_weighting!r}; expected 'uniform', 'scarcity', 'fail' or 'stratify'"
             )
         all_rows = list(self._sil_buffer.values())
         size = min(config.sil_batch_size, len(all_rows))
@@ -337,11 +345,39 @@ class Trainer:
                 rows = [failed[pick] for pick in failed_picks.tolist()] + [rest[pick] for pick in rest_picks.tolist()]
             else:
                 rows = uniform_rows()
+        elif config.sil_weighting == "stratify":
+            handoff = [row for row in all_rows if self._row_handoff(row)]
+            single = [row for row in all_rows if not self._row_handoff(row)]
+            self._sil_handoff_group = len(handoff)
+            if handoff and single:
+                half = size // 2
+                handoff_picks = torch.randint(len(handoff), (half,))
+                single_picks = torch.randint(len(single), (size - half,))
+                rows = [handoff[pick] for pick in handoff_picks.tolist()] + [
+                    single[pick] for pick in single_picks.tolist()
+                ]
+            else:
+                rows = uniform_rows()
         else:
             rows = uniform_rows()
         for row in rows:
             self._sil_replay_counts[row.level] = self._sil_replay_counts.get(row.level, 0) + 1
         return rows
+
+    def _row_handoff(self, row: SILRow) -> bool:
+        """
+        Arm-count class label read off the buffered solution tokens: a layout with
+        two or more arm placements passes the atom between arms (handoff class).
+        """
+        vocab = self.envs[0].tokenizer.vocab
+        tokens = row.actions.tolist()
+        start = tokens.index(vocab.special_id("[START_LAYOUT]"))
+        end = tokens.index(vocab.special_id("[END_LAYOUT]"))
+        arms = sum(
+            vocab.is_in(name_token, "builtin") and vocab.builtin(name_token).manipulator
+            for name_token in tokens[start + 1 : end : LAYOUT_GROUP]
+        )
+        return arms >= 2
 
     def _sil_minibatch(self, rows: list[SILRow]) -> RolloutBatch:
         """
@@ -607,6 +643,20 @@ class Trainer:
         np.random.set_state(rng["numpy"])
         return trainer
 
+    def warm_start(self, path: str | Path) -> None:
+        """
+        Load model weights from a checkpoint into the fresh policy; optimizer,
+        iteration counter and eval bookkeeping stay untouched (unlike `resume`).
+        A checkpoint model-config mismatch is a hard error.
+        """
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        model_config = payload["model_config"]
+        if model_config != asdict(self.model_config):
+            raise ValueError(
+                f"warm start from {path}: checkpoint model config {model_config} does not match {asdict(self.model_config)}"
+            )
+        self.policy.load_state_dict(payload["model_state"])
+
     def _seed(self) -> None:
         seed = self.train_config.seed
         torch.manual_seed(seed)
@@ -652,6 +702,8 @@ class Trainer:
             entry["sil_replay_top"] = [[name, count] for name, count in ranked[:5]]
             if self._sil_fail_group is not None:
                 entry["sil_fail_group"] = self._sil_fail_group
+            if self._sil_handoff_group is not None:
+                entry["sil_handoff_group"] = self._sil_handoff_group
         if self.stage is not None:
             entry["stage"] = self.stage
         self._stamp_autodiscovery(entry)
@@ -712,6 +764,21 @@ class Trainer:
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
         print(f"stage {stage} skipped | {reason}")
+
+    def _log_warm_start(self, source: str) -> None:
+        """
+        `warm_start` metrics row: this fresh run initialized its weights from a checkpoint.
+        """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "iteration": 0,
+            "warm_start": source,
+        }
+        self._stamp_autodiscovery(entry)
+        entry["timestamp"] = datetime.now().isoformat()
+        with (self.run_dir / "metrics.jsonl").open("a") as file:
+            file.write(json.dumps(entry) + "\n")
+        print(f"warm start | weights from {source}")
 
     def _bank_counts(self) -> str:
         """
