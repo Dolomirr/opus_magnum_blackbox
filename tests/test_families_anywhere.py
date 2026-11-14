@@ -8,9 +8,6 @@ from opus_magnum_sym import AtomType, Hex, Level, StepActionType
 from opus_magnum_blackbox.codec import OpusTokenizer, apply_solution, decode_solution, solution_to_oms
 from opus_magnum_blackbox.families import (
     FamilyError,
-    _anywhere_level_spec,
-    _handoff_candidates,
-    _plan_solves,
     anywhere_plan,
     anywhere_reference_oms,
     anywhere_reference_solution,
@@ -19,6 +16,7 @@ from opus_magnum_blackbox.families import (
     hex_distance,
     verify,
 )
+from opus_magnum_blackbox.families.tier2_anywhere import _anywhere_level_spec, _handoff_candidates, _plan_solves
 from opus_magnum_blackbox.grammar import GrammarError
 from opus_magnum_blackbox.masking import ActionMasker
 
