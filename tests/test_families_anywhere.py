@@ -259,7 +259,7 @@ def test_sweep_sampled_pair_classes():
         assert (arms, target) in {(1, 2), (2, 1)}
 
 
-@pytest.mark.slow
+@pytest.mark.corpus
 def test_sweep_full_pair_classes():
     """
     All 1260 ordered pairs split exactly into 656 single-arm (target 2) + 604 handoff (target 1).

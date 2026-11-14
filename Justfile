@@ -65,9 +65,13 @@ profile-config config="configs/profile_tier0.toml":
 # Tests
 # ===============================
 
-# Run test suite
+# Run default test suite
 test:
     uv run pytest
+
+# Run full test suite including corpus-scale coverage
+test-corpus:
+    uv run pytest --corpus
 
 # Run test suite with verbose logging
 test-verbose:
