@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from opus_magnum_blackbox.codec import DecodeReport
-from opus_magnum_blackbox.env import LevelEntry, OpusEnv
+from opus_magnum_blackbox.env import LevelEntry, OpusEnv, progress_distances
 from opus_magnum_blackbox.reward import compute_reward
 
 
@@ -60,6 +60,7 @@ class ProfiledEnv(OpusEnv):
         if report.ok:
             with Timer(self.prof, "sim_run"):
                 result = level.run()
+        initial_dist, final_dist = progress_distances(level)
         with Timer(self.prof, "sim_reset"):
             level.reset()
         with Timer(self.prof, "reward"):
@@ -68,6 +69,8 @@ class ProfiledEnv(OpusEnv):
                 result,
                 self._spec,
                 replace(self.reward_config, cost_max=self._current.cost_max),
+                initial_dist=initial_dist,
+                final_dist=final_dist,
             )
 
         if result is not None:

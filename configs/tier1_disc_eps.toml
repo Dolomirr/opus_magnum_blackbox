@@ -1,0 +1,44 @@
+# Tier-1 discovery test, matrix run 3/5: EPS ONLY.
+# explore_epsilon 0.05, no shaping, no SIL. Question: does mode escape alone suffice?
+# k=9, consolidate ceiling 3000 (ad default).
+# Plan: .opencode/plan/tier1_discovery_test.md, stage 4.
+
+[run]
+levels          = ["tier1_simple_arms/train"]
+eval_levels     = ["tier1_simple_arms/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+autodiscovery   = 9
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 100 # scaled by the dial to 11
+lr                  = 1e-3
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5 # prevent overfit
+
+[[stage]]
+name            = "rl-shape"
+kind            = "rl"
+iterations      = 400
+episodes        = 32
+lr              = 1e-4
+entropy_coef    = 0.005
+shaping_weight  = 0.5         # delivery-fraction shaping on unsolved COMPLETED
+explore_epsilon = 0.05        # discovery: per-step mask-uniform sampling
+
+[[stage]]
+name            = "rl-consolidate"
+kind            = "rl"
+iterations      = 3000 # ceiling, not target
+episodes        = 32
+lr              = 1e-4
+entropy_coef    = 0.001
+shaping_weight  = 0.0         # delivered-fraction shaping stays a rl-shape-only aid
+explore_epsilon = 0.05       # discovery ingredient stays on
+eval_patience   = 20         # ~200 iterations without eval-bank improvement ends the stage
+# alpha/beta/gamma stay 0

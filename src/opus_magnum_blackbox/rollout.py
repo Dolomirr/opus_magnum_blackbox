@@ -35,6 +35,8 @@ class Episode:
     returns        : list[float]      # G_t, from rewards and gamma
     solved         : bool
     terminated     : bool             # False for truncated episodes
+    level          : str = ""         # source level name (per-level dedup key)
+    dead_end       : bool = False     # terminated by an empty grammar mask (env-forced failure)
     # fmt: on
 
 
@@ -54,10 +56,13 @@ class RolloutBatch:
     old_values     : torch.Tensor # [B, T] float
     returns        : torch.Tensor # [B, T] float
     valid          : torch.Tensor # [B, T] bool, positions below decoder_length
+    episode_solved : torch.Tensor # [B] bool, per-episode solve flag
+    level_names    : list[str]    # per-row source level (SIL dedup key)
 
     mean_return    : float
     solve_rate     : float
     mean_length    : float
+    dead_ends      : int = 0      # episodes terminated by an empty grammar mask
     # fmt: on
 
 
@@ -73,6 +78,20 @@ def discounted_returns(rewards: list[float], gamma: float) -> list[float]:
     return returns
 
 
+def mixture_distribution(
+    probs: torch.Tensor, action_mask: torch.Tensor, epsilon: float
+) -> torch.distributions.Categorical:
+    """
+    Mixture of masked policy distribution and mask over uniform valid tokens:
+
+    Exploring steps sampled and scored under under mixture,
+    so logprob always comes from distribution that was sampled from valid posibilities.
+    """
+    valid = action_mask.bool()
+    uniform = valid.float() / valid.float().sum(dim=-1, keepdim=True)
+    return torch.distributions.Categorical(probs=(1.0 - epsilon) * probs + epsilon * uniform)
+
+
 def _forward_observation(policy: OpusPolicy, obs: dict, device) -> tuple[torch.Tensor, torch.Tensor]:
     decoder_length = int(obs["decoder_length"])
     encoder_input = torch.from_numpy(obs["encoder_input"]).unsqueeze(0).to(device)
@@ -83,23 +102,51 @@ def _forward_observation(policy: OpusPolicy, obs: dict, device) -> tuple[torch.T
     return logits[0, decoder_length], values[0, decoder_length]
 
 
-def collect_episode(env: OpusEnv, policy: OpusPolicy, device, greedy: bool = False, gamma: float = 1.0) -> Episode:
+def collect_episode(  # noqa: PLR0913, PLR0917
+    env: OpusEnv,
+    policy: OpusPolicy,
+    device,
+    greedy: bool = False,
+    gamma: float = 1.0,
+    explore_epsilon: float = 0.0,
+    sample_temperature: float = 1.0,
+) -> Episode:
     """
     Roll-out one episode for masked policy (sampled, or argmax when greedy).
+
+    `explore_epsilon` applies to sampled steps only: a per-step Bernoulli(epsilon)
+    picks between the plain policy sample (recorded under the policy) and the
+    `(1 - epsilon) * p + epsilon * u` mixture (recorded under the mixture).
+    `sample_temperature` divides logits by `T` before softmax on sampled
+    steps only.
+    Greedy rollouts ignore it.
+    Logprob always belongs to the distribution token was drawn from.
     """
     obs, _ = env.reset()
     encoder_input = obs["encoder_input"]
     encoder_length = int(obs["encoder_length"])
     tokens, masks, logprobs, values, rewards = [], [], [], [], []
     solved = terminated = False
+    dead_end = False
 
     with torch.no_grad():
         while True:
             mask = obs["action_mask"].astype(bool)
+            mask_tensor = torch.from_numpy(mask).to(device)
             logits, value = _forward_observation(policy, obs, device)
-            dist = policy.masked_distribution(logits, torch.from_numpy(mask).to(device))
-            action = int(dist.probs.argmax()) if greedy else int(dist.sample())
-            logprob = float(dist.log_prob(torch.tensor(action, device=device)))
+            if not greedy and sample_temperature != 1.0:
+                logits = logits / sample_temperature
+            dist = policy.masked_distribution(logits, mask_tensor)
+            if greedy:
+                action = int(dist.probs.argmax())
+                logprob = float(dist.log_prob(torch.tensor(action, device=device)))
+            elif explore_epsilon > 0.0 and bool(torch.bernoulli(torch.tensor(explore_epsilon)).item()):
+                mixture = mixture_distribution(dist.probs, mask_tensor, explore_epsilon)
+                action = int(mixture.sample())
+                logprob = float(mixture.log_prob(torch.tensor(action, device=device)))
+            else:
+                action = int(dist.sample())
+                logprob = float(dist.log_prob(torch.tensor(action, device=device)))
 
             obs, reward, terminated, truncated, info = env.step(action)
             tokens.append(action)
@@ -109,6 +156,7 @@ def collect_episode(env: OpusEnv, policy: OpusPolicy, device, greedy: bool = Fal
             rewards.append(float(reward))
             if terminated or truncated:
                 solved = bool(info.get("solved", False))
+                dead_end = bool(info.get("dead_end", False))
                 break
 
     return Episode(
@@ -122,6 +170,8 @@ def collect_episode(env: OpusEnv, policy: OpusPolicy, device, greedy: bool = Fal
         returns=discounted_returns(rewards, gamma),
         solved=solved,
         terminated=terminated,
+        level=str(info.get("level", "")),
+        dead_end=dead_end,
     )
 
 
@@ -149,12 +199,13 @@ class _Slot:
     logprobs: list[float]
     values: list[float]
     rewards: list[float]
+    dead_end: bool
 
     def reset(self) -> None:
         self.obs, _ = self.env.reset()
         self.encoder_input = self.obs["encoder_input"]
         self.encoder_length = int(self.obs["encoder_length"])
-        self.tokens, self.masks, self.logprobs, self.values, self.rewards = [], [], [], [], []
+        self.tokens, self.masks, self.logprobs, self.values, self.rewards, self.dead_end = [], [], [], [], [], False
 
     def episode(self, terminated: bool, info: dict, gamma: float) -> Episode:
         """
@@ -171,6 +222,8 @@ class _Slot:
             returns=discounted_returns(self.rewards, gamma),
             solved=bool(info.get("solved", False)),
             terminated=terminated,
+            level=str(info.get("level", "")),
+            dead_end=bool(info.get("dead_end", False)),
         )
 
 
@@ -208,6 +261,8 @@ def _batched_step(  # noqa: PLR0913, PLR0917
     memory: torch.Tensor,
     memory_pad_mask: torch.Tensor,
     greedy: bool,
+    explore_epsilon: float = 0.0,
+    sample_temperature: float = 1.0,
 ) -> tuple[list[int], list[float], list[float]]:
     """
     One policy decision for `rows` stacked observations
@@ -215,6 +270,11 @@ def _batched_step(  # noqa: PLR0913, PLR0917
 
     Single host->device transfer and one batched forward over.
     Masked logprobs and state values come back together in one GPU->CPU sync.
+
+    With `explore_epsilon` > 0 on sampled steps, every row samples: mixture
+    over valid tokens mask and scores it; greedy steps are unaffected.
+    `sample_temperature` divides masked logits by T on sampled steps only;
+    greedy steps are unaffected.
     """
     buffer = staging[:rows].to(device, non_blocking=True)
     decoder_history = buffer[:, :max_dec]
@@ -227,10 +287,20 @@ def _batched_step(  # noqa: PLR0913, PLR0917
     step_values = values.gather(1, decoder_length.view(-1, 1)).squeeze(1)
 
     masked = step_logits.masked_fill(~action_mask, float("-inf"))
+    if not greedy and sample_temperature != 1.0:
+        masked = masked / sample_temperature
     logsumexp = masked.logsumexp(dim=-1)
     probs = masked.softmax(dim=-1)
     action = probs.argmax(dim=-1) if greedy else torch.multinomial(probs, 1).squeeze(1)
     logprob = masked.gather(1, action.unsqueeze(1)).squeeze(1) - logsumexp
+
+    if not greedy and explore_epsilon > 0.0:
+        explore = torch.rand(rows, device=device) < explore_epsilon
+        mixture = mixture_distribution(probs, action_mask, explore_epsilon)
+        explore_action = torch.multinomial(mixture.probs, 1).squeeze(1)
+        explore_logprob = mixture.probs.gather(1, explore_action.unsqueeze(1)).log().squeeze(1)
+        action = torch.where(explore, explore_action, action)
+        logprob = torch.where(explore, explore_logprob, logprob)
 
     packet = torch.stack((action.float(), logprob, step_values), dim=1).cpu()
     return packet[:, 0].long().tolist(), packet[:, 1].tolist(), packet[:, 2].tolist()
@@ -253,13 +323,22 @@ def replicate_envs(envs: list[OpusEnv], n: int, seed: int | None = None) -> list
 
 
 def collect_batched(  # noqa: PLR0913, PLR0917
-    envs: list[OpusEnv], policy: OpusPolicy, n: int, device, greedy: bool = False, gamma: float = 1.0
+    envs: list[OpusEnv],
+    policy: OpusPolicy,
+    n: int,
+    device,
+    greedy: bool = False,
+    gamma: float = 1.0,
+    explore_epsilon: float = 0.0,
+    sample_temperature: float = 1.0,
 ) -> RolloutBatch:
     """
     N episodes over `n` lockstep slots,
     slot i bound to `envs[i % len(envs)]`.
 
     Each token-step issues one batched policy forward across the active slots.
+    `explore_epsilon` mixes mask-uniform exploration into sampled slots.
+    `sample_temperature` tempers sampled slots' softmax; greedy runs ignore both.
 
     Finished slot refills only while "demand" is begger then other slots capacity,
     otherwise retires from active set;
@@ -285,6 +364,7 @@ def collect_batched(  # noqa: PLR0913, PLR0917
             logprobs=[],
             values=[],
             rewards=[],
+            dead_end=False,
         )
         for i in range(n)
     ]
@@ -315,7 +395,16 @@ def collect_batched(  # noqa: PLR0913, PLR0917
                 staging_rows[row, max_dec] = obs["decoder_length"]
                 staging_rows[row, max_dec + 1 :] = obs["action_mask"]
             actions, logprobs, values = _batched_step(
-                policy, staging, len(active), max_dec, device, memory, memory_pad_mask, greedy
+                policy,
+                staging,
+                len(active),
+                max_dec,
+                device,
+                memory,
+                memory_pad_mask,
+                greedy,
+                explore_epsilon,
+                sample_temperature,
             )
 
             # Snapshot: finishing slots may retire from `active` below.
@@ -381,9 +470,12 @@ def build_batch(episodes: list[Episode], pad_id: int) -> RolloutBatch:
         old_values=old_values,
         returns=returns,
         valid=valid,
+        episode_solved=torch.tensor([e.solved for e in episodes], dtype=torch.bool),
+        level_names=[e.level for e in episodes],
         mean_return=sum(e.returns[0] for e in episodes) / batch_size,
         solve_rate=sum(e.solved for e in episodes) / batch_size,
         mean_length=sum(len(e.tokens) for e in episodes) / batch_size,
+        dead_ends=sum(e.dead_end for e in episodes),
     )
 
 
@@ -429,6 +521,8 @@ def build_supervised(
         old_values=zeros,
         returns=zeros,
         valid=valid,
+        episode_solved=torch.zeros(batch_size, dtype=torch.bool),
+        level_names=[""] * batch_size,
         mean_return=0.0,
         solve_rate=0.0,
         mean_length=sum(len(tokens) for tokens in sequences) / batch_size,

@@ -51,3 +51,30 @@ def test_eval_unknown_level_exits_with_corpus_listing(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         cli.main(["eval", str(checkpoint), "--level", "nope", "--device", "cpu"])
     assert "unknown levels" in str(excinfo.value.code)
+
+
+def test_generate_temperature_changes_sampling_but_stays_valid(tmp_path, monkeypatch):
+    """
+    `generate --temperature 2` fattens the sampling tail: different solutions than T = 1
+    at a fixed seed, deterministic per temperature. Only grammar-valid, applicable
+    sequences are written — the file exists only after decode + placement succeeded.
+    """
+    entry = LevelEntry(source=make_spec(), cost_max=50, name="tier0_test")
+    monkeypatch.setattr(cli, "_find_entry", lambda name: entry)
+    checkpoint = _checkpoint(tmp_path, OpusEnv([entry]))
+
+    def generate(temperature: float, out_dir: Path) -> list[str]:
+        argv = ["generate", str(checkpoint), "--count", "4", "--seed", "5", "--device", "cpu", "--out-dir", str(out_dir)]
+        if temperature != 1.0:
+            argv += ["--temperature", str(temperature)]
+        assert cli.main(argv) == 0
+        return [path.read_text() for path in sorted(out_dir.glob("tier0_test.*.oms"))]
+
+    cold = generate(1.0, tmp_path / "cold")
+    hot = generate(2.0, tmp_path / "hot")
+    cold_again = generate(1.0, tmp_path / "cold-again")
+
+    assert len(cold) >= 1
+    assert len(hot) >= 1
+    assert cold == cold_again  # fixed seed: reproducible
+    assert cold != hot  # temperature widens the sampling tail

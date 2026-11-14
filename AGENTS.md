@@ -128,7 +128,7 @@ Rules enforced by `advance`:
 
 - Action space: `Discrete(vocab_size)`.
 - `reset` samples a `LevelEntry` by weight, reuses a cached `Level`, and encodes its `spec`.
-- `step` appends the token even when the mask says invalid, applies `invalid_action_penalty`, and terminates on `[SUBMIT]` or truncates at `max_decoder_len`.
+- `step` appends the token even when the mask says invalid, applies `invalid_action_penalty`, and terminates on `[SUBMIT]` or truncates at `max_decoder_len`. A grammar dead end — the next decision's mask has zero valid tokens — terminates as failure via the standard finish path (`info["dead_end"]`, PAD-only mask in the returned observation).
 - Finish path: decode → apply → `level.run()` → `compute_reward` → `level.reset()`. The reset is mandatory because applying a solution dirties the level.
 - `__getstate__` clears the level cache for pickling/async workers.
 - Reward is terminal-only and pure (`reward.py`): static failure/`FAILED` → `failure_penalty + placement_reward * placements`; `ERROR` → `error_base + error_progress * crash_step/spec.steps`; unsolved `COMPLETED` → `unsolved_reward + shaping`; solved → `solve_reward + alpha/beta/gamma` clamped cost/area/cycles bonuses. All weights live in `RewardConfig`.

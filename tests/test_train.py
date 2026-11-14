@@ -1,18 +1,25 @@
 """Trainer smoke: iterations run, metrics and checkpoints land, resume restores state, eval is exhaustive per bank entry."""
 
+import inspect
 import json
+import math
+from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 from conftest import known_solution_tokens, make_spec
-from opus_magnum_sym import LevelSpec
+from opus_magnum_sym import Hex, LevelSpec
 from torch import nn
 
+from opus_magnum_blackbox import train as train_module
 from opus_magnum_blackbox.config import ModelConfig, TrainConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
+from opus_magnum_blackbox.families import reference_tokens, single_atom_spec
 from opus_magnum_blackbox.model import OpusPolicy
+from opus_magnum_blackbox.rollout import Episode, RolloutBatch, build_batch
 from opus_magnum_blackbox.train import Trainer
 
 TINY = ModelConfig(d_model=32, nhead=4, encoder_layers=1, decoder_layers=1, dim_feedforward=64)
@@ -271,3 +278,476 @@ def test_slot_pool_seeding_stable_across_trainers(tmp_path):
     draws = [[env.reset()[1]["level"] for _ in range(4)] for env in pools[0]]
     assert draws == [[env.reset()[1]["level"] for _ in range(4)] for env in pools[1]]
     assert len({tuple(seq) for seq in draws}) > 1  # replicas do not draw in lockstep
+
+
+# --- self-imitation buffer and step (stage 3 of the discovery plan) ---
+
+
+def make_sil_episode(env: OpusEnv, spec, tokens: list[int], solved: bool, level: str) -> Episode:
+    padded, encoder_length = env.tokenizer.encode_level_spec(spec)
+    return Episode(
+        encoder_input=padded,
+        encoder_length=encoder_length,
+        tokens=tokens,
+        masks=[env.masker.mask(tokens[:t], spec) for t in range(len(tokens))],
+        logprobs=[0.0] * len(tokens),
+        values=[0.0] * len(tokens),
+        rewards=[0.0] * len(tokens),
+        returns=[0.0] * len(tokens),
+        solved=solved,
+        terminated=True,
+        level=level,
+    )
+
+
+def make_solved_batch(env: OpusEnv, levels: list[tuple[object, str]]) -> RolloutBatch:
+    """Batch of solved episodes, one per (spec, level name)."""
+    vocab = env.tokenizer.vocab
+    return build_batch(
+        [make_sil_episode(env, spec, reference_tokens(spec), True, name) for spec, name in levels],
+        vocab.pad_id,
+    )
+
+
+def test_sil_scarcity_draw_hits_first_time_levels_most(tmp_path):
+    """
+    Level A buffered once, level B five times: the weighted draw hits A ~5x more often
+    (probability proportional to 1/counter); a fixed seed reproduces the exact counts.
+    """
+    spec_a = single_atom_spec(Hex(2, 3), Hex(2, 2))
+    spec_b = single_atom_spec(Hex(3, 3), Hex(3, 2))
+    env = OpusEnv(
+        [
+            LevelEntry(source=spec_a, cost_max=100, name="bank/a"),
+            LevelEntry(source=spec_b, cost_max=100, name="bank/b"),
+        ]
+    )
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=2, sil_weighting="scarcity"))
+    trainer._sil_step(make_solved_batch(env, [(spec_a, "bank/a")]))
+    for _ in range(5):
+        trainer._sil_step(make_solved_batch(env, [(spec_b, "bank/b")]))
+    assert trainer._sil_solves == {"bank/a": 1, "bank/b": 5}
+
+    def draw_counts() -> Counter:
+        torch.manual_seed(7)
+        counts: Counter = Counter()
+        for _ in range(500):
+            for row in trainer._sample_sil_rows():
+                counts[row.level] += 1
+        return counts
+
+    counts = draw_counts()
+    assert counts == draw_counts()  # fixed seed: exact, reproducible counts
+    total = counts["bank/a"] + counts["bank/b"]
+    assert counts["bank/a"] == pytest.approx((5 / 6) * total, abs=0.1 * total)
+    assert counts["bank/a"] > 2 * counts["bank/b"]
+
+
+def test_sil_uniform_weighting_reproduces_legacy_draw(tmp_path):
+    """
+    `sil_weighting="uniform"` is exactly the unstratified draw: seeded randperm over the
+    buffer's insertion order, without replacement.
+    """
+    specs = [
+        (single_atom_spec(Hex(2, 3), Hex(2, 2)), "bank/a"),
+        (single_atom_spec(Hex(3, 3), Hex(3, 2)), "bank/b"),
+        (single_atom_spec(Hex(2, 4), Hex(2, 3)), "bank/c"),
+    ]
+    env = OpusEnv([LevelEntry(source=spec, cost_max=100, name=name) for spec, name in specs])
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=2))
+    trainer._sil_step(make_solved_batch(env, specs))
+    buffer_rows = list(trainer._sil_buffer.values())
+
+    torch.manual_seed(3)
+    rows = trainer._sample_sil_rows()
+
+    torch.manual_seed(3)
+    picks = set(torch.randperm(len(buffer_rows))[:2].tolist())
+    expected = [row for index, row in enumerate(buffer_rows) if index in picks]
+    assert [row.level for row in rows] == [row.level for row in expected]
+
+
+def test_sil_unknown_weighting_is_a_hard_error(tmp_path):
+    """A typo'd sil_weighting must not silently degrade to uniform."""
+    trainer = make_trainer(tmp_path)
+    trainer.train_config = replace(trainer.train_config, sil_weighting="stratified")
+    with pytest.raises(ValueError, match="sil_weighting"):
+        trainer._sample_sil_rows()
+
+
+def test_sil_path_has_no_distance_labels():
+    """
+    Guard: the SIL replay path is label-free — the trainer module never references
+    distance/geometry classes; replay weights derive from solve counters and greedy
+    pass outcomes alone.
+    """
+    source = inspect.getsource(train_module)
+    assert "distance" not in source
+    assert "geometry" not in source
+
+
+def test_sil_buffer_dedupes_per_level_and_caps(tmp_path):
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    spec = env.levels[0].source
+    good = known_solution_tokens(vocab)
+    failed = [vocab.special_id("[SUBMIT]")]
+    episodes = [
+        make_sil_episode(env, spec, good[:-1], True, "lvl/a"),
+        make_sil_episode(env, spec, failed, False, "lvl/b"),
+        make_sil_episode(env, spec, good, True, "lvl/a"),  # refresh: the latest solve must win
+        make_sil_episode(env, spec, good, True, "lvl/c"),
+    ]
+    batch = build_batch(episodes, vocab.pad_id)
+
+    trainer = make_trainer(tmp_path)
+    trainer.train_config = replace(trainer.train_config, sil_coef=0.1)
+    loss, new_levels = trainer._sil_step(batch)
+    assert loss is not None
+    assert set(trainer._sil_buffer) == {"lvl/a", "lvl/c"}  # failed row never buffered
+    assert new_levels == ["lvl/a", "lvl/c"]  # the refresh is not a new level
+    assert int(trainer._sil_buffer["lvl/a"].actions.shape[0]) == len(good)  # latest solve kept
+    assert trainer._sil_solves == {"lvl/a": 2, "lvl/c": 1}  # refreshes count toward scarcity
+
+    capped = make_trainer(tmp_path / "cap")
+    capped.train_config = replace(capped.train_config, sil_coef=0.1, sil_buffer_cap=1)
+    capped._sil_step(batch)
+    assert set(capped._sil_buffer) == {"lvl/c"}  # oldest levels evicted first
+    assert capped._sil_solves == {"lvl/a": 2, "lvl/c": 1}  # counters outlive cap eviction
+
+
+def test_sil_disabled_is_inert(tmp_path):
+    env = make_env()
+    trainer = make_trainer(tmp_path)  # default sil_coef=0
+    vocab = env.tokenizer.vocab
+    batch = build_batch([make_sil_episode(env, env.levels[0].source, known_solution_tokens(vocab), True, "lvl/a")], vocab.pad_id)
+    assert trainer._sil_step(batch) == (None, [])
+    assert trainer._sil_buffer == {}
+
+
+def test_sil_loss_scales_linearly(tmp_path):
+    """
+    Same weights and same buffer: the SIL loss returned is the pre-step BC NLL,
+    so halving `sil_coef` must halve it.
+    """
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    batch = build_batch([make_sil_episode(env, env.levels[0].source, known_solution_tokens(vocab), True, "lvl/a")], vocab.pad_id)
+
+    losses = {}
+    for sil_coef in (0.5, 1.0):
+        torch.manual_seed(0)
+        policy = OpusPolicy(env.tokenizer.config, TINY)
+        trainer = Trainer(policy, [env], replace(make_config(tmp_path / str(sil_coef)), sil_coef=sil_coef))
+        torch.manual_seed(7)  # same minibatch pick under both coefficients
+        losses[sil_coef] = trainer._sil_step(batch)[0]
+
+    assert losses[1.0] == pytest.approx(2.0 * losses[0.5], rel=1e-4)
+
+
+def test_sil_step_leaves_update_untouched(tmp_path):
+    """
+    The REINFORCE step is byte-identical with and without SIL; the SIL step itself
+    runs off the buffered solved row only.
+    """
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    batch = build_batch(
+        [
+            make_sil_episode(env, env.levels[0].source, known_solution_tokens(vocab), True, "lvl/a"),
+            make_sil_episode(env, env.levels[0].source, [vocab.special_id("[SUBMIT]")], False, "lvl/failed"),
+        ],
+        vocab.pad_id,
+    )
+
+    outcomes = []
+    for sil_coef in (0.0, 0.1):
+        torch.manual_seed(0)
+        policy = OpusPolicy(env.tokenizer.config, TINY)
+        trainer = Trainer(policy, [env], replace(make_config(tmp_path / f"up{sil_coef}"), sil_coef=sil_coef))
+        outcomes.append(trainer.update(batch))
+    assert outcomes[0] == outcomes[1]
+
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path / "sil"), sil_coef=0.1))
+    loss, new_levels = trainer._sil_step(batch)
+    assert loss is not None
+    assert new_levels == ["lvl/a"]
+    assert set(trainer._sil_buffer) == {"lvl/a"}
+
+
+def test_sil_metrics_logged_only_when_enabled(tmp_path):
+    spec = make_spec()
+    env = OpusEnv([LevelEntry(source=spec, cost_max=50, name="bank/train")])
+    base = make_config(tmp_path, iterations=1, eval_interval=10, checkpoint_interval=10)
+
+    off = Trainer(_script_policy(env, spec), [env], base)
+    off.run()
+    entry = read_metrics(off.run_dir)[0]
+    assert "sil_loss" not in entry
+    assert "sil_buffer" not in entry
+    assert "sil_replay_top" not in entry
+
+    on = Trainer(_script_policy(env, spec), [env], replace(base, sil_coef=0.1))
+    on.run()
+    entry = read_metrics(on.run_dir)[0]
+    assert entry["sil_loss"] >= 0.0
+    assert entry["sil_buffer"] == 1  # both episodes play the same level: one deduped entry
+    assert entry["sil_new_levels"] == ["bank/train"]
+    assert entry["sil_replay_top"] == [["bank/train", 1]]  # one buffered level: the draw's single pick
+
+
+# --- failure-driven SIL replay weighting (stage 1 of the tier1 retry plan) ---
+
+
+def make_fail_trainer(tmp_path: Path, specs: list[tuple[object, str]], sil_batch_size: int = 4) -> Trainer:
+    """Trainer with sil_weighting="fail" and one buffered solved row per (spec, level name)."""
+    env = OpusEnv([LevelEntry(source=spec, cost_max=100, name=name) for spec, name in specs])
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(
+        policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=sil_batch_size, sil_weighting="fail")
+    )
+    trainer._sil_step(make_solved_batch(env, specs))
+    return trainer
+
+
+def test_sil_fail_draw_gives_failed_levels_half_the_minibatch(tmp_path):
+    """
+    Synthetic pass/fail table: exactly half of each minibatch comes from buffered levels
+    whose latest greedy pass failed, half from the rest (with replacement — the rest group
+    holds a single level, so both rest picks must hit it); a fixed seed reproduces the draw.
+    """
+    specs = [
+        (single_atom_spec(Hex(2, 3), Hex(2, 2)), "bank/pass"),
+        (single_atom_spec(Hex(3, 3), Hex(3, 2)), "bank/fail_a"),
+        (single_atom_spec(Hex(2, 4), Hex(2, 3)), "bank/fail_b"),
+        (single_atom_spec(Hex(3, 4), Hex(3, 3)), "bank/fail_c"),
+    ]
+    trainer = make_fail_trainer(tmp_path, specs)
+    trainer._greedy_passes = {name: not name.startswith("bank/fail") for _, name in specs}
+
+    torch.manual_seed(11)
+    rows = trainer._sample_sil_rows()
+    counts = Counter("failed" if trainer._greedy_passes[row.level] is False else "rest" for row in rows)
+    assert counts == {"failed": 2, "rest": 2}  # exact halves at sil_batch_size=4
+    assert Counter(row.level for row in rows if trainer._greedy_passes[row.level]) == {"bank/pass": 2}
+    assert trainer._sil_fail_group == 3  # failed-and-buffered group size
+
+    torch.manual_seed(11)
+    assert [row.level for row in trainer._sample_sil_rows()] == [row.level for row in rows]
+
+
+def test_sil_fail_falls_back_to_uniform_on_degenerate_groups(tmp_path):
+    """
+    No table yet (pre-first-eval), an all-passed table (empty failure group) and an
+    all-failed table (empty rest group) each fall back to exactly the legacy uniform pick.
+    """
+    specs = [
+        (single_atom_spec(Hex(2, 3), Hex(2, 2)), "bank/a"),
+        (single_atom_spec(Hex(3, 3), Hex(3, 2)), "bank/b"),
+        (single_atom_spec(Hex(2, 4), Hex(2, 3)), "bank/c"),
+    ]
+    trainer = make_fail_trainer(tmp_path, specs, sil_batch_size=2)
+    buffer_rows = list(trainer._sil_buffer.values())
+
+    def assert_uniform_pick(fail_group: int) -> None:
+        torch.manual_seed(3)
+        rows = trainer._sample_sil_rows()
+        torch.manual_seed(3)
+        picks = set(torch.randperm(len(buffer_rows))[:2].tolist())
+        expected = [row.level for index, row in enumerate(buffer_rows) if index in picks]
+        assert [row.level for row in rows] == expected
+        assert trainer._sil_fail_group == fail_group
+
+    assert_uniform_pick(0)  # pre-first-eval: empty table, failure group empty
+    trainer._greedy_passes = {name: True for _, name in specs}
+    assert_uniform_pick(0)  # all passed: failure group empty
+    trainer._greedy_passes = {name: False for _, name in specs}
+    assert_uniform_pick(3)  # all failed: rest group empty
+
+
+def test_sil_fail_table_leaves_uniform_draw_unchanged(tmp_path):
+    """
+    Uniform mode ignores the pass table: with failures recorded the draw is still the
+    legacy randperm pick, and `sil_fail_group` stays unset (no metric key).
+    """
+    specs = [
+        (single_atom_spec(Hex(2, 3), Hex(2, 2)), "bank/a"),
+        (single_atom_spec(Hex(3, 3), Hex(3, 2)), "bank/b"),
+        (single_atom_spec(Hex(2, 4), Hex(2, 3)), "bank/c"),
+    ]
+    env = OpusEnv([LevelEntry(source=spec, cost_max=100, name=name) for spec, name in specs])
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(policy, [env], replace(make_config(tmp_path), sil_coef=0.1, sil_batch_size=2))
+    trainer._sil_step(make_solved_batch(env, specs))
+    trainer._greedy_passes = {name: False for _, name in specs}
+    buffer_rows = list(trainer._sil_buffer.values())
+
+    torch.manual_seed(3)
+    rows = trainer._sample_sil_rows()
+    torch.manual_seed(3)
+    picks = set(torch.randperm(len(buffer_rows))[:2].tolist())
+    expected = [row.level for index, row in enumerate(buffer_rows) if index in picks]
+    assert [row.level for row in rows] == expected
+    assert trainer._sil_fail_group is None
+
+
+def test_greedy_eval_records_per_level_pass_table(tmp_path):
+    """
+    The train-bank greedy eval keeps pass/fail per level name, aligned with the entries;
+    the eval-bank pass stays aggregate-only and touches no train level's outcome.
+    """
+    solved = make_spec()
+    entries = [
+        LevelEntry(source=solved, cost_max=50, name="bank/solved"),
+        LevelEntry(source=make_spec(target=2, cycling=False), cost_max=50, name="bank/target2"),
+        LevelEntry(source=make_spec(steps=5), cost_max=50, name="bank/short"),
+    ]
+    env = OpusEnv(entries)
+    eval_env = OpusEnv([LevelEntry(source=solved, cost_max=50, name="bank/eval")])
+    trainer = Trainer(
+        _script_policy(env, solved), [env], TrainConfig(device="cpu", run_dir=str(tmp_path)), eval_envs=[eval_env]
+    )
+
+    assert trainer.evaluate() == pytest.approx(1 / 3)
+    assert trainer._greedy_passes == {"bank/solved": True, "bank/target2": False, "bank/short": False}
+
+    trainer._greedy_solve_rate(trainer.eval_envs)
+    assert trainer._greedy_passes == {"bank/solved": True, "bank/target2": False, "bank/short": False}
+
+
+def test_sil_fail_group_metric_logged_on_fail_rows(tmp_path):
+    """
+    `fail` mode stamps `sil_fail_group` (failed-and-buffered group size) onto SIL rows —
+    0 before the first eval, then the group size; uniform rows carry no such key.
+    """
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    batch = build_batch([make_sil_episode(env, env.levels[0].source, known_solution_tokens(vocab), True, "lvl/a")], vocab.pad_id)
+
+    uniform = make_trainer(tmp_path / "uniform")
+    uniform.train_config = replace(uniform.train_config, sil_coef=0.1)
+    uniform._sil_step(batch)
+    uniform.run_dir.mkdir(parents=True, exist_ok=True)
+    uniform._log_metrics(batch, 0.0, 0.0, 0.0, 0.0, sil_loss=0.0)
+    assert "sil_fail_group" not in read_metrics(uniform.run_dir)[0]
+
+    fail = make_trainer(tmp_path / "fail")
+    fail.train_config = replace(fail.train_config, sil_coef=0.1, sil_weighting="fail")
+    fail._sil_step(batch)  # no table yet: fallback draw with an empty failure group
+    assert fail._sil_fail_group == 0
+    fail.run_dir.mkdir(parents=True, exist_ok=True)
+    fail._log_metrics(batch, 0.0, 0.0, 0.0, 0.0, sil_loss=0.0)
+    assert read_metrics(fail.run_dir)[0]["sil_fail_group"] == 0
+
+
+# --- sampling temperature (stage 2 of the hardening plan) ---
+
+
+def test_sample_temperature_one_run_matches_default(tmp_path):
+    """
+    Explicit sample_temperature=1.0 runs byte-identical to the default (knob unset):
+    same seeded trajectories, losses and eval rates (modulo wall time / timestamps).
+    """
+    run_metrics = []
+    for config in (
+        make_config(tmp_path / "default", iterations=2, eval_interval=2, checkpoint_interval=10),
+        replace(make_config(tmp_path / "explicit", iterations=2, eval_interval=2, checkpoint_interval=10), sample_temperature=1.0),
+    ):
+        env = make_env()
+        torch.manual_seed(0)
+        policy = OpusPolicy(env.tokenizer.config, TINY)
+        trainer = Trainer(policy, [env], config)
+        trainer.run()
+        run_metrics.append([{k: v for k, v in entry.items() if k not in ("timestamp", "wall_time")} for entry in read_metrics(trainer.run_dir)])
+    assert run_metrics[0] == run_metrics[1]
+
+
+def test_update_importance_ratio_unit_and_clamped(tmp_path):
+    """
+    `update()` weights each step by exp(fresh - old) clamped to [0, 2], detached:
+    old == fresh (T = 1 replay) gives the plain REINFORCE loss bit-for-bit;
+    a 200-nat stale gap clamps at the bounds and stays finite.
+    """
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    spec = env.levels[0].source
+    tokens = known_solution_tokens(vocab)
+    padded, encoder_length = env.tokenizer.encode_level_spec(spec)
+    episode = Episode(
+        encoder_input=padded,
+        encoder_length=encoder_length,
+        tokens=tokens,
+        masks=[env.masker.mask(tokens[:t], spec) for t in range(len(tokens))],
+        logprobs=[0.0] * len(tokens),
+        values=[0.0] * len(tokens),
+        rewards=[0.0] * len(tokens),
+        returns=[1.0] * len(tokens),  # nonzero advantages
+        solved=True,
+        terminated=True,
+        level="lvl/a",
+    )
+    batch = build_batch([episode], vocab.pad_id)
+
+    def fresh_forward(policy: OpusPolicy, rollout: RolloutBatch) -> tuple[torch.Tensor, torch.Tensor]:
+        """Teacher-forced fresh logprobs and values, mirroring `update`'s masking."""
+        action_masks = rollout.action_masks.clone()
+        action_masks[~rollout.valid, vocab.pad_id] = True
+        with torch.no_grad():
+            logits, values = policy(rollout.encoder_input, rollout.encoder_length, rollout.actions, rollout.decoder_length)
+            dist = policy.masked_distribution(logits[:, :-1], action_masks)
+            return dist.log_prob(rollout.actions), values[:, :-1]
+
+    def make() -> tuple[Trainer, torch.Tensor, torch.Tensor]:
+        torch.manual_seed(0)  # identical weights for every case
+        policy = OpusPolicy(env.tokenizer.config, TINY)
+        trainer = Trainer(policy, [env], make_config(tmp_path / f"case{len(list(tmp_path.iterdir()))}"))
+        return trainer, *fresh_forward(policy, batch)
+
+    unit, fresh, values = make()
+    advantages = batch.returns - values  # update computes (returns - values).detach(); same numbers
+    expected = -(fresh * advantages)[batch.valid].mean()
+    unit_batch = replace(batch, old_logprobs=fresh, old_values=values)
+    assert unit.update(unit_batch)[0] == expected.item()  # ratio exactly 1
+
+    hot, fresh, _ = make()
+    hot_batch = replace(batch, old_logprobs=fresh - 200.0)  # exp(+200) overflows: clamps at 2
+    assert hot.update(hot_batch)[0] == pytest.approx(2.0 * expected.item(), rel=1e-9)
+
+    cold, fresh, _ = make()
+    cold_batch = replace(batch, old_logprobs=fresh + 200.0)  # exp(-200): finite, contribution vanishes
+    loss_cold = cold.update(cold_batch)[0]
+    assert math.isfinite(loss_cold)
+    assert abs(loss_cold) < 1e-6
+
+
+# --- grammar dead-end metrics (stage 2.5 of the hardening plan) ---
+
+
+def test_dead_ends_logged_only_when_present(tmp_path):
+    """`dead_ends` appears in the metrics row only when the batch contains dead ends."""
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    tokens = known_solution_tokens(vocab)
+
+    def episode(dead_end: bool) -> Episode:
+        built = make_sil_episode(env, env.levels[0].source, tokens, True, "lvl/a")
+        built.dead_end = dead_end
+        return built
+
+    clean = make_trainer(tmp_path / "clean")
+    clean.run_dir.mkdir(parents=True, exist_ok=True)
+    clean._log_metrics(build_batch([episode(False)], vocab.pad_id), 0.0, 0.0, 0.0, 0.0)
+    assert "dead_ends" not in read_metrics(clean.run_dir)[0]
+
+    spammed = make_trainer(tmp_path / "spammed")
+    spammed.run_dir.mkdir(parents=True, exist_ok=True)
+    spammed._log_metrics(build_batch([episode(True)], vocab.pad_id), 0.0, 0.0, 0.0, 0.0)
+    assert read_metrics(spammed.run_dir)[0]["dead_ends"] == 1

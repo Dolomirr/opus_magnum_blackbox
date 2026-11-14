@@ -1,0 +1,50 @@
+# Tier-1 discovery stage 5, run 2/2: LOUDER SIL.
+# Same as tier1_disc_sil2.toml but sil_coef 0.5. If loud SIL converts buffered d1
+# levels but d2 sags below the 0.55 guard, this arm says whether more amplification
+# helps or hurts. Plan: .opencode/plan/tier1_discovery_test.md, stage 5.
+
+[run]
+levels          = ["tier1_simple_arms/train"]
+eval_levels     = ["tier1_simple_arms/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+autodiscovery   = 9
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 100 # scaled by the dial to 11
+lr                  = 1e-3
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5 # prevent overfit
+
+[[stage]]
+name            = "rl-shape"
+kind            = "rl"
+iterations      = 400
+episodes        = 32
+lr              = 1e-4
+entropy_coef    = 0.005
+shaping_weight  = 0.5
+progress_weight = 0.3
+sil_coef        = 0.5
+sil_batch_size  = 32
+sil_stratify    = true
+
+[[stage]]
+name            = "rl-consolidate"
+kind            = "rl"
+iterations      = 2000 # ceiling, not target
+episodes        = 32
+lr              = 1e-4
+entropy_coef    = 0.001
+shaping_weight  = 0.0
+progress_weight = 0.3
+sil_coef        = 0.5
+sil_batch_size  = 32
+sil_stratify    = true
+eval_patience   = 20    # ~200 iterations without eval-bank improvement ends the stage
+# alpha/beta/gamma stay 0

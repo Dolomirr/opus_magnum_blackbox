@@ -103,3 +103,77 @@ def test_placement_progress_credited_on_failure(spec):
     # Two placements applied before the third failed.
     report = DecodeReport(ok=False, error="placement failed", error_token_pos=8, placements=2)
     assert compute_reward(report, None, spec, config) == -1.0 + 0.05 * 2
+
+
+def test_progress_bonus_full_on_delivery(spec):
+    # Nothing remains near the exit: the atom was delivered (final_dist = 0).
+    config = RewardConfig(progress_weight=0.3)
+    assert compute_reward(DecodeReport(ok=True), _result(), spec, config, 2.0, 0.0) == 1.0 + 0.3
+    result = _result(solved=False, finished_by_exit={0: 0}, total_finished=0, finished_steps_by_exit={0: None})
+    assert compute_reward(DecodeReport(ok=True), result, spec, config, 2.0, 0.0) == 0.3
+
+
+def test_progress_bonus_partial_on_near_miss(spec):
+    # Entrance->exit is 2, the closest remaining atom ended 1 cell away.
+    config = RewardConfig(progress_weight=0.3)
+    result = _result(solved=False, finished_by_exit={0: 0}, total_finished=0, finished_steps_by_exit={0: None})
+    assert compute_reward(DecodeReport(ok=True), result, spec, config, 2.0, 1.0) == 0.3 * 0.5
+
+
+def test_progress_bonus_zero_for_stalled_or_regressed_atom(spec):
+    config = RewardConfig(progress_weight=0.3)
+    result = _result(solved=False, finished_by_exit={0: 0}, total_finished=0, finished_steps_by_exit={0: None})
+    # Atom still resting at the entrance: no movement, no bonus.
+    assert compute_reward(DecodeReport(ok=True), result, spec, config, 2.0, 2.0) == 0.0
+    # Atom pushed farther than the entrance: clamped to zero, never a penalty.
+    assert compute_reward(DecodeReport(ok=True), result, spec, config, 2.0, 5.0) == 0.0
+
+
+def test_progress_weight_zero_reproduces_current_rewards(spec):
+    config = RewardConfig()
+    result = _result(solved=False, finished_by_exit={0: 0}, total_finished=0, finished_steps_by_exit={0: None})
+    assert compute_reward(DecodeReport(ok=True), result, spec, config, 2.0, 1.0) == 0.0
+    assert compute_reward(DecodeReport(ok=True), _result(), spec, config, 2.0, 0.0) == 1.0
+
+
+def test_progress_bonus_requires_distances(spec):
+    config = RewardConfig(progress_weight=0.3)
+    # No distances passed (unfixed entrypoints etc.): term stays off, no crash.
+    assert compute_reward(DecodeReport(ok=True), _result(), spec, config) == 1.0
+    # Degenerate zero span would divide by zero: term stays off.
+    assert compute_reward(DecodeReport(ok=True), _result(), spec, config, 0.0, 0.0) == 1.0
+
+
+def test_progress_bonus_never_exceeds_weight(spec):
+    config = RewardConfig(progress_weight=0.3)
+    for final in (0.0, 1.0, 2.0, 7.0):
+        reward = compute_reward(DecodeReport(ok=True), _result(), spec, config, 2.0, final)
+        assert 1.0 <= reward <= 1.0 + config.progress_weight
+
+
+def test_progress_bonus_combines_with_delivered_shaping(spec):
+    config = RewardConfig(progress_weight=0.3, shaping_weight=0.5)
+    result = _result(
+        solved=False,
+        finished_by_exit={0: 1, 1: 0},
+        total_finished=1,
+        finished_steps_by_exit={0: 6, 1: None},
+    )
+    assert compute_reward(DecodeReport(ok=True), result, spec, config, 2.0, 1.0) == 0.3 * 0.5 + 0.5 * 0.5
+
+
+def test_no_progress_bonus_on_crash_or_static_failure(spec):
+    config = RewardConfig(progress_weight=0.3)
+    error_result = _result(
+        status=LevelStatus.ERROR,
+        error=LevelError("Collision", "boom", 15, FailureReason.COLLISION_SWEEP_ATOM),
+        solved=False,
+    )
+    assert compute_reward(DecodeReport(ok=True), error_result, spec, config, 2.0, 0.0) == -0.5 + 0.4 * (15 / 30)
+    failed_result = _result(
+        status=LevelStatus.FAILED,
+        error=LevelError("x", "missing", None, FailureReason.ENTRYPOINT_MISSING),
+        solved=False,
+    )
+    assert compute_reward(DecodeReport(ok=True), failed_result, spec, config, 2.0, 0.0) == -1.0
+    assert compute_reward(DecodeReport(ok=False), None, spec, config, 2.0, 0.0) == -1.0

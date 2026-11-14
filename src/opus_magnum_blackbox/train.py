@@ -9,7 +9,7 @@ import json
 import time
 import zlib
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +22,39 @@ from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import Timer
 from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched, replicate_envs
+
+
+@dataclass(frozen=True)
+class SILRow:
+    """
+    Replayable solved-episode row: exactly the batch fields the BC loss consumes,
+    trimmed to the episode length.
+    `level` is dedup key; its solve counter is in `Trainer._sil_solves`.
+    """
+
+    # fmt: off
+    level          : str
+    encoder_input  : torch.Tensor # [E] int64
+    encoder_length : int
+    actions        : torch.Tensor # [T] int64
+    action_masks   : torch.Tensor # [T, V] bool
+    valid          : torch.Tensor # [T] bool
+    # fmt: on
+
+
+def _sil_row(batch: RolloutBatch, row: int) -> SILRow:
+    """
+    Slice one solved episode out of a batch.
+    """
+    length = int(batch.decoder_length[row])
+    return SILRow(
+        level=batch.level_names[row],
+        encoder_input=batch.encoder_input[row],
+        encoder_length=int(batch.encoder_length[row]),
+        actions=batch.actions[row, :length],
+        action_masks=batch.action_masks[row, :length],
+        valid=batch.valid[row, :length],
+    )
 
 
 class Trainer:
@@ -37,6 +70,8 @@ class Trainer:
         reward_config: RewardConfig | None = None,
         model_config: ModelConfig | None = None,
         eval_envs: list[OpusEnv] | None = None,
+        autodiscovery: int | None = None,
+        tag: str = "",
     ) -> None:
         self.policy = policy
         self.envs = envs
@@ -49,19 +84,35 @@ class Trainer:
         self.policy.to(self.device)  # apply Module to com. device
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.train_config.lr)
         self.iteration = 0
-        # Stage name stamped onto metrics entries while a pipeline stage runs; None outside.
         self.stage: str | None = None
-        # Optional `profile.ProfiledEnvs`; when set, `run` writes `profile.jsonl`.
+        """Stage name stamped onto metrics entries while a pipeline stage runs; None outside."""
+        self.autodiscovery: int | None = autodiscovery
+        """Supervision dial (1..10)"""
+        self.tag = tag
+        """Run-dir suffix tag (config stem + knobs); empty falls back to the `-adN` suffix."""
         self.profile = None
+        """Optional `profile.ProfiledEnvs`; when set, `run` writes `profile.jsonl`."""
+
         # Stepping-independent env replicas for the lockstep collector, cached per slot count.
         self._slot_env_pool: dict[int, list[OpusEnv]] = {}
         # Single-level envs for exhaustive greedy eval, cached per env pool + entry name.
         self._entry_env_pools: dict[tuple[OpusEnv, ...], dict[str, OpusEnv]] = {}
         # Best eval-bank solve rate seen so far; drives `best_eval.pt`.
         self._best_eval_rate: float | None = None
-        # Sub-second precision: trainer + resume within one second must not share a run dir.
-        # The directory is created lazily on the first write, so resumes can target an existing one.
+        # Self-imitation buffer: latest solved episode per level name (see `_sil_step`).
+        self._sil_buffer: dict[str, SILRow] = {}
+        # Buffered solve counters per level name; drives replay weighting.
+        self._sil_solves: dict[str, int] = {}
+        # Per-level picks of latest SIL minibatch; logged as `sil_replay_top`.
+        self._sil_replay_counts: dict[str, int] = {}
+        # Latest exhaustive greedy pass per train level name; drives the "fail" SIL weighting.
+        self._greedy_passes: dict[str, bool] = {}
+        # Failed-and-buffered group size of the latest "fail" draw; logged as `sil_fail_group`.
+        self._sil_fail_group: int | None = None
+
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
+        """Sub-second precision: trainer + resume within one second must not share a run dir.
+        The directory is created lazily on the first write, so resumes can target an existing one."""
 
     @staticmethod
     def _auto_device() -> str:
@@ -78,7 +129,12 @@ class Trainer:
             common.append(parts[0])
         label = "/".join(common) if common else names[0]
         # Flatten group separators: the label must stay a single path segment.
-        return f"{stamp}-{label.replace('/', '_')}"
+        name = f"{stamp}-{label.replace('/', '_')}"
+        if self.tag:
+            name += f"-{self.tag}"
+        elif self.autodiscovery is not None and self.autodiscovery > 1:
+            name += f"-ad{self.autodiscovery}"
+        return name
 
     def run(self, eval_patience: int | None = None) -> None:
         """
@@ -106,11 +162,14 @@ class Trainer:
                     self.train_config.episodes_per_iteration,
                     self.device,
                     gamma=self.train_config.gamma,
+                    explore_epsilon=self.train_config.explore_epsilon,
+                    sample_temperature=self.train_config.sample_temperature,
                 )
             with self._timed("update"):
                 policy_loss, value_loss, entropy = self.update(batch)
+                sil_loss, sil_new_levels = self._sil_step(batch)
             iteration_wall = time.time() - started
-            self._log_metrics(batch, policy_loss, value_loss, entropy, iteration_wall)
+            self._log_metrics(batch, policy_loss, value_loss, entropy, iteration_wall, sil_loss, sil_new_levels)
             self._log_profile(batch, iteration_wall)
 
             if self.iteration % self.train_config.eval_interval == 0:
@@ -154,6 +213,7 @@ class Trainer:
         actions        = batch.actions.to(self.device)
         decoder_length = batch.decoder_length.to(self.device)
         action_masks   = batch.action_masks.to(self.device)
+        old_logprobs   = batch.old_logprobs.to(self.device)
         returns        = batch.returns.to(self.device)
         valid          = batch.valid.to(self.device)
         # fmt:on
@@ -173,7 +233,13 @@ class Trainer:
         entropy = dist.entropy()
         advantages = (returns - values).detach()
 
-        policy_loss = -(logprobs * advantages)[valid].mean()
+        # Off-policy correction: rollout actions came from collection-time policy,
+        # possibly with temperature.
+        # Weight gradient, clamped Pso stale or overflowing ratios cannot blow up the step.
+        # Impossible samples have 0 ratio.
+        ratio = (logprobs - old_logprobs).exp().clamp(min=0.0, max=2.0).detach()
+        contributions = torch.where(ratio > 0.0, logprobs * advantages * ratio, torch.zeros_like(ratio))
+        policy_loss = -contributions[valid].mean()
         value_loss = ((values - returns) ** 2)[valid].mean()
         entropy = entropy[valid].mean()
 
@@ -187,6 +253,130 @@ class Trainer:
         nn.utils.clip_grad_norm_(self.policy.parameters(), self.train_config.grad_clip)
         self.optimizer.step()
         return policy_loss.item(), value_loss.item(), entropy.item()
+
+    def _sil_step(self, batch: RolloutBatch) -> tuple[float | None, list[str]]:
+        """
+        Self-imitation: fold solved rollout rows into the buffer, then run one
+        `_bc_update` step over a sampled minibatch, loss scaled by `sil_coef`.
+
+        The buffer keeps the latest solve per level name, capped at `sil_buffer_cap`
+        (oldest levels evicted first); it is in-memory only, so resumed runs refill
+        within a few iterations.
+        Every buffered solve increments level's counter.
+        Minibatch levels are drawn proportionally to 1/counter,
+        so first-time levels dominate and re-solved levels opear less often.
+        Returns  no step and no metrics keys when `sil_coef` is 0 or the buffer is still empty.
+
+        Returns:
+            Tuple:
+                - the scaled BC loss, or None when no step ran
+                - level names newly added to the buffer this iteration
+
+        """
+        config = self.train_config
+        if config.sil_coef <= 0.0:
+            return None, []
+        new_levels: list[str] = []
+        for row in batch.episode_solved.nonzero(as_tuple=True)[0].tolist():
+            entry = _sil_row(batch, int(row))
+            # pop-then-set keeps a refreshed solve newest, so cap eviction drops stale levels first
+            if self._sil_buffer.pop(entry.level, None) is None:
+                new_levels.append(entry.level)
+            self._sil_buffer[entry.level] = entry
+            self._sil_solves[entry.level] = self._sil_solves.get(entry.level, 0) + 1
+            while len(self._sil_buffer) > config.sil_buffer_cap:
+                self._sil_buffer.pop(next(iter(self._sil_buffer)))
+
+        if not self._sil_buffer:
+            return None, new_levels
+        self._sil_replay_counts = {}
+        rows = self._sample_sil_rows()
+        minibatch = self._sil_minibatch(rows)
+        loss, _accuracy = self._bc_update(minibatch, torch.arange(len(rows)), loss_scale=config.sil_coef)
+        return loss, new_levels
+
+    def _sample_sil_rows(self) -> list[SILRow]:
+        """
+        SIL minibatch draw.
+
+        "uniform": seeded shuffle over the buffer, without replacement.
+        "scarcity": levels drawn propotionally to 1/solve counter,
+        with replacement (the buffer keeps one row per level),
+        so rarely solved levels replayed most often.
+        "fail": half from buffered levels whose latest greedy eval failed, half from
+        the rest, both with replacement; falls back to uniform while either group
+        is empty (also before the first eval).
+        Records per-level picks into `_sil_replay_counts` for the `sil_replay_top` metric,
+        and the failed-group size into `_sil_fail_group` for the `sil_fail_group` metric.
+        """
+        config = self.train_config
+        if config.sil_weighting not in ("uniform", "scarcity", "fail"):
+            raise ValueError(
+                f"unknown sil_weighting: {config.sil_weighting!r}; expected 'uniform', 'scarcity' or 'fail'"
+            )
+        all_rows = list(self._sil_buffer.values())
+        size = min(config.sil_batch_size, len(all_rows))
+
+        def uniform_rows() -> list[SILRow]:
+            picks = set(torch.randperm(len(all_rows))[:size].tolist())
+            return [row for index, row in enumerate(all_rows) if index in picks]
+
+        if config.sil_weighting == "scarcity":
+            levels = list(self._sil_buffer)
+            probs = torch.tensor([1.0 / self._sil_solves[name] for name in levels])
+            picks = torch.multinomial(probs, size, replacement=True).tolist()
+            rows = [self._sil_buffer[levels[pick]] for pick in picks]
+        elif config.sil_weighting == "fail":
+            failed = [row for name, row in self._sil_buffer.items() if self._greedy_passes.get(name) is False]
+            rest = [row for name, row in self._sil_buffer.items() if self._greedy_passes.get(name) is not False]
+            self._sil_fail_group = len(failed)
+            if failed and rest:
+                half = size // 2
+                failed_picks = torch.randint(len(failed), (half,))
+                rest_picks = torch.randint(len(rest), (size - half,))
+                rows = [failed[pick] for pick in failed_picks.tolist()] + [rest[pick] for pick in rest_picks.tolist()]
+            else:
+                rows = uniform_rows()
+        else:
+            rows = uniform_rows()
+        for row in rows:
+            self._sil_replay_counts[row.level] = self._sil_replay_counts.get(row.level, 0) + 1
+        return rows
+
+    def _sil_minibatch(self, rows: list[SILRow]) -> RolloutBatch:
+        """
+        Pad buffered rows into one `RolloutBatch` layout for `_bc_update`.
+        """
+        batch_size = len(rows)
+        max_len = max(row.actions.shape[0] for row in rows)
+        vocab_size = rows[0].action_masks.shape[1]
+
+        actions = torch.full((batch_size, max_len), self.pad_id, dtype=torch.long)
+        action_masks = torch.zeros((batch_size, max_len, vocab_size), dtype=torch.bool)
+        valid = torch.zeros((batch_size, max_len), dtype=torch.bool)
+        for i, row in enumerate(rows):
+            length = row.actions.shape[0]
+            actions[i, :length] = row.actions
+            action_masks[i, :length] = row.action_masks
+            valid[i, :length] = row.valid
+
+        zeros = torch.zeros(batch_size, max_len)
+        return RolloutBatch(
+            encoder_input=torch.stack([row.encoder_input for row in rows]),
+            encoder_length=torch.tensor([row.encoder_length for row in rows], dtype=torch.long),
+            actions=actions,
+            decoder_length=torch.tensor([row.actions.shape[0] for row in rows], dtype=torch.long),
+            action_masks=action_masks,
+            old_logprobs=zeros,
+            old_values=zeros,
+            returns=zeros,
+            valid=valid,
+            episode_solved=torch.ones(batch_size, dtype=torch.bool),
+            level_names=[row.level for row in rows],
+            mean_return=0.0,
+            solve_rate=0.0,
+            mean_length=float(max_len),
+        )
 
     def _timed(self, name: str):
         """
@@ -216,16 +406,21 @@ class Trainer:
     def evaluate(self) -> float:
         """
         Exhaustive greedy solve rate over the train bank: one episode per level entry.
+        Keeps the per-level pass/fail outcome on the trainer for the "fail" SIL weighting.
         """
-        return self._greedy_solve_rate(self.envs)
+        return self._greedy_solve_rate(self.envs, record=True)
 
-    def _greedy_solve_rate(self, envs: list[OpusEnv]) -> float:
+    def _greedy_solve_rate(self, envs: list[OpusEnv], record: bool = False) -> float:
         """
         One deterministic greedy episode per level entry across `envs` banks.
+        With `record`, per-level outcomes are kept as name → bool in `_greedy_passes`;
+        the eval-bank pass stays aggregate-only.
         """
         self.policy.eval()
         entry_envs = [self._entry_env(envs, entry) for env in envs for entry in env.levels]
         batch = collect_batched(entry_envs, self.policy, len(entry_envs), self.device, greedy=True)
+        if record:
+            self._greedy_passes.update(zip(batch.level_names, batch.episode_solved.tolist(), strict=True))
         return batch.solve_rate
 
     def _entry_env(self, pool: list[OpusEnv], entry: LevelEntry) -> OpusEnv:
@@ -307,7 +502,7 @@ class Trainer:
         for group in self.optimizer.param_groups:
             group["lr"] = previous_lr
 
-    def _bc_update(self, batch: RolloutBatch, rows: torch.Tensor) -> tuple[float, float]:
+    def _bc_update(self, batch: RolloutBatch, rows: torch.Tensor, loss_scale: float = 1.0) -> tuple[float, float]:
         """
         One gradient step over given batch rows.
 
@@ -335,7 +530,7 @@ class Trainer:
         logprobs = dist.log_prob(actions)
         accuracy = dist.probs.argmax(dim=-1)[valid].eq(actions[valid]).float().mean()
 
-        loss = -logprobs[valid].mean()
+        loss = -logprobs[valid].mean() * loss_scale
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.policy.parameters(), self.train_config.grad_clip)
@@ -386,6 +581,8 @@ class Trainer:
         """
         Rebuild trainer from checkpoint.
         Eval envs come from the caller's config, not the checkpoint payload.
+        The SIL buffer is in-memory only and starts empty on resume;
+        it repopulates from solved episodes within a few iterations.
         """
         payload = torch.load(path, map_location="cpu", weights_only=False)
         model_config = ModelConfig(**payload["model_config"])
@@ -417,8 +614,22 @@ class Trainer:
         for env in [*self.envs, *self.eval_envs]:
             env.reset(seed=seed)
 
-    def _log_metrics(
-        self, batch: RolloutBatch, policy_loss: float, value_loss: float, entropy: float, wall_time: float
+    def _stamp_autodiscovery(self, entry: dict) -> None:
+        """
+        Pipeline supervision dial, stamped onto every metrics row when the run comes from a pipeline.
+        """
+        if self.autodiscovery is not None:
+            entry["autodiscovery"] = self.autodiscovery
+
+    def _log_metrics(  # noqa: PLR0913, PLR0917
+        self,
+        batch: RolloutBatch,
+        policy_loss: float,
+        value_loss: float,
+        entropy: float,
+        wall_time: float,
+        sil_loss: float | None = None,
+        sil_new_levels: list[str] | None = None,
     ) -> None:
         entry = {
             "iteration": self.iteration,
@@ -430,8 +641,20 @@ class Trainer:
             "entropy": entropy,
             "wall_time": wall_time,
         }
+        if batch.dead_ends:
+            entry["dead_ends"] = batch.dead_ends  # grammar dead ends: env-forced failures
+        if sil_loss is not None:
+            entry["sil_loss"] = sil_loss
+            entry["sil_buffer"] = len(self._sil_buffer)
+            entry["sil_new_levels"] = sil_new_levels or []
+            # most-replayed levels of this iteration's draw, as [name, picks] pairs
+            ranked = sorted(self._sil_replay_counts.items(), key=lambda item: (-item[1], item[0]))
+            entry["sil_replay_top"] = [[name, count] for name, count in ranked[:5]]
+            if self._sil_fail_group is not None:
+                entry["sil_fail_group"] = self._sil_fail_group
         if self.stage is not None:
             entry["stage"] = self.stage
+        self._stamp_autodiscovery(entry)
         entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
@@ -446,6 +669,7 @@ class Trainer:
             entry["eval_solve_rate"] = eval_solve_rate
         if self.stage is not None:
             entry["stage"] = self.stage
+        self._stamp_autodiscovery(entry)
         timestamp = datetime.now().isoformat()
         entry["timestamp"] = timestamp
         with (self.run_dir / "metrics.jsonl").open("a") as file:
@@ -466,10 +690,28 @@ class Trainer:
         }
         if self.stage is not None:
             entry["stage"] = self.stage
+        self._stamp_autodiscovery(entry)
         entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
         print(f"iter {self.iteration} | stage early stop | best eval {best_rate:.2f} / last {last_rate:.2f}")
+
+    def _log_stage_skip(self, stage: str, reason: str) -> None:
+        """
+        `stage_skip` metrics row: the pipeline skipped this stage before it ran.
+        """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "iteration": self.iteration,
+            "stage": stage,
+            "stage_skip": True,
+            "reason": reason,
+        }
+        self._stamp_autodiscovery(entry)
+        entry["timestamp"] = datetime.now().isoformat()
+        with (self.run_dir / "metrics.jsonl").open("a") as file:
+            file.write(json.dumps(entry) + "\n")
+        print(f"stage {stage} skipped | {reason}")
 
     def _bank_counts(self) -> str:
         """
@@ -498,6 +740,7 @@ class Trainer:
         }
         if eval_solve_rate is not None:
             entry["eval_solve_rate"] = eval_solve_rate
+        self._stamp_autodiscovery(entry)
         entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
