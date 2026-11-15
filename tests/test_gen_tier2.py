@@ -2,6 +2,7 @@
 
 import random
 import tomllib
+from pathlib import Path
 
 import pytest
 from opus_magnum_sym import Hex
@@ -12,13 +13,12 @@ from opus_magnum_blackbox.families import hex_distance
 from opus_magnum_blackbox.solutions import load_solutions
 
 SMALL_TRAIN, SMALL_EVAL = 6, 3
+CLASS_EVAL_PERCENT = 25
 
 
 @pytest.fixture(scope="module")
 def small_bank(tmp_path_factory):
-    params = gen_tier2.BankParams(
-        seed=5, train_single=4, train_handoff=2, eval_single=2, eval_handoff=1, size=(3, 3)
-    )
+    params = gen_tier2.BankParams(seed=5, train_single=4, train_handoff=2, eval_single=2, eval_handoff=1, size=(3, 3))
     return gen_tier2.generate_bank(tmp_path_factory.mktemp("tier2_bank"), params=params)
 
 
@@ -217,9 +217,7 @@ def test_train_eval_disjoint_with_matching_manifest(small_bank):
 
 def test_quotas_apportioned_from_populations(small_bank):
     """Emitted per-stratum counts equal the quotas re-derived from a fresh classification sweep."""
-    params = gen_tier2.BankParams(
-        seed=5, train_single=4, train_handoff=2, eval_single=2, eval_handoff=1, size=(3, 3)
-    )
+    params = gen_tier2.BankParams(seed=5, train_single=4, train_handoff=2, eval_single=2, eval_handoff=1, size=(3, 3))
     strata, _ = gen_tier2.classify_pairs(size=(3, 3))
     populations = {stratum: len(pairs) for stratum, pairs in strata.items()}
     assert gen_tier2.stratify_quotas(populations, params) == small_bank.quotas
@@ -232,11 +230,7 @@ def test_quotas_apportioned_from_populations(small_bank):
 
 def _flat_strata(nested: dict) -> dict[str, dict[str, int]]:
     """`provenance.strata` as parsed from TOML (`{"1": {"single": ...}}`) flattened to `"1.single"` keys."""
-    return {
-        f"{distance}.{kind}": counts
-        for distance, kinds in nested.items()
-        for kind, counts in kinds.items()
-    }
+    return {f"{distance}.{kind}": counts for distance, kinds in nested.items() for kind, counts in kinds.items()}
 
 
 def test_manifest_strata_match_files(small_bank):
@@ -269,6 +263,187 @@ def test_manifest_strata_match_files(small_bank):
     assert class_sums == provenance["classes"]
     assert sum(counts["train"] for counts in actual.values()) == provenance["train_count"]
     assert sum(counts["eval"] for counts in actual.values()) == provenance["eval_count"]
+
+
+# --- per-class enumerated banks ---
+
+
+def test_enum_quotas_half_up_apportioned():
+    """Half-up eval share of the whole class, apportioned over strata by largest remainder."""
+    assert gen_tier2.enum_quotas({(gen_tier2.SINGLE, 1, 1): 656}, 20) == {(gen_tier2.SINGLE, 1, 1): (525, 131)}
+    assert gen_tier2.enum_quotas({(gen_tier2.HANDOFF, 0, 3): 604}, 20) == {(gen_tier2.HANDOFF, 0, 3): (483, 121)}
+    quotas = gen_tier2.enum_quotas({(gen_tier2.SINGLE, 1, 1): 3, (gen_tier2.SINGLE, 2, 1): 7}, 20)
+    assert quotas == {(gen_tier2.SINGLE, 1, 1): (2, 1), (gen_tier2.SINGLE, 2, 1): (6, 1)}
+    assert gen_tier2.enum_quotas({}, 20) == {}
+    assert gen_tier2.enum_quotas({(gen_tier2.SINGLE, 1, 1): 10}, 0) == {(gen_tier2.SINGLE, 1, 1): (10, 0)}
+
+
+@pytest.fixture(scope="module")
+def small_class_strata():
+    return gen_tier2.classify_class_pairs(size=(3, 3))
+
+
+def test_class_classification_separates_ring_strata(small_class_strata):
+    """3x3: singles key the winning ring (`arm` -> 1, `arm_l2` -> 2), handoffs pin ring 0."""
+    strata, rejected = small_class_strata
+    assert rejected == {}
+    assert {stratum: len(pairs) for stratum, pairs in sorted(strata.items())} == {
+        (gen_tier2.SINGLE, 1, 1): 32,
+        (gen_tier2.SINGLE, 1, 2): 30,
+        (gen_tier2.SINGLE, 2, 4): 2,
+        (gen_tier2.HANDOFF, 0, 3): 8,
+    }
+    for (kind, ring, distance), pairs in strata.items():
+        assert ring >= (1 if kind == gen_tier2.SINGLE else 0)
+        for entrance, exit_, spec in pairs:
+            assert hex_distance(entrance, exit_) == distance
+            assert spec.target == (2 if kind == gen_tier2.SINGLE else 1)
+
+
+def test_class_classification_agrees_with_flat_grouping():
+    """Regrouping class strata by (distance, kind) reproduces the flat classification's pair sets."""
+    class_strata, _ = gen_tier2.classify_class_pairs(size=(3, 3))
+    flat, _ = gen_tier2.classify_pairs(size=(3, 3))
+    regrouped: dict[tuple[int, str], set[tuple[int, int, int, int]]] = {}
+    for (kind, _, distance), pairs in class_strata.items():
+        keys = regrouped.setdefault((distance, kind), set())
+        keys.update((entrance.r, entrance.s, exit_.r, exit_.s) for entrance, exit_, _ in pairs)
+    flat_keys = {
+        stratum: {(entrance.r, entrance.s, exit_.r, exit_.s) for entrance, exit_, _ in pairs}
+        for stratum, pairs in flat.items()
+    }
+    assert regrouped == flat_keys
+
+
+@pytest.fixture(scope="module")
+def small_class_banks(tmp_path_factory):
+    params = gen_tier2.EnumBankParams(seed=5, eval_percent=CLASS_EVAL_PERCENT, size=(3, 3))
+    return gen_tier2.generate_class_banks(tmp_path_factory.mktemp("tier2_class_banks"), params=params)
+
+
+def test_class_banks_partition_classified_pairs(small_class_banks, small_class_strata):
+    """Splits are disjoint and union-complete per class; the banks cover every classified pair exactly."""
+    strata, rejected = small_class_strata
+    assert rejected == {}
+    classified: dict[str, set] = {}
+    for (kind, _, _), pairs in strata.items():
+        classified.setdefault(kind, set()).update(
+            (entrance.r, entrance.s, exit_.r, exit_.s) for entrance, exit_, _ in pairs
+        )
+    bank_keys: dict[str, set] = {}
+    for kind in (gen_tier2.SINGLE, gen_tier2.HANDOFF):
+        bank = small_class_banks[gen_tier2.CLASS_BANK_NAMES[kind]]
+        assert all(variant.kind == kind for variant in bank.variants)
+        train_keys = {variant.key for variant in bank.train}
+        eval_keys = {variant.key for variant in bank.eval}
+        assert not train_keys & eval_keys
+        assert train_keys | eval_keys == classified[kind]
+        bank_keys[kind] = train_keys | eval_keys
+    assert not bank_keys[gen_tier2.SINGLE] & bank_keys[gen_tier2.HANDOFF]
+
+
+def test_class_bank_quotas_match_populations(small_class_banks, small_class_strata):
+    """Emitted per-stratum counts equal the quotas re-derived from a fresh classification sweep."""
+    strata, _ = small_class_strata
+    for kind in (gen_tier2.SINGLE, gen_tier2.HANDOFF):
+        bank = small_class_banks[gen_tier2.CLASS_BANK_NAMES[kind]]
+        populations = {key: len(pairs) for key, pairs in strata.items() if key[0] == kind}
+        assert bank.quotas == gen_tier2.enum_quotas(populations, CLASS_EVAL_PERCENT)
+
+
+def test_class_bank_manifests_match_files(small_class_banks):
+    """Per-bank provenance: counts, mode, eval share, and per-stratum tables derived from the files themselves."""
+    for kind in (gen_tier2.SINGLE, gen_tier2.HANDOFF):
+        bank = small_class_banks[gen_tier2.CLASS_BANK_NAMES[kind]]
+        manifest = tomllib.loads(bank.manifest.read_text())
+        assert manifest["cost_max"] == gen_tier2.MANIFEST_COST_MAX
+        assert manifest["weight"] == gen_tier2.MANIFEST_WEIGHT
+        provenance = manifest["provenance"]
+        assert provenance["mode"] == "enumerate"
+        assert provenance["seed"] == 5
+        assert provenance["eval_percent"] == CLASS_EVAL_PERCENT
+        assert provenance["train_count"] == len(bank.train)
+        assert provenance["eval_count"] == len(bank.eval)
+        assert provenance["rejected"] == 0
+        assert provenance["steps"] == 30
+        assert provenance["size"] == [3, 3]
+        assert provenance["atom"] == "water"
+        assert _flat_class_strata(provenance["strata"], kind) == _file_stratum_counts(bank.root)
+
+
+def test_class_bank_generation_is_deterministic(tmp_path, small_class_banks):
+    banks = gen_tier2.generate_class_banks(
+        tmp_path, params=gen_tier2.EnumBankParams(seed=5, eval_percent=CLASS_EVAL_PERCENT, size=(3, 3))
+    )
+    for name, bank in small_class_banks.items():
+        names = sorted(path.relative_to(bank.root).as_posix() for path in bank.root.rglob("*") if path.is_file())
+        other = sorted(
+            path.relative_to(banks[name].root).as_posix() for path in banks[name].root.rglob("*") if path.is_file()
+        )
+        assert names == other
+        for rel in names:
+            assert (bank.root / rel).read_bytes() == (banks[name].root / rel).read_bytes(), rel
+
+
+def test_class_bank_regeneration_overwrites_in_place(tmp_path):
+    root = tmp_path / "banks"
+    gen_tier2.generate_class_banks(root, params=gen_tier2.EnumBankParams(seed=5, eval_percent=25, size=(3, 3)))
+    banks = gen_tier2.generate_class_banks(root, params=gen_tier2.EnumBankParams(seed=5, eval_percent=10, size=(3, 3)))
+    single = banks["tier2_single"]
+    assert (len(single.train), len(single.eval)) == (58, 6)
+    assert sorted(path.name for path in (single.root / "eval").iterdir()) == [
+        "v000.oml",
+        "v000.oms",
+        "v001.oml",
+        "v001.oms",
+        "v002.oml",
+        "v002.oms",
+        "v003.oml",
+        "v003.oms",
+        "v004.oml",
+        "v004.oms",
+        "v005.oml",
+        "v005.oms",
+    ]
+
+
+def _flat_class_strata(nested: dict, kind: str) -> dict[str, dict[str, int]]:
+    """`provenance.strata` as parsed from TOML, flattened to file-derivable keys: `"ring.distance"` for singles, `"distance"` for handoffs."""
+    if kind == gen_tier2.SINGLE:
+        return {
+            f"{ring}.{distance}": counts for ring, distances in nested.items() for distance, counts in distances.items()
+        }
+    return dict(nested)
+
+
+def _variant_stratum(oml: Path) -> str:
+    """File-derivable stratum key of one variant: the winning ring from the `.oms` arm placement, distance from the `.oml`."""
+    coords, target = {}, None
+    for line in oml.read_text().splitlines():
+        parts = line.split()
+        if parts and parts[0] in ("entrance", "exit"):
+            coords[parts[0]] = (int(parts[2]), int(parts[3]))
+        if parts and parts[0] == "target":
+            target = int(parts[1])
+    distance = hex_distance(Hex(*coords["entrance"]), Hex(*coords["exit"]))
+    if target == 1:
+        return f"{distance}"
+    oms = oml.with_suffix(".oms")
+    for line in oms.read_text().splitlines():
+        parts = line.split()
+        if parts and parts[0] == "place" and parts[1].startswith("arm"):
+            ring = 1 if parts[1] == "arm" else int(parts[1].removeprefix("arm_l"))
+            return f"{ring}.{distance}"
+    raise AssertionError(f"{oms.name}: no arm placement")
+
+
+def _file_stratum_counts(root: Path) -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {}
+    for split in ("train", "eval"):
+        for oml in sorted((root / split).glob("v*.oml")):
+            entry = counts.setdefault(_variant_stratum(oml), {"train": 0, "eval": 0})
+            entry[split] += 1
+    return counts
 
 
 # --- the checked-in repo bank ---
@@ -316,3 +491,95 @@ def test_repo_bank_subset_solves(relative):
         solutions=(gen_tier2.BANK_DIR / f"{relative}.oms",),
     )
     assert load_solutions(entry)[0]
+
+
+# --- the checked-in per-class repo banks ---
+
+
+def test_repo_class_banks_counts_and_manifest():
+    """The enumerated banks hold all 656 single + 604 handoff pairs, cut ~80/20 per the half-up eval share."""
+    for bank_dir, total in ((gen_tier2.SINGLE_BANK_DIR, 656), (gen_tier2.HANDOFF_BANK_DIR, 604)):
+        manifest = tomllib.loads((bank_dir / "manifest.toml").read_text())
+        provenance = manifest["provenance"]
+        assert manifest["cost_max"] == gen_tier2.MANIFEST_COST_MAX
+        assert provenance["mode"] == "enumerate"
+        assert provenance["eval_percent"] == 20
+        assert provenance["train_count"] + provenance["eval_count"] == total
+        assert provenance["eval_count"] == (total * 20 + 50) // 100
+        assert provenance["rejected"] == 0
+        assert provenance["size"] == [6, 6]
+        for split, count in (("train", provenance["train_count"]), ("eval", provenance["eval_count"])):
+            omls = sorted((bank_dir / split).glob("v*.oml"))
+            assert len(omls) == count, (bank_dir.name, split)
+            assert all(oml.with_suffix(".oms").exists() for oml in omls), (bank_dir.name, split)
+
+
+def test_repo_class_banks_partition_pair_space():
+    """Both banks together cover exactly the 1260 ordered 6x6 pairs; nothing overlaps within or across banks."""
+    bank_keys: dict[str, set] = {}
+    for bank_dir in (gen_tier2.SINGLE_BANK_DIR, gen_tier2.HANDOFF_BANK_DIR):
+        keys = [_oml_key(oml) for split in ("train", "eval") for oml in sorted((bank_dir / split).glob("v*.oml"))]
+        assert len(keys) == len(set(keys)), bank_dir.name
+        bank_keys[bank_dir.name] = set(keys)
+    assert not bank_keys["tier2_single"] & bank_keys["tier2_handoff"]
+    cells = [Hex(row, col) for row in range(6) for col in range(6)]
+    universe = {(e.r, e.s, x.r, x.s) for e in cells for x in cells if e != x}
+    assert bank_keys["tier2_single"] | bank_keys["tier2_handoff"] == universe
+
+
+def test_repo_single_bank_strata_match_files():
+    """Single-bank manifest strata (ring x distance) match the files, and ring totals hit the measured basis."""
+    provenance = tomllib.loads((gen_tier2.SINGLE_BANK_DIR / "manifest.toml").read_text())["provenance"]
+    actual = _file_stratum_counts(gen_tier2.SINGLE_BANK_DIR)
+    assert _flat_class_strata(provenance["strata"], gen_tier2.SINGLE) == actual
+    ring_totals: dict[int, int] = {}
+    for stratum, counts in actual.items():
+        ring = int(stratum.split(".", 1)[0])
+        ring_totals[ring] = ring_totals.get(ring, 0) + counts["train"] + counts["eval"]
+    assert ring_totals == {1: 428, 2: 120, 3: 108}
+
+
+def test_repo_handoff_bank_strata_match_files():
+    provenance = tomllib.loads((gen_tier2.HANDOFF_BANK_DIR / "manifest.toml").read_text())["provenance"]
+    assert _flat_class_strata(provenance["strata"], gen_tier2.HANDOFF) == _file_stratum_counts(
+        gen_tier2.HANDOFF_BANK_DIR
+    )
+
+
+def _oml_key(oml: Path) -> tuple[int, int, int, int]:
+    coords: dict[str, tuple[int, int]] = {}
+    for line in oml.read_text().splitlines():
+        parts = line.split()
+        if parts and parts[0] in ("entrance", "exit"):
+            coords[parts[0]] = (int(parts[2]), int(parts[3]))
+    return (*coords["entrance"], *coords["exit"])
+
+
+@pytest.mark.parametrize("bank_dir", [gen_tier2.SINGLE_BANK_DIR, gen_tier2.HANDOFF_BANK_DIR])
+@pytest.mark.parametrize("split", ["train", "eval"])
+def test_repo_class_bank_endpoints_solve(bank_dir, split):
+    count = tomllib.loads((bank_dir / "manifest.toml").read_text())["provenance"][f"{split}_count"]
+    for index in (0, count - 1):
+        oml = bank_dir / f"{split}/v{index:03d}.oml"
+        entry = LevelEntry(
+            source=oml,
+            cost_max=gen_tier2.MANIFEST_COST_MAX,
+            name=oml.stem,
+            solutions=(oml.with_suffix(".oms"),),
+        )
+        assert load_solutions(entry)[0]
+
+
+@pytest.mark.corpus
+@pytest.mark.parametrize("bank_dir", [gen_tier2.SINGLE_BANK_DIR, gen_tier2.HANDOFF_BANK_DIR])
+def test_repo_class_bank_full_solves(bank_dir):
+    """Corpus sweep: every emitted pair re-loads, decodes, applies and solves from disk."""
+    for split in ("train", "eval"):
+        for oml in sorted((bank_dir / split).glob("v*.oml")):
+            entry = LevelEntry(
+                source=oml,
+                cost_max=gen_tier2.MANIFEST_COST_MAX,
+                name=oml.stem,
+                solutions=(oml.with_suffix(".oms"),),
+            )
+            assert load_solutions(entry)[0], oml.name
