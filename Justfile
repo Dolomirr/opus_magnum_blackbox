@@ -53,6 +53,14 @@ train-tier1:
 train-tier2:
     uv run opus-magnum-blackbox run configs/tier2_anywhere.toml
 
+# Run tier-2 curriculum-split s(single-arm bank, ring-stratified SIL)
+train-tier2-single:
+    uv run opus-magnum-blackbox run configs/tier2_single.toml
+
+# Run tier-2 curriculum-split (handoff bank; fill [run] init_from first)
+train-tier2-handoff:
+    uv run opus-magnum-blackbox run configs/tier2_handoff.toml
+
 # Run the canonical tier-1 discovery recipe (BC seed + stratified self-imitation)
 train-tier1-discovery:
     uv run opus-magnum-blackbox run configs/tier1_discovery.toml
