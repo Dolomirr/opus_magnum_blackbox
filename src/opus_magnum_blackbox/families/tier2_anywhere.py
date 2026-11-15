@@ -60,7 +60,7 @@ from opus_magnum_blackbox.families._common import (
 from opus_magnum_blackbox.grammar import Action, Placement, Solution
 from opus_magnum_blackbox.vocab import Vocab
 
-ANYWHERE_BLUEPRINTS = frozenset({"arm", "arm_piston"})
+ANYWHERE_BLUEPRINTS = frozenset({"arm", "arm_piston", "arm_l2", "arm_l3"})
 MAX_RING = 3
 
 
@@ -294,9 +294,9 @@ def _single_candidates(
                 k = (x_dir - e_dir) % 6 if clw else (e_dir - x_dir) % 6
                 if not 1 <= k <= 5:
                     continue
-                cycle = _single_cycle(ring, clw, k)
+                cycle = _single_cycle(clw, k)
                 arm = ArmProgram(
-                    "arm" if ring == 1 else "arm_piston",
+                    "arm" if ring == 1 else f"arm_l{ring}",
                     base,
                     e_dir,
                     _cycle_ticks(cycle, deliveries),
@@ -341,15 +341,18 @@ def _handoff_candidates(
                             if x_rel is None:
                                 continue
                             x_dir, r_b_x = x_rel
-                            a_ticks = _leg_ticks(1, a_dir, r_a_e, h_dir, r_a_h)
+                            blueprint_a, a_ticks = _leg_program(1, a_dir, r_a_e, h_dir, r_a_h)
                             # B grabs exactly one tick after A releases; its leg starts
-                            # earlier only to fit the pre-grab EXTEND actions.
-                            b_start = max(1, a_ticks[-1][0] + 2 - r_b_h)
-                            b_ticks = _leg_ticks(b_start, b_dir, r_b_h, x_dir, r_b_x)
+                            # earlier only to fit the pre-grab EXTEND actions of a piston.
+                            release_a = a_ticks[-1][0]
+                            pre_ext = 0 if r_b_h == r_b_x else r_b_h - 1
+                            blueprint_b, b_ticks = _leg_program(
+                                max(1, release_a + 1 - pre_ext), b_dir, r_b_h, x_dir, r_b_x
+                            )
                             plan = AnywherePlan(
                                 (
-                                    ArmProgram(_blueprint((r_a_e, r_a_h)), a_base, a_dir, a_ticks),
-                                    ArmProgram(_blueprint((r_b_h, r_b_x)), b_base, b_dir, b_ticks),
+                                    ArmProgram(blueprint_a, a_base, a_dir, a_ticks),
+                                    ArmProgram(blueprint_b, b_base, b_dir, b_ticks),
                                 ),
                                 1,
                             )
@@ -366,7 +369,7 @@ def _handoff_candidates(
     return out
 
 
-def _single_cycle(ring: int, clw: bool, k: int) -> tuple[StepActionType, ...]:
+def _single_cycle(clw: bool, k: int) -> tuple[StepActionType, ...]:
     """
     One delivery cycle: EXTEND out, grab, `k` turns to the exit, release, turns
     home, RETRACT. `k` is the turn count in the variant's own direction (CLW or
@@ -375,14 +378,7 @@ def _single_cycle(ring: int, clw: bool, k: int) -> tuple[StepActionType, ...]:
     direction) — ring 1 is exactly the tier-1 cycle.
     """
     turn = _CLW if clw else _CCLW
-    return (
-        *(_EXT,) * (ring - 1),
-        _GRAB,
-        *(turn,) * k,
-        _RELEASE,
-        *(turn,) * (6 - k),
-        *(_RET,) * (ring - 1),
-    )
+    return (_GRAB, *(turn,) * k, _RELEASE, *(turn,) * (6 - k))
 
 
 def _cycle_ticks(cycle: tuple[StepActionType, ...], deliveries: int) -> tuple[tuple[int, StepActionType], ...]:
@@ -396,40 +392,34 @@ def _cycle_ticks(cycle: tuple[StepActionType, ...], deliveries: int) -> tuple[tu
     )
 
 
-def _leg_ticks(
+def _leg_program(
     start: int,
     grab_dir: int,
     grab_ring: int,
     give_dir: int,
     give_ring: int,
-) -> tuple[tuple[int, StepActionType], ...]:
+) -> tuple[str, tuple[tuple[int, StepActionType], ...]]:
     """
     (tick, action) pairs for one handoff leg: reach (grab_dir, grab_ring), grab,
     move the atom to (give_dir, give_ring) by radial slides then the shorter
     swing, release. Slides come first so the swing stays on a single ring.
     """
-    ticks: list[tuple[int, StepActionType]] = []
-    tick = start
-    for _ in range(grab_ring - 1):
-        ticks.append((tick, _EXT))
-        tick += 1
-    ticks.append((tick, _GRAB))
-    tick += 1
-    slides = (_RET,) * (grab_ring - give_ring) if grab_ring > give_ring else (_EXT,) * (give_ring - grab_ring)
+    if grab_ring == give_ring:
+        blueprint = "arm" if grab_ring == 1 else f"arm_l{grab_ring}"
+        actions: tuple[StepActionType, ...] = (_GRAB, *_swing(grab_dir, give_dir), _RELEASE)
+    else:
+        blueprint = "arm_piston"
+        slides = (_RET,) * (grab_ring - give_ring) if grab_ring > give_ring else (_EXT,) * (give_ring - grab_ring)
+        actions = (*(_EXT,) * (grab_ring - 1), _GRAB, *slides, *_swing(grab_dir, give_dir), _RELEASE)
+    return blueprint, tuple((start + offset, action) for offset, action in enumerate(actions))
+
+
+def _swing(grab_dir: int, give_dir: int) -> tuple[StepActionType, ...]:
+    """
+    Turns from `grab_dir` to `give_dir`, shortest direction.
+    """
     swing = (give_dir - grab_dir) % 6
-    slides += (_CLW,) * swing if swing <= 3 else (_CCLW,) * (6 - swing)
-    for action in slides:
-        ticks.append((tick, action))
-        tick += 1
-    ticks.append((tick, _RELEASE))
-    return tuple(ticks)
-
-
-def _blueprint(rings: tuple[int, ...]) -> str:
-    """
-    A plain arm serves an all-radius-1 leg pair; anything longer needs a piston.
-    """
-    return "arm" if all(ring == 1 for ring in rings) else "arm_piston"
+    return (_CLW,) * swing if swing <= 3 else (_CCLW,) * (6 - swing)
 
 
 def _plan_solves(spec: LevelSpec, plan: AnywherePlan) -> bool:
