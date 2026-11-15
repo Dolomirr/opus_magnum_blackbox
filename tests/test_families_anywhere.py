@@ -1,4 +1,4 @@
-"""Tier-2 anywhere family: piston-length singles and two-arm handoffs, simulator-verified."""
+"""Tier-2 anywhere family: static-arm singles and two-arm handoffs, simulator-verified."""
 
 import random
 
@@ -16,7 +16,12 @@ from opus_magnum_blackbox.families import (
     hex_distance,
     verify,
 )
-from opus_magnum_blackbox.families.tier2_anywhere import _anywhere_level_spec, _handoff_candidates, _plan_solves
+from opus_magnum_blackbox.families.tier2_anywhere import (
+    _anywhere_level_spec,
+    _handoff_candidates,
+    _leg_program,
+    _plan_solves,
+)
 from opus_magnum_blackbox.grammar import GrammarError
 from opus_magnum_blackbox.masking import ActionMasker
 
@@ -57,10 +62,13 @@ def test_plan_shape(name, entrance, exit_, arms):
     assert plan.target == spec.target
     assert len(plan.arms) == arms
     blueprints = {arm.blueprint for arm in plan.arms}
+    assert blueprints <= {"arm", "arm_l2", "arm_l3", "arm_piston"}
     if name.startswith("single_ring1"):
         assert blueprints == {"arm"}
+    elif name.startswith("single"):
+        assert blueprints == {f"arm_l{name[11]}"}  # ring digit from the case name
     else:
-        assert "arm_piston" in blueprints
+        assert blueprints <= {"arm", "arm_l2", "arm_l3"}  # these handoffs win without a piston
 
 
 @pytest.mark.parametrize(("name", "entrance", "exit_", "arms"), CASES)
@@ -93,7 +101,7 @@ def test_oms_renders_both_arms():
     assert report.ok
     text = solution_to_oms(ir, report.handles, spec)
     assert text.count("place ") == 2
-    assert "place arm_piston" in text
+    assert all(line.startswith("place arm") for line in text.splitlines() if line.startswith("place"))
     assert text.count("grab") == 2
     assert text.count("release") == 2
     assert anywhere_reference_oms(spec) == text
@@ -145,21 +153,48 @@ def test_straight_line_d3_stays_single_arm():
     assert len(plan.arms) == 1
     assert spec.target == 2
     actions = [action for _, action in plan.arms[0].ticks]
-    assert len(actions) == 24  # 12-action ring-3 cycle, target 2
+    assert len(actions) == 16  # 8-action static ring-3 cycle, target 2
     assert verify(spec, anywhere_reference_solution(spec)) > 0
 
 
-def test_single_piston_cycle_books_extends_at_cycle_ends():
-    """Ring 2 single: each cycle opens with EXTEND and closes with RETRACT around the turn core."""
+def test_single_static_cycle_has_no_radial_actions():
+    """Ring 2 single: the static part's cycles are pure rotation, no EXTEND/RETRACT churn."""
     spec = anywhere_spec(Hex(2, 1), Hex(0, 5))
+    plan = anywhere_plan(spec)
+    assert [arm.blueprint for arm in plan.arms] == ["arm_l2"]
     actions = [action for _, action in anywhere_plan(spec).arms[0].ticks]
-    assert len(actions) == 20  # 10-action cycle, target 2
-    for start in (0, 10):
-        cycle = actions[start : start + 10]
-        assert cycle[0] is StepActionType.EXTEND
-        assert cycle[1] is StepActionType.GRAB
-        assert cycle[4] is StepActionType.RELEASE
-        assert cycle[-1] is StepActionType.RETRACT
+    assert len(actions) == 16  # two 8-action cycles, target 2
+    assert not any(action in (StepActionType.EXTEND, StepActionType.RETRACT) for action in actions)
+    for start in (0, 8):
+        cycle = actions[start : start + 8]
+        assert cycle[0] is StepActionType.GRAB
+        assert cycle[-1] in (StepActionType.ROTATE_CLW, StepActionType.ROTATE_CCLW)
+        assert sum(action is StepActionType.RELEASE for action in cycle) == 1
+
+
+def test_radius_changing_leg_falls_back_to_piston():
+    """Static arms cannot change radius between grab and give; the piston stays the fallback."""
+    blueprint, ticks = _leg_program(1, grab_dir=0, grab_ring=2, give_dir=2, give_ring=1)
+    assert blueprint == "arm_piston"
+    actions = [action for _, action in ticks]
+    assert actions == [
+        StepActionType.EXTEND,
+        StepActionType.GRAB,
+        StepActionType.RETRACT,
+        StepActionType.ROTATE_CLW,
+        StepActionType.ROTATE_CLW,
+        StepActionType.RELEASE,
+    ]
+    assert [tick for tick, _ in ticks] == [1, 2, 3, 4, 5, 6]
+
+    static_blueprint, static_ticks = _leg_program(4, grab_dir=2, grab_ring=3, give_dir=3, give_ring=3)
+    assert static_blueprint == "arm_l3"
+    assert [action for _, action in static_ticks] == [
+        StepActionType.GRAB,
+        StepActionType.ROTATE_CLW,
+        StepActionType.RELEASE,
+    ]
+    assert [tick for tick, _ in static_ticks] == [4, 5, 6]
 
 
 def test_handoff_grab_follows_release():
@@ -217,7 +252,7 @@ def test_spec_shape_contract():
     assert spec.size == (6, 6)
     assert spec.entrypoints_fixed is True
     assert spec.cycling is False
-    assert spec.allowed_blueprints == frozenset({"arm", "arm_piston"})
+    assert spec.allowed_blueprints == frozenset({"arm", "arm_piston", "arm_l2", "arm_l3"})
     assert [entrypoint.pos for entrypoint in spec.entrypoints] == [Hex(0, 0), Hex(0, 3)]
     assert all(len(shape.cells) == 1 and not shape.links for shape in spec.shapes)
 
@@ -262,8 +297,11 @@ def test_sweep_full_pair_classes():
     """
     All 1260 ordered pairs split exactly into 656 single-arm (target 2) + 604 handoff (target 1).
 
-    Any FamilyError, plan-less spec, or single-arm-at-target-1 build shows up as a
-    count off this table (or a raised error), pinning the stage-1.5 CCLW fix.
+    Re-measured on the static-arm family (stage 4): ring geometry is unchanged,
+    static cycles only drop the EXTEND/RETRACT padding, so single-arm coverage
+    is identical to the piston family and every winner still verifies on a fresh
+    simulator level. Any FamilyError, plan-less spec, or single-arm-at-target-1
+    build shows up as a count off this table (or a raised error).
     """
     counts: dict[tuple[int, int], int] = {}
     for entrance, exit_ in ALL_PAIRS:
