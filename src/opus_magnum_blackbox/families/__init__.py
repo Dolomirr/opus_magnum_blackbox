@@ -2,7 +2,8 @@
 Family modules: fixed-entrypoint level builders and simulator-verified reference solutions.
 
 - `tier1`: single-atom family (6x6 board, `arm` only, hex-distance 1-2).
-- `tier2_anywhere`: any distinct entrance/exit pair on the 6x6 board (`{arm, arm_piston}`,
+- `tier2_anywhere`: any distinct entrance/exit pair on the 6x6 board (`arm`, `arm_l2`/`arm_l3`
+  static parts plus `arm_piston` as the fallback for radius-changing handoff legs;
   single arms over rings 1-3 plus two-arm handoffs).
 """
 

@@ -1,7 +1,9 @@
 # Tier-2 anywhere pipeline: BC bootstrap on the sampled train bank, then RL with
 # delivery shaping, then consolidation with class-stratified self-imitation.
 # Bank: ~450 train / ~120 eval variants, stratified over distance classes 1-10
-# (single-arm target 2, handoff target 1).
+# (single-arm target 2, handoff target 1). Reference solutions run static arms
+# (`arm`, `arm_l2`, `arm_l3`); `arm_piston` appears only on radius-changing
+# handoff legs where no static plan exists.
 # Run: `just train-tier2`
 
 [run]

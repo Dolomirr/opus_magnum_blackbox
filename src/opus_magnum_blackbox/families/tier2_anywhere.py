@@ -6,30 +6,29 @@ Spec:
 
 - 6x6 board
 - fixed 1-cell typed entrance and exit
-- `arm` and `arm_piston` allowed; rings 2-3 are `arm_piston` programs leading
-  with EXTEND actions (`arm_double`/`arm_triple` are declared by the simulator
-  but unimplemented, and static-length tokens would be a wire-format break)
+- `arm` (radius 1) and `arm_l2`/`arm_l3` static parts; `arm_piston` stays
+  in the allow-list as the fallback for radius-changing handoff legs
+  (`arm_double`/`arm_triple` are multi-arm glyphs, not lengths, and stay out)
 - `cycling 0`
 - target 2 for single-arm plans, 1 for handoffs
 
 Geometry (measured against the simulator):
 
-- the hand orbits at radius = current hand length; EXTEND/RETRACT slide it one
-  ring along the current rotation per tick;
+- a static arm's hand orbits at its fixed length; `arm_piston` slides that
+  radius one ring per EXTEND/RETRACT along the current rotation;
 - rotation 0 is `(-1, +1)` from the base and `ROTATE_CLW` is `r + 1`,
   exactly as tier-1.
 
 Cycles:
 
-- single arm (ring 1-3): `EXTEND x (L-1)`, `GRAB`, `k` turns to exit,
-  `RELEASE`, `6 - k` turns home, `RETRACT x (L-1)` — one `2L + 8`-action cycle
-  per delivery, all turns in one direction, so the arm always returns to its
-  rest state (radius 1, entrance direction); ring 1 reduces to the tier-1
-  cycle byte for byte.
+- single arm (ring 1-3): GRAB, `k` turns to exit, RELEASE, `6 - k` turns home —
+  one 8-action cycle per delivery, all turns in one direction, so the arm
+  always returns to its rest state (its ring, entrance direction); ring 1 is
+  the tier-1 cycle byte for byte.
 - handoff: arm A grabs at E and releases at a shared ring cell H, arm B grabs
   at H and releases at X. The atom persists on the board between release and
-  grab, so B's grab is scheduled exactly one tick after A's release; B's leg
-  start is pulled earlier only to fit the pre-grab EXTEND actions.
+  grab, so B's grab is scheduled exactly one tick after A's release; a piston
+  leg starts earlier only to fit its pre-grab EXTEND actions.
 
 Candidates are enumerated in a deterministic rank order (fewer arms, shorter
 peak arm length, fewer actions, lexicographic positions), cap-filtered, and
@@ -277,7 +276,9 @@ def _single_candidates(
     size: BoardSize,
 ) -> list[tuple[tuple, AnywherePlan]]:
     """
-    One arm whose ring of radius 1..MAX_RING sees both cells, both turn directions.
+    One static arm whose ring of radius 1..MAX_RING sees both cells, both turn
+    directions. Ring 1 is the plain `arm`, longer rings the `arm_lN` parts; the
+    hand rests on its ring, so a cycle is pure rotation.
     """
     deliveries = target if target is not None else 2
     out = []
@@ -317,8 +318,9 @@ def _handoff_candidates(
 ) -> list[tuple[tuple, AnywherePlan]]:
     """
     Two arms sharing a handoff cell H: A grabs E and releases at H, B grabs H
-    and releases at X, every leg radius in 1..MAX_RING, both legs' slides and
-    swings free to pick either turn direction (the shorter swing wins the rank).
+    and releases at X. Each leg runs on a static arm when its grab and give
+    radii match, otherwise on the `arm_piston` fallback; every leg's swings pick
+    the shorter turn direction.
     """
     # bro.
     out = []
@@ -371,11 +373,10 @@ def _handoff_candidates(
 
 def _single_cycle(clw: bool, k: int) -> tuple[StepActionType, ...]:
     """
-    One delivery cycle: EXTEND out, grab, `k` turns to the exit, release, turns
-    home, RETRACT. `k` is the turn count in the variant's own direction (CLW or
-    CCLW); all turns run in that one direction, so the cycle always spans
-    `2 * ring + 8` actions and ends back at the rest state (radius 1, entrance
-    direction) — ring 1 is exactly the tier-1 cycle.
+    One delivery cycle of a static arm: GRAB, `k` turns to the exit, RELEASE,
+    `(6 - k)` turns home — 8 actions at every ring, all turns in one direction,
+    so the cycle ends back at the rest state (rest radius, entrance direction).
+    Ring 1 is exactly the tier-1 cycle.
     """
     turn = _CLW if clw else _CCLW
     return (_GRAB, *(turn,) * k, _RELEASE, *(turn,) * (6 - k))
@@ -400,9 +401,11 @@ def _leg_program(
     give_ring: int,
 ) -> tuple[str, tuple[tuple[int, StepActionType], ...]]:
     """
-    (tick, action) pairs for one handoff leg: reach (grab_dir, grab_ring), grab,
-    move the atom to (give_dir, give_ring) by radial slides then the shorter
-    swing, release. Slides come first so the swing stays on a single ring.
+    Blueprint and (tick, action) pairs for one handoff leg: reach (grab_dir,
+    grab_ring), grab, move the atom to (give_dir, give_ring), release. Matching
+    grab/give radii run on a static arm (`arm` at radius 1, else `arm_lN`) with
+    the shorter swing; a radius-changing leg needs `arm_piston` with pre-grab
+    EXTENDs and radial slides first so the swing stays on a single ring.
     """
     if grab_ring == give_ring:
         blueprint = "arm" if grab_ring == 1 else f"arm_l{grab_ring}"
