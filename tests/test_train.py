@@ -17,7 +17,13 @@ from torch import nn
 from opus_magnum_blackbox import train as train_module
 from opus_magnum_blackbox.config import ModelConfig, TrainConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
-from opus_magnum_blackbox.families import anywhere_reference_tokens, anywhere_spec, reference_tokens, single_atom_spec
+from opus_magnum_blackbox.families import (
+    anywhere_reference_solution,
+    anywhere_reference_tokens,
+    anywhere_spec,
+    reference_tokens,
+    single_atom_spec,
+)
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.rollout import Episode, RolloutBatch, build_batch
 from opus_magnum_blackbox.train import Trainer
@@ -772,6 +778,161 @@ def test_sil_handoff_group_metric_logged_on_stratify_rows(tmp_path):
     stratify.run_dir.mkdir(parents=True, exist_ok=True)
     stratify._log_metrics(batch, 0.0, 0.0, 0.0, 0.0, sil_loss=0.0)
     assert read_metrics(stratify.run_dir)[0]["sil_handoff_group"] == 0
+
+
+# --- ring-stratified SIL replay (tier-2 curriculum split) ---
+
+
+RING_SIZE = (3, 3)
+
+
+def make_labeled_trainer(tmp_path: Path, levels: list[tuple[object, str]], sil_label: str | None, sil_batch_size: int = 4) -> Trainer:
+    """Trainer with sil_weighting="stratify" and the given stratify label (None = default), one buffered solve per level."""
+    env = OpusEnv([LevelEntry(source=spec, cost_max=100, name=name) for spec, name in levels])
+    torch.manual_seed(0)
+    policy = OpusPolicy(env.tokenizer.config, TINY)
+    trainer = Trainer(
+        policy,
+        [env],
+        replace(
+            make_config(tmp_path),
+            sil_coef=0.1,
+            sil_batch_size=sil_batch_size,
+            sil_weighting="stratify",
+            **({"sil_label": sil_label} if sil_label is not None else {}),
+        ),
+    )
+    trainer._sil_step(make_anywhere_batch(env, levels))
+    return trainer
+
+
+def test_sil_ring_label_detects_non_arm_blueprints(tmp_path):
+    """
+    The ring label reads the buffered tokens: a layout holding any non-`arm`
+    manipulator placement (`arm_l2`/`arm_l3`/`arm_piston`) is ring class; plain
+    `arm`-only layouts are not — cross-checked against the reference solutions'
+    blueprint names.
+    """
+    levels = [
+        (anywhere_spec(Hex(0, 0), Hex(2, 2), size=RING_SIZE), "bank/ring2"),  # d4 diagonal: ring-2 arm
+        (anywhere_spec(Hex(0, 0), Hex(0, 1), size=RING_SIZE), "bank/ring1"),  # d1: plain arm
+        (anywhere_spec(Hex(0, 0), Hex(1, 2), size=RING_SIZE), "bank/handoff"),  # d3 handoff
+    ]
+    trainer = make_labeled_trainer(tmp_path, levels, "ring")
+
+    assert trainer._row_ring(trainer._sil_buffer["bank/ring2"]) is True
+    assert trainer._row_ring(trainer._sil_buffer["bank/ring1"]) is False
+    for spec, name in levels:
+        blueprints = [p.builtin.name for p in anywhere_reference_solution(spec).placements if p.builtin.manipulator]
+        expected = any(blueprint != "arm" for blueprint in blueprints)
+        assert trainer._row_ring(trainer._sil_buffer[name]) is expected, name
+
+
+def test_sil_ring_draw_gives_ring_rows_half_the_minibatch(tmp_path):
+    """
+    One ring-class solve and three plain solves: exactly half of each minibatch
+    replays the ring row (with replacement), half the rest; a fixed seed
+    reproduces the draw, and `sil_ring_group` reports the class size.
+    """
+    levels = [
+        (anywhere_spec(Hex(0, 0), Hex(2, 2), size=RING_SIZE), "bank/ring"),
+        (anywhere_spec(Hex(0, 0), Hex(0, 1), size=RING_SIZE), "bank/a"),
+        (anywhere_spec(Hex(0, 0), Hex(1, 1), size=RING_SIZE), "bank/b"),
+        (anywhere_spec(Hex(0, 1), Hex(1, 0), size=RING_SIZE), "bank/c"),
+    ]
+    trainer = make_labeled_trainer(tmp_path, levels, "ring")
+
+    torch.manual_seed(11)
+    rows = trainer._sample_sil_rows()
+    counts = Counter("ring" if row.level == "bank/ring" else "plain" for row in rows)
+    assert counts == {"ring": 2, "plain": 2}  # exact halves at sil_batch_size=4
+    assert trainer._sil_ring_group == 1
+
+    torch.manual_seed(11)
+    assert [row.level for row in trainer._sample_sil_rows()] == [row.level for row in rows]
+
+
+def test_sil_ring_falls_back_to_uniform_on_single_class_buffers(tmp_path):
+    """All-plain and all-ring buffers each fall back to exactly the legacy uniform pick; `sil_ring_group` reports the class size."""
+    plains = [
+        (anywhere_spec(Hex(0, 0), Hex(0, 1), size=RING_SIZE), "bank/a"),
+        (anywhere_spec(Hex(0, 0), Hex(1, 1), size=RING_SIZE), "bank/b"),
+        (anywhere_spec(Hex(0, 1), Hex(1, 0), size=RING_SIZE), "bank/c"),
+    ]
+    trainer = make_labeled_trainer(tmp_path, plains, "ring", sil_batch_size=2)
+    buffer_rows = list(trainer._sil_buffer.values())
+
+    torch.manual_seed(3)
+    rows = trainer._sample_sil_rows()
+    torch.manual_seed(3)
+    picks = set(torch.randperm(len(buffer_rows))[:2].tolist())
+    assert [row.level for row in rows] == [row.level for index, row in enumerate(buffer_rows) if index in picks]
+    assert trainer._sil_ring_group == 0
+
+    rings = [
+        (anywhere_spec(Hex(0, 0), Hex(2, 2), size=RING_SIZE), "bank/r1"),  # d4 diagonal, ordered one way
+        (anywhere_spec(Hex(2, 2), Hex(0, 0), size=RING_SIZE), "bank/r2"),  # ...and the other
+    ]
+    trainer = make_labeled_trainer(tmp_path / "all_ring", rings, "ring", sil_batch_size=2)
+    buffer_rows = list(trainer._sil_buffer.values())
+
+    torch.manual_seed(3)
+    rows = trainer._sample_sil_rows()
+    torch.manual_seed(3)
+    picks = set(torch.randperm(len(buffer_rows))[:2].tolist())
+    assert [row.level for row in rows] == [row.level for index, row in enumerate(buffer_rows) if index in picks]
+    assert trainer._sil_ring_group == 2
+
+
+def test_sil_handoff_label_stays_default_and_explicit_matches(tmp_path):
+    """
+    `handoff` is the default label: an unset label and an explicit `"handoff"`
+    produce byte-identical draws, and the ring metric stays untouched on the
+    handoff label.
+    """
+    assert TrainConfig().sil_label == "handoff"
+    levels = [
+        (anywhere_spec(Hex(0, 0), Hex(1, 2), size=RING_SIZE), "bank/handoff"),
+        (anywhere_spec(Hex(0, 0), Hex(2, 2), size=RING_SIZE), "bank/ring2"),
+        (anywhere_spec(Hex(0, 0), Hex(0, 1), size=RING_SIZE), "bank/a"),
+        (anywhere_spec(Hex(0, 0), Hex(1, 1), size=RING_SIZE), "bank/b"),
+    ]
+    default_trainer = make_labeled_trainer(tmp_path / "default", levels, None)
+    explicit_trainer = make_labeled_trainer(tmp_path / "explicit", levels, "handoff")
+
+    torch.manual_seed(11)
+    default_rows = default_trainer._sample_sil_rows()
+    torch.manual_seed(11)
+    explicit_rows = explicit_trainer._sample_sil_rows()
+    assert [row.level for row in explicit_rows] == [row.level for row in default_rows]
+    assert explicit_trainer._sil_handoff_group == default_trainer._sil_handoff_group
+    assert default_trainer._sil_ring_group is None
+
+
+def test_sil_unknown_label_raises(tmp_path):
+    levels = [
+        (anywhere_spec(Hex(0, 0), Hex(0, 1), size=RING_SIZE), "bank/a"),
+        (anywhere_spec(Hex(0, 0), Hex(1, 1), size=RING_SIZE), "bank/b"),
+    ]
+    trainer = make_labeled_trainer(tmp_path, levels, "handoff")
+    trainer.train_config = replace(trainer.train_config, sil_label="rings")
+    with pytest.raises(ValueError, match="unknown sil_label"):
+        trainer._sample_sil_rows()
+
+
+def test_sil_ring_group_metric_logged_on_ring_rows(tmp_path):
+    """`stratify` + `sil_label="ring"` stamps `sil_ring_group` (buffered non-`arm` rows) onto SIL rows."""
+    env = make_env()
+    vocab = env.tokenizer.vocab
+    batch = build_batch([make_sil_episode(env, env.levels[0].source, known_solution_tokens(vocab), True, "lvl/a")], vocab.pad_id)
+
+    ring = make_trainer(tmp_path / "ring")
+    ring.train_config = replace(ring.train_config, sil_coef=0.1, sil_weighting="stratify", sil_label="ring")
+    ring._sil_step(batch)
+    assert ring._sil_ring_group == 0  # the buffered tier-0 solve holds a plain `arm`
+    ring.run_dir.mkdir(parents=True, exist_ok=True)
+    ring._log_metrics(batch, 0.0, 0.0, 0.0, 0.0, sil_loss=0.0)
+    assert read_metrics(ring.run_dir)[0]["sil_ring_group"] == 0
 
 
 # --- sampling temperature (stage 2 of the hardening plan) ---

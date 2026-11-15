@@ -9,7 +9,7 @@ import torch
 from conftest import make_spec
 
 from opus_magnum_blackbox.config import ModelConfig, TrainConfig
-from opus_magnum_blackbox.corpus import LEVELS_DIR
+from opus_magnum_blackbox.corpus import LEVELS_DIR, resolve_entries
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.stages import PipelineConfig, load_pipeline, run_pipeline
@@ -164,3 +164,41 @@ def test_load_pipeline_eval_levels(tmp_path):
     path.write_text(PIPELINE_TOML.replace("seed = 0", "seed = 0\nnope = 1"))
     with pytest.raises(ValueError, match=r"unknown \[run\] keys"):
         load_pipeline(path)
+
+
+# --- tier-2 curriculum-split configs (stage E2) ---
+
+
+def test_tier2_split_configs_parse_and_route_sil_label():
+    single = load_pipeline("configs/tier2_single.toml")
+    assert single.levels == ("tier2_single/train",)
+    assert single.eval_levels == ("tier2_single/eval",)
+    assert single.autodiscovery == 5
+    assert single.init_from is not None  # tier-1 warm start
+    assert single.init_from.exists()
+    assert [(stage.name, type(stage).__name__) for stage in single.stages] == [
+        ("bc", "PretrainStage"),
+        ("rl-shape", "RLStage"),
+        ("rl-consolidate", "RLStage"),
+    ]
+    consolidate = single.stages[-1].train_config
+    assert consolidate.sil_weighting == "stratify"
+    assert consolidate.sil_label == "ring"
+
+    handoff = load_pipeline("configs/tier2_handoff.toml")
+    assert handoff.levels == ("tier2_handoff/train",)
+    assert handoff.eval_levels == ("tier2_single/eval", "tier2_handoff/eval")
+    assert handoff.init_from is None  # filled with stage A's best_eval.pt at launch
+    assert handoff.stages[-1].train_config.sil_label == "handoff"
+
+
+def test_multi_group_eval_levels_resolve_into_one_env():
+    """Both eval groups resolve into one 252-entry bank; the pipeline builds a single eval env from them."""
+    entries = resolve_entries(["tier2_single/eval", "tier2_handoff/eval"])
+    assert len(entries) == 252
+    assert {entry.name.split("/")[0] for entry in entries} == {"tier2_single", "tier2_handoff"}
+    singles = [entry for entry in entries if entry.name.startswith("tier2_single/")]
+    handoffs = [entry for entry in entries if entry.name.startswith("tier2_handoff/")]
+    assert len(singles) == 131  # the single bank's full eval cut
+    assert len(handoffs) == 121  # the handoff bank's full eval cut
+    assert len(OpusEnv(entries).levels) == 252
