@@ -23,6 +23,7 @@ from opus_magnum_blackbox.grammar import LAYOUT_GROUP
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import Timer
 from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched, replicate_envs
+from opus_magnum_blackbox.vocab import INSERTED_BUILTINS, Vocab, insertion_permutation
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,37 @@ def _sil_row(batch: RolloutBatch, row: int) -> SILRow:
         action_masks=batch.action_masks[row, :length],
         valid=batch.valid[row, :length],
     )
+
+
+def _remap_vocab_ids(
+    state: dict[str, torch.Tensor], vocab: Vocab, perm: tuple[int, ...], seed: int
+) -> dict[str, torch.Tensor]:
+    """
+    Move vocab-indexed checkpoint weights onto current token ids:
+    embedding rows and policy-head columns accroding old->new permutation,
+    inserted builtins get small fresh random values.
+    Remap is reproducible within local rng.
+    """
+    fresh_ids = torch.tensor([vocab.builtin_id(name) for name in INSERTED_BUILTINS])
+    generator = torch.Generator().manual_seed(seed)
+    out = dict(state)
+
+    d_model = state["embed.weight"].shape[1]
+    embed = torch.empty(len(vocab) + 1, d_model)
+    embed[fresh_ids] = torch.randn(len(INSERTED_BUILTINS), d_model, generator=generator) * 0.02
+    embed[torch.tensor([*perm, len(vocab)])] = state["embed.weight"]
+    out["embed.weight"] = embed
+
+    head_weight = torch.empty(len(vocab), d_model)
+    head_weight[fresh_ids] = torch.randn(len(INSERTED_BUILTINS), d_model, generator=generator) * 0.02
+    head_weight[torch.tensor(perm)] = state["policy_head.weight"]
+    out["policy_head.weight"] = head_weight
+
+    head_bias = torch.empty(len(vocab))
+    head_bias[fresh_ids] = torch.randn(len(INSERTED_BUILTINS), generator=generator) * 0.02
+    head_bias[torch.tensor(perm)] = state["policy_head.bias"]
+    out["policy_head.bias"] = head_bias
+    return out
 
 
 class Trainer:
@@ -112,6 +144,8 @@ class Trainer:
         self._sil_fail_group: int | None = None
         # Buffered handoff-class row count of the latest "stratify" draw; logged as `sil_handoff_group`.
         self._sil_handoff_group: int | None = None
+        # Vocab permutation applied by the latest warm start; logged in its metrics row.
+        self._warm_start_remap: dict | None = None
 
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
         """Sub-second precision: trainer + resume within one second must not share a run dir.
@@ -648,6 +682,10 @@ class Trainer:
         Load model weights from a checkpoint into the fresh policy; optimizer,
         iteration counter and eval bookkeeping stay untouched (unlike `resume`).
         A checkpoint model-config mismatch is a hard error.
+        A checkpoint from before the `INSERTED_BUILTINS` vocab insertion is
+        remapped onto current ids (`_remap_vocab_ids`; the permutation is exact
+        for old tokens) and recorded for the warm-start metrics row; a checkpoint
+        vocab incompatible with that event is a hard error.
         """
         payload = torch.load(path, map_location="cpu", weights_only=False)
         model_config = payload["model_config"]
@@ -655,7 +693,22 @@ class Trainer:
             raise ValueError(
                 f"warm start from {path}: checkpoint model config {model_config} does not match {asdict(self.model_config)}"
             )
-        self.policy.load_state_dict(payload["model_state"])
+        state = dict(payload["model_state"])
+        vocab = self.envs[0].tokenizer.vocab
+        old_vocab_size = int(state["policy_head.weight"].shape[0])
+        self._warm_start_remap = None
+        if old_vocab_size != len(vocab):
+            embed_rows = int(state["embed.weight"].shape[0])
+            bias_size = int(state["policy_head.bias"].shape[0])
+            if embed_rows != old_vocab_size + 1 or bias_size != old_vocab_size:
+                raise ValueError(
+                    f"warm start from {path}: checkpoint has inconsistent vocab-sized shapes "
+                    f"(embed {embed_rows}, head {old_vocab_size}, bias {bias_size})"
+                )
+            perm = insertion_permutation(old_vocab_size, vocab)
+            state = _remap_vocab_ids(state, vocab, perm, self.train_config.seed)
+            self._warm_start_remap = {"from": old_vocab_size, "to": len(vocab), "inserted": list(INSERTED_BUILTINS)}
+        self.policy.load_state_dict(state)
 
     def _seed(self) -> None:
         seed = self.train_config.seed
@@ -774,11 +827,15 @@ class Trainer:
             "iteration": 0,
             "warm_start": source,
         }
+        if self._warm_start_remap is not None:
+            entry["vocab_remap"] = self._warm_start_remap
         self._stamp_autodiscovery(entry)
         entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
-        print(f"warm start | weights from {source}")
+        remap = self._warm_start_remap
+        suffix = f" | vocab remapped {remap['from']}->{remap['to']}" if remap else ""
+        print(f"warm start | weights from {source}{suffix}")
 
     def _bank_counts(self) -> str:
         """
