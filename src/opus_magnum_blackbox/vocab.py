@@ -10,7 +10,8 @@ Token categories (each is a contiguous id range):
 | modes      | MODE_UNFIXED MODE_FIXED UNPLACED    | level config                  |
 | ctypes     | CTYPE_ENTRANCE CTYPE_EXIT           | encoder shape segments        |
 | atoms      | ATOM_NONE + one per real AtomType   | encoder typed cells           |
-| builtins   | BP_<name> implemented built-in      |                               |
+| builtins   | BP_<name> implemented built-in      | arm_lN = fixed-length arm,    |
+|            |                                     | hand rests on ring N          |
 | entrypoint | shape slots: ESHAPE_0..K-1          | resolved against current spec |
 | rotations  | ROT_0..5                            |                               |
 | coords     | Q_0..max_cols-1 , R_0..max_rows-1   | maps to Hex.s/r               |
