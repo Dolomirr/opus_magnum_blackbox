@@ -1,19 +1,30 @@
 """
-Tier-2 anywhere bank generator: deterministic sampled-stratified `levels/tier2_anywhere/` variant files.
+Tier-2 anywhere bank generator: deterministic variant banks under `levels/`.
 
 Every variant is a `vNNN.oml` spec plus its same-stem reference `vNNN.oms`,
 emitted from the anywhere family generator and re-validated from disk after writing.
 
-The bank is a seeded stratified sample, not an enumeration: classification sweeps
-every ordered entrance/exit pair once and groups it into a stratum — (hex distance,
-single/handoff per the winning plan's arm count); pairs the family rejects are
-counted per distance, not raised. The per-class split quotas (`train_single`/
-`train_handoff`/`eval_single`/`eval_handoff`) are apportioned over each class's
-strata proportionally to stratum population (largest remainder, capped at capacity),
-every stratum is seeded-shuffled and cut train-first, so the splits are disjoint by
-construction and each kept pair is uniform within its stratum. Handoffs deliver
-exactly one molecule (target 1) — two cycles would sit at the 32-triplet cap —
-and single arms deliver target 2, so the class rule follows the winning plan.
+Two bank shapes, selected by mode:
+
+- `sample` (mixed bank, `levels/tier2_anywhere/`): a seeded stratified sample, not enumeration.
+  Classification sweeps every ordered entrance/exit pair once and
+  groups it into a stratum — (hex distance, single/handoff per the winning plan's
+  arm count); pairs the family rejects are counted per distance, not raised. The
+  per-class split quotas (`train_single`/`train_handoff`/`eval_single`/
+  `eval_handoff`) are apportioned over each class's strata proportionally to
+  stratum population (largest remainder, capped at capacity), every stratum is
+  seeded-shuffled and cut train-first, so the splits are disjoint by construction
+  and each kept pair is uniform within its stratum.
+- `classes` (per-class banks, `levels/tier2_single/` + `levels/tier2_handoff/`):
+  full enumeration. Every in-family pair of a class is kept, cut ~80/20 train/eval
+  with the eval share apportioned over the class's strata — (winning ring, hex
+  distance) for singles, hex distance for handoffs — so together the banks
+  partition the classified pair space exactly. Disjoint by construction; zero
+  rejects on the full 6x6 board.
+
+Handoffs deliver exactly one molecule (target 1) — two cycles would sit at the
+32-triplet cap — and single arms deliver target 2, so the class rule follows the
+winning plan.
 
 Same parameters yield the same bank; regeneration overwrites in place and removes stale variant files.
 """
@@ -45,19 +56,26 @@ BANK_DIR = LEVELS_DIR / FAMILY_NAME
 MANIFEST_COST_MAX = 50
 MANIFEST_WEIGHT = 1.0
 
-SINGLE = "single"    # one arm serves the pair, target 2
+SINGLE = "single"  # one arm serves the pair, target 2
 HANDOFF = "handoff"  # two arms hand the atom over, target 1
 
+CLASS_BANK_NAMES = {SINGLE: "tier2_single", HANDOFF: "tier2_handoff"}
+SINGLE_BANK_DIR = LEVELS_DIR / CLASS_BANK_NAMES[SINGLE]
+HANDOFF_BANK_DIR = LEVELS_DIR / CLASS_BANK_NAMES[HANDOFF]
+
 # fmt: off
-type EntranceExit       = tuple[Hex, Hex]                     # (entrance, exit) cells of one family pair
-type PairKey            = tuple[int, int, int, int]           # entrance (r, s) + exit (r, s)
-type Stratum            = tuple[int, str]                     # (hex distance, SINGLE | HANDOFF)
-type ClassifiedPair     = tuple[Hex, Hex, LevelSpec]          # pair with its verified spec
-type StratumPairs       = dict[Stratum, list[ClassifiedPair]] # classified pairs keyed by stratum
-type StratumPopulations = dict[Stratum, int]                  # per-stratum pair counts
-type StratumQuotas      = dict[Stratum, tuple[int, int]]      # per-stratum (train, eval) quotas
-type StratumCounts      = dict[Stratum, dict[str, int]]       # stratum -> {"train", "eval"} counts
-type DistanceCounts     = dict[int, int]                      # FamilyError rejects per distance class
+type EntranceExit       = tuple[Hex, Hex]                          # (entrance, exit) cells of one family pair
+type PairKey            = tuple[int, int, int, int]                # entrance (r, s) + exit (r, s)
+type Stratum            = tuple[int, str]                          # (hex distance, SINGLE | HANDOFF)
+type ClassifiedPair     = tuple[Hex, Hex, LevelSpec]               # pair with its verified spec
+type StratumPairs       = dict[Stratum, list[ClassifiedPair]]      # classified pairs keyed by stratum
+type StratumPopulations = dict[Stratum, int]                       # per-stratum pair counts
+type StratumQuotas      = dict[Stratum, tuple[int, int]]           # per-stratum (train, eval) quotas
+type StratumCounts      = dict[Stratum, dict[str, int]]            # stratum -> {"train", "eval"} counts
+type DistanceCounts     = dict[int, int]                           # FamilyError rejects per distance class
+type ClassStratum       = tuple[str, int, int]                     # (SINGLE | HANDOFF, arm ring, hex distance); ring 0 for handoffs
+type ClassStrata        = dict[ClassStratum, list[ClassifiedPair]] # class-stratified pairs
+type ClassQuotas        = dict[ClassStratum, tuple[int, int]]      # per-stratum (train, eval) quotas
 # fmt: on
 
 
@@ -75,6 +93,21 @@ class BankParams:
     train_handoff: int = 300
     eval_single: int = 40
     eval_handoff: int = 80
+    steps: int = 30
+    size: BoardSize = (6, 6)
+    atom: AtomType = AtomType.WATER
+
+
+@dataclass(frozen=True)
+class EnumBankParams:
+    """
+    Per-class enumerated-bank parameters: every in-family pair of a class is
+    kept, cut ~`(100 - eval_percent)`/`eval_percent` train/eval, stratified by
+    (ring, distance) for singles and by distance for handoffs.
+    """
+
+    seed: int = 0
+    eval_percent: int = 20
     steps: int = 30
     size: BoardSize = (6, 6)
     atom: AtomType = AtomType.WATER
@@ -122,6 +155,25 @@ class Bank:
         return [*self.train, *self.eval]
 
 
+@dataclass(frozen=True)
+class ClassBank:
+    """
+    One emitted per-class bank: every in-family pair of the class, split train/eval.
+
+    `quotas` are keyed by class stratum; train + eval covers the full class population.
+    """
+
+    root: Path
+    train: list[Variant]
+    eval: list[Variant]
+    manifest: Path
+    quotas: ClassQuotas
+
+    @property
+    def variants(self) -> list[Variant]:
+        return [*self.train, *self.eval]
+
+
 def classify_pairs(
     *,
     steps: int = 30,
@@ -154,6 +206,39 @@ def classify_pairs(
     return strata, rejected
 
 
+def classify_class_pairs(
+    *,
+    steps: int = 30,
+    size: BoardSize = (6, 6),
+    atom: AtomType = AtomType.WATER,
+) -> tuple[ClassStrata, DistanceCounts]:
+    """
+    Every in-family ordered pair grouped by class stratum.
+    """
+    rows, cols = size
+    cells = [Hex(r, s) for r in range(rows) for s in range(cols)]
+    strata: ClassStrata = {}
+    rejected: DistanceCounts = {}
+    for entrance in cells:
+        for exit_ in cells:
+            if exit_ == entrance:
+                continue
+            distance = hex_distance(entrance, exit_)
+            try:
+                spec, plan = anywhere_spec_plan(entrance, exit_, steps=steps, size=size, atom=atom)
+            except FamilyError:
+                rejected[distance] = rejected.get(distance, 0) + 1
+                continue
+            if len(plan.arms) >= 2:
+                stratum = (HANDOFF, 0, distance)
+            else:
+                blueprint = plan.arms[0].blueprint
+                ring = 1 if blueprint == "arm" else int(blueprint.removeprefix("arm_l"))
+                stratum = (SINGLE, ring, distance)
+            strata.setdefault(stratum, []).append((entrance, exit_, spec))
+    return strata, rejected
+
+
 def stratify_quotas(populations: StratumPopulations, params: BankParams) -> StratumQuotas:
     """
     Per-stratum (train, eval) quotas: each class's split totals are apportioned over
@@ -169,6 +254,18 @@ def stratify_quotas(populations: StratumPopulations, params: BankParams) -> Stra
         train_shares = _apportion(train_total, {key: pop - eval_shares[key] for key, pop in pops.items()})
         quotas.update({key: (train_shares[key], eval_shares[key]) for key in pops})
     return quotas
+
+
+def enum_quotas(populations: dict[ClassStratum, int], eval_percent: int) -> ClassQuotas:
+    """
+    Per-stratum (train, eval) quotas for enumerated bank:
+    half-up `eval_percent` share of population is portioned over strata
+    proportionally to population (largest remainder), each stratum's train
+    quota is its remainder - so train + eval covers every pair exactly once.
+    """
+    eval_total = (sum(populations.values()) * eval_percent + 50) // 100
+    eval_shares = _apportion(eval_total, populations)
+    return {key: (pop - eval_shares[key], eval_shares[key]) for key, pop in populations.items()}
 
 
 def stratified_sample(
@@ -233,41 +330,133 @@ def generate_bank(out_dir: Path = BANK_DIR, *, params: BankParams | None = None)
     return Bank(out_dir, train, eval_, manifest, quotas, rejected)
 
 
+def generate_class_banks(out_dir: Path = LEVELS_DIR, *, params: EnumBankParams | None = None) -> dict[str, ClassBank]:
+    """
+    Emit both per-class banks as files and validate every pair from disk.
+
+    One classification sweep feeds both banks: every in-family pair of a class is
+    kept, cut ~`(100 - eval_percent)`/`eval_percent` train/eval with the eval
+    share apportioned over the class's strata. Splits stay disjoint and their
+    union complete by construction; the two banks together partition the
+    classified pair space exactly.
+    """
+    params = params or EnumBankParams()
+    strata, rejected = classify_class_pairs(steps=params.steps, size=params.size, atom=params.atom)
+    rng = random.Random(params.seed)
+    banks: dict[str, ClassBank] = {}
+    for kind in (SINGLE, HANDOFF):
+        class_strata = {key: pairs for key, pairs in strata.items() if key[0] == kind}
+        if not class_strata:
+            raise ValueError(f"classification kept no {kind} pairs on the {params.size[0]}x{params.size[1]} board")
+        populations = {key: len(pairs) for key, pairs in class_strata.items()}
+        quotas = enum_quotas(populations, params.eval_percent)
+        train_pairs, eval_pairs = stratified_sample(class_strata, quotas, rng)
+        kept = len(train_pairs) + len(eval_pairs)
+        if kept != sum(populations.values()):
+            raise ValueError(f"{kind} split kept {kept} of {sum(populations.values())} classified pairs")
+        root = out_dir / CLASS_BANK_NAMES[kind]
+        train = [
+            _emit_variant(spec, entrance, exit_, index, root / "train")
+            for index, (entrance, exit_, spec) in enumerate(train_pairs)
+        ]
+        eval_ = [
+            _emit_variant(spec, entrance, exit_, index, root / "eval")
+            for index, (entrance, exit_, spec) in enumerate(eval_pairs)
+        ]
+        _clean_stale(root / "train", [path for variant in train for path in (variant.oml, variant.oms)])
+        _clean_stale(root / "eval", [path for variant in eval_ for path in (variant.oml, variant.oms)])
+        root.mkdir(parents=True, exist_ok=True)
+        manifest = root / "manifest.toml"
+        manifest.write_text(_class_manifest_text(kind, params, len(train), len(eval_), quotas, sum(rejected.values())))
+        # self-ignore
+        (root / ".gitignore").write_text("# Generated bank; reproduce with `just gen-tier2-classes`.\n*\n")
+        banks[CLASS_BANK_NAMES[kind]] = ClassBank(root, train, eval_, manifest, quotas)
+    return banks
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Generate the tier-2 anywhere level bank (deterministic, idempotent)."
-    )
-    parser.add_argument("--seed", type=int, default=BankParams.seed, help="sampling and split seed")
-    parser.add_argument(
-        "--train-single", type=int, default=BankParams.train_single, help="train quota for single-arm variants"
+        description="Generate the tier-2 anywhere level banks (deterministic, idempotent)."
     )
     parser.add_argument(
-        "--train-handoff", type=int, default=BankParams.train_handoff, help="train quota for handoff variants"
+        "--mode",
+        choices=("sample", "classes"),
+        default="sample",
+        help="sample: quota-stratified mixed bank; classes: enumerated per-class banks (single + handoff)",
     )
     parser.add_argument(
-        "--eval-single", type=int, default=BankParams.eval_single, help="eval quota for single-arm variants"
+        "--seed",
+        type=int,
+        default=BankParams.seed,
+        help="sampling and split seed",
     )
     parser.add_argument(
-        "--eval-handoff", type=int, default=BankParams.eval_handoff, help="eval quota for handoff variants"
+        "--train-single",
+        type=int,
+        default=BankParams.train_single,
+        help="train quota for single-arm variants",
     )
-    parser.add_argument("--steps", type=int, default=BankParams.steps, help="sim step budget per variant")
-    parser.add_argument("--out-dir", type=Path, default=BANK_DIR, help="bank root directory")
+    parser.add_argument(
+        "--train-handoff",
+        type=int,
+        default=BankParams.train_handoff,
+        help="train quota for handoff variants",
+    )
+    parser.add_argument(
+        "--eval-single",
+        type=int,
+        default=BankParams.eval_single,
+        help="eval quota for single-arm variants",
+    )
+    parser.add_argument(
+        "--eval-handoff",
+        type=int,
+        default=BankParams.eval_handoff,
+        help="eval quota for handoff variants",
+    )
+    parser.add_argument(
+        "--eval-percent",
+        type=int,
+        default=EnumBankParams.eval_percent,
+        help="eval share of each class bank, percent",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=BankParams.steps,
+        help="sim step budget per variant",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="bank root directory (default: levels/ for classes, the tier2_anywhere bank for sample)",
+    )
     args = parser.parse_args(argv)
-    params = BankParams(
-        seed=args.seed,
-        train_single=args.train_single,
-        train_handoff=args.train_handoff,
-        eval_single=args.eval_single,
-        eval_handoff=args.eval_handoff,
-        steps=args.steps,
-    )
-    bank = generate_bank(args.out_dir, params=params)
-    print(f"wrote {len(bank.train)} train + {len(bank.eval)} eval variants to {bank.root}")
-    for kind in (SINGLE, HANDOFF):
-        train_n = sum(1 for variant in bank.train if variant.kind == kind)
-        eval_n = sum(1 for variant in bank.eval if variant.kind == kind)
-        print(f"  {kind}: train {train_n}, eval {eval_n}")
-    print(f"  rejected pairs: {sum(bank.rejected.values())}")
+    if args.mode == "sample":
+        params = BankParams(
+            seed=args.seed,
+            train_single=args.train_single,
+            train_handoff=args.train_handoff,
+            eval_single=args.eval_single,
+            eval_handoff=args.eval_handoff,
+            steps=args.steps,
+        )
+        bank = generate_bank(args.out_dir or BANK_DIR, params=params)
+        print(f"wrote {len(bank.train)} train + {len(bank.eval)} eval variants to {bank.root}")
+        for kind in (SINGLE, HANDOFF):
+            train_n = sum(1 for variant in bank.train if variant.kind == kind)
+            eval_n = sum(1 for variant in bank.eval if variant.kind == kind)
+            print(f"  {kind}: train {train_n}, eval {eval_n}")
+        print(f"  rejected pairs: {sum(bank.rejected.values())}")
+        return 0
+    params = EnumBankParams(seed=args.seed, eval_percent=args.eval_percent, steps=args.steps)
+    banks = generate_class_banks(args.out_dir or LEVELS_DIR, params=params)
+    for bank in banks.values():
+        print(f"wrote {len(bank.train)} train + {len(bank.eval)} eval variants to {bank.root}")
+        for (kind, ring, distance), (train_n, eval_n) in sorted(bank.quotas.items()):
+            label = f"ring {ring} distance {distance}" if kind == SINGLE else f"distance {distance}"
+            print(f"  {label}: train {train_n}, eval {eval_n}")
     return 0
 
 
@@ -442,6 +631,55 @@ def _manifest_text(
             f"eval = {counts['eval']}",
         ]
     lines.append("")
+    return "\n".join(lines)
+
+
+def _class_manifest_text(  # noqa: PLR0913, PLR0917
+    kind: str,
+    params: EnumBankParams,
+    train_count: int,
+    eval_count: int,
+    quotas: ClassQuotas,
+    rejected: int,
+) -> str:
+    """
+    Per-class manifest consumed by the corpus scanner: cost/weight defaults plus
+    provenance for regeneration — mode/seed/eval share, counts, and the
+    per-stratum (train, eval) quotas. Single strata nest ring then distance,
+    handoff strata nest distance only.
+    """
+    stratification = "(ring, distance)" if kind == SINGLE else "distance"
+    lines = [
+        "# DO NOT EDIT",
+        "",
+        f"# {CLASS_BANK_NAMES[kind]} bank manifest; consumed by corpus scanner.",
+        f"# Regenerate bank with `gen-tier2-classes` (mode enumerate, seed {params.seed}).",
+        f"# Every in-family {kind} pair, stratified by {stratification},",
+        f"# split ~{100 - params.eval_percent}/{params.eval_percent} train/eval.",
+        "",
+        f"cost_max = {MANIFEST_COST_MAX}",
+        f"weight = {MANIFEST_WEIGHT}",
+        "",
+        "[provenance]",
+        'mode = "enumerate"',
+        f"seed = {params.seed}",
+        f"eval_percent = {params.eval_percent}",
+        f"train_count = {train_count}",
+        f"eval_count = {eval_count}",
+        f"steps = {params.steps}",
+        f"size = [{params.size[0]}, {params.size[1]}]",
+        f'atom = "{params.atom.name.lower()}"',
+        f"rejected = {rejected}",
+        "",
+    ]
+    for (_, ring, distance), (train_quota, eval_quota) in sorted(quotas.items()):
+        table = f"strata.{ring}.{distance}" if kind == SINGLE else f"strata.{distance}"
+        lines += [
+            f"[provenance.{table}]",
+            f"train = {train_quota}",
+            f"eval = {eval_quota}",
+            "",
+        ]
     return "\n".join(lines)
 
 

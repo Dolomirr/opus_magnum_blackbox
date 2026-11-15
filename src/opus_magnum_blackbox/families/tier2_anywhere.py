@@ -457,9 +457,7 @@ def _assert_caps(plan: AnywherePlan, steps: int) -> None:
     config = TokenizerConfig()
     triplets = sum(len(arm.ticks) for arm in plan.arms)
     if triplets > config.max_program_actions:
-        raise FamilyError(
-            f"plan programs {triplets} actions, over the {config.max_program_actions} program-action cap"
-        )
+        raise FamilyError(f"plan programs {triplets} actions, over the {config.max_program_actions} program-action cap")
     if len(plan.arms) > config.max_placements:
         raise FamilyError(f"plan places {len(plan.arms)} arms, over the {config.max_placements} placement cap")
     last = max(tick for arm in plan.arms for tick, _ in arm.ticks)

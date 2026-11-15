@@ -37,6 +37,10 @@ gen-tier1 seed="0":
 gen-tier2 seed="0":
     uv run python -m opus_magnum_blackbox.gen_tier2 --seed {{seed}}
 
+# Regenerate tier-2 per-class enumerated banks (tier2_single + tier2_handoff)
+gen-tier2-classes seed="0" eval_percent="20":
+    uv run python -m opus_magnum_blackbox.gen_tier2 --mode classes --seed {{seed}} --eval-percent {{eval_percent}}
+
 # Train the baseline policy on tier-0 level (default overfit config)
 train:
     uv run opus-magnum-blackbox train
