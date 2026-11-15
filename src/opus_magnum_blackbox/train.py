@@ -144,6 +144,9 @@ class Trainer:
         self._sil_fail_group: int | None = None
         # Buffered handoff-class row count of the latest "stratify" draw; logged as `sil_handoff_group`.
         self._sil_handoff_group: int | None = None
+        # Buffered ring-class row count of the latest "stratify" draw with `sil_label = "ring"`;
+        # logged as `sil_ring_group`.
+        self._sil_ring_group: int | None = None
         # Vocab permutation applied by the latest warm start; logged in its metrics row.
         self._warm_start_remap: dict | None = None
 
@@ -343,13 +346,17 @@ class Trainer:
         "fail": half from buffered levels whose latest greedy eval failed, half from
         the rest, both with replacement; falls back to uniform while either group
         is empty (also before the first eval).
-        "stratify": half from buffered handoff-class solutions (two or more arm
-        placements in the layout), half from the single-arm rest, both with
-        replacement; falls back to uniform while either class is empty.
+        "stratify": half from buffered rows of `sil_label`'s class — "handoff":
+        solutions with two or more arm placements (two or more arm placements in
+        the layout); "ring": solutions holding at least one non-`arm` arm
+        blueprint (a length-rare single) — half from the class, half from the
+        rest, both with replacement; falls back to uniform while either class
+        is empty.
         Records per-level picks into `_sil_replay_counts` for the `sil_replay_top` metric,
         the failed-group size into `_sil_fail_group` for the `sil_fail_group` metric,
-        and the buffered handoff-class count into `_sil_handoff_group` for the
-        `sil_handoff_group` metric.
+        the buffered handoff-class count into `_sil_handoff_group` for the
+        `sil_handoff_group` metric, and the buffered ring-class count into
+        `_sil_ring_group` for the `sil_ring_group` metric.
         """
         config = self.train_config
         if config.sil_weighting not in ("uniform", "scarcity", "fail", "stratify"):
@@ -380,23 +387,38 @@ class Trainer:
             else:
                 rows = uniform_rows()
         elif config.sil_weighting == "stratify":
-            handoff = [row for row in all_rows if self._row_handoff(row)]
-            single = [row for row in all_rows if not self._row_handoff(row)]
-            self._sil_handoff_group = len(handoff)
-            if handoff and single:
-                half = size // 2
-                handoff_picks = torch.randint(len(handoff), (half,))
-                single_picks = torch.randint(len(single), (size - half,))
-                rows = [handoff[pick] for pick in handoff_picks.tolist()] + [
-                    single[pick] for pick in single_picks.tolist()
-                ]
-            else:
-                rows = uniform_rows()
+            rows = self._stratify_rows(all_rows, size)
         else:
             rows = uniform_rows()
         for row in rows:
             self._sil_replay_counts[row.level] = self._sil_replay_counts.get(row.level, 0) + 1
         return rows
+
+    def _stratify_rows(self, all_rows: list[SILRow], size: int) -> list[SILRow]:
+        """
+        "stratify" draw: half from `sil_label`'s class, half from the rest, both
+        with replacement; uniform fallback while either class is empty.
+
+        "handoff": two or more arm placements; "ring": at least one non-`arm` arm
+        blueprint. The buffered class size is stamped onto the label's group
+        metric (`sil_handoff_group` / `sil_ring_group`).
+        """
+        config = self.train_config
+        if config.sil_label not in ("handoff", "ring"):
+            raise ValueError(f"unknown sil_label: {config.sil_label!r}; expected 'handoff' or 'ring'")
+        label, group_metric = (
+            (self._row_handoff, "_sil_handoff_group") if config.sil_label == "handoff" else (self._row_ring, "_sil_ring_group")
+        )
+        first = [row for row in all_rows if label(row)]
+        rest = [row for row in all_rows if not label(row)]
+        setattr(self, group_metric, len(first))
+        if first and rest:
+            half = size // 2
+            first_picks = torch.randint(len(first), (half,))
+            rest_picks = torch.randint(len(rest), (size - half,))
+            return [first[pick] for pick in first_picks.tolist()] + [rest[pick] for pick in rest_picks.tolist()]
+        picks = set(torch.randperm(len(all_rows))[:size].tolist())
+        return [row for index, row in enumerate(all_rows) if index in picks]
 
     def _row_handoff(self, row: SILRow) -> bool:
         """
@@ -412,6 +434,25 @@ class Trainer:
             for name_token in tokens[start + 1 : end : LAYOUT_GROUP]
         )
         return arms >= 2
+
+    def _row_ring(self, row: SILRow) -> bool:
+        """
+        Arm-length class label read off the buffered solution tokens: a layout
+        holding at least one non-`arm` manipulator placement (an `arm_lN` ring or
+        a piston leg). On the single bank this concentrates replay on the
+        length-rare ring-2/ring-3 classes; the handoff label degenerates there
+        (every solve holds exactly one arm).
+        """
+        vocab = self.envs[0].tokenizer.vocab
+        tokens = row.actions.tolist()
+        start = tokens.index(vocab.special_id("[START_LAYOUT]"))
+        end = tokens.index(vocab.special_id("[END_LAYOUT]"))
+        return any(
+            vocab.is_in(name_token, "builtin")
+            and vocab.builtin(name_token).manipulator
+            and vocab.builtin(name_token).name != "arm"
+            for name_token in tokens[start + 1 : end : LAYOUT_GROUP]
+        )
 
     def _sil_minibatch(self, rows: list[SILRow]) -> RolloutBatch:
         """
@@ -757,6 +798,8 @@ class Trainer:
                 entry["sil_fail_group"] = self._sil_fail_group
             if self._sil_handoff_group is not None:
                 entry["sil_handoff_group"] = self._sil_handoff_group
+            if self._sil_ring_group is not None:
+                entry["sil_ring_group"] = self._sil_ring_group
         if self.stage is not None:
             entry["stage"] = self.stage
         self._stamp_autodiscovery(entry)

@@ -68,6 +68,7 @@ _TAG_ABBREV = {
     ("TrainConfig", "sil_batch_size"): "silb",
     ("TrainConfig", "sil_buffer_cap"): "silcap",
     ("TrainConfig", "sil_weighting"): "silw",
+    ("TrainConfig", "sil_label"): "sill",
     ("TrainConfig", "value_coef"): "vl",
     ("TrainConfig", "gamma"): "ga",
     ("TrainConfig", "grad_clip"): "gc",

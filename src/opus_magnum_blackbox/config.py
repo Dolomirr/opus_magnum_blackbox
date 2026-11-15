@@ -79,6 +79,7 @@ class TrainConfig:
     sil_batch_size         : int   = 8         # rows per SIL minibatch
     sil_buffer_cap         : int   = 256       # buffered solved episodes, deduped per level (latest kept)
     sil_weighting          : str   = "uniform" # SIL draw: "uniform" | "scarcity" (proporional to 1/n) | "fail" (half from failed) | "stratify" (half from handoff)
+    sil_label              : str   = "handoff" # stratify class: "handoff" (>= 2 arm placements) | "ring" (any non-arm arm blueprint)
     value_coef             : float = 0.5
     gamma                  : float = 1.0
     grad_clip              : float = 1.0
