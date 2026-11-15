@@ -13,6 +13,7 @@ translated to solution IR, encoded, and validated on load.
 
 import random
 import shlex
+from dataclasses import replace
 from pathlib import Path
 
 from opus_magnum_sym import Hex, Level, LevelSpec, StepActionType
@@ -49,7 +50,7 @@ def augment(tokens: list[int], spec: LevelSpec, seed: int, max_variants: int) ->
     Layout quadruplets are kept mixed, so that placements share
     entrypoint slot in relative order and relabelling program
     handles to follow the new manipulator order;
-    triplets are mixed within in single.
+    triplets keep ascending tick order within each handle.
     The original sequence is not included;
     only `max_variants` distinct sequences are returned.
     """
@@ -76,12 +77,11 @@ def augment(tokens: list[int], spec: LevelSpec, seed: int, max_variants: int) ->
                 handle += 1
         triplets: dict[int, list[Action]] = {}
         for action in parsed.actions:
-            triplets.setdefault(handle_map[action.handle], []).append(action)
+            new_handle = handle_map[action.handle]
+            triplets.setdefault(new_handle, []).append(replace(action, handle=new_handle))
         actions: list[Action] = []
         for new_handle in sorted(triplets):
-            group = triplets[new_handle][:]
-            rng.shuffle(group)
-            actions.extend(group)
+            actions.extend(sorted(triplets[new_handle], key=lambda action: action.tick))
         ir = Solution(placements=[p for _, p in indexed], actions=actions, submitted=True, length=0)
         variant = tokenizer.encode_solution(ir.placements, actions, spec)
         if tuple(variant) in seen:

@@ -5,12 +5,13 @@ import json
 import pytest
 import torch
 from conftest import known_solution_tokens, make_spec
-from opus_magnum_sym import Level, StepActionType
+from opus_magnum_sym import Hex, Level, StepActionType
 
 from opus_magnum_blackbox.codec import apply_solution, decode_solution
 from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, TrainConfig
 from opus_magnum_blackbox.corpus import LEVELS_DIR
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
+from opus_magnum_blackbox.families import anywhere_reference_tokens, anywhere_spec
 from opus_magnum_blackbox.grammar import Action, GrammarError, Placement, spec_model
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.rollout import Episode, build_batch, build_supervised
@@ -86,10 +87,35 @@ def test_augmented_variants_solve_and_are_deterministic(vocab, spec):
     for variant in variants:
         decoded = decode_solution(variant, spec, vocab)
         assert not isinstance(decoded, GrammarError)
+        keys = [(action.handle, action.tick) for action in decoded.actions]
+        assert keys == sorted(keys)  # triplets stay in canonical ascending order
         level = Level(spec)
         assert apply_solution(decoded, spec, level).ok
         assert level.run().solved
     assert augment(tokens, spec, seed=0, max_variants=6) == variants
+
+
+def test_augmented_multi_handle_variants_stay_canonical(vocab):
+    """
+    Regression (tier-2 stage 4): augmenting two-handle handoff solutions must relabel the
+    program handles along with the shuffled placement order. Pre-fix the grouped triplets
+    kept their stale handles, and a swapped-arm variant emitted handle 0 after handle 1.
+    """
+    spec = anywhere_spec(Hex(0, 0), Hex(4, 3))  # d7 handoff reference: two arms
+    tokens = anywhere_reference_tokens(spec)
+    variants = augment(tokens, spec, seed=98, max_variants=16)
+    assert variants
+    for variant in variants:
+        decoded = decode_solution(variant, spec, vocab)
+        assert not isinstance(decoded, GrammarError)
+        handles = [action.handle for action in decoded.actions]
+        assert handles == sorted(handles)  # canonical: handles non-decreasing
+        keys = [(action.handle, action.tick) for action in decoded.actions]
+        assert keys == sorted(keys)  # canonical: ascending ticks within each handle
+        level = Level(spec)
+        assert apply_solution(decoded, spec, level).ok
+        assert level.run().solved
+    assert augment(tokens, spec, seed=98, max_variants=16) == variants
 
 
 def test_unsupported_command_raises(tmp_path):
