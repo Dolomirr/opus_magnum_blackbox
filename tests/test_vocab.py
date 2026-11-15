@@ -8,7 +8,7 @@ changed meaning, and ids move only by the exact documented shift.
 """
 
 from opus_magnum_blackbox import vocab as vocab_module
-from opus_magnum_blackbox.vocab import Builtin, Vocab
+from opus_magnum_blackbox.vocab import INSERTED_BUILTINS, Builtin, Vocab
 
 # Builtin names in `BPN` order as they were before arm_l2..arm_l6 were registered.
 PRE_INSERTION_BUILTINS = (
@@ -20,7 +20,6 @@ PRE_INSERTION_BUILTINS = (
     "salt_transmuter",
     "glyph_duplication",
 )
-INSERTED_BUILTINS = ("arm_l2", "arm_l3", "arm_l4", "arm_l5", "arm_l6")
 
 
 def _pre_insertion_vocab(monkeypatch):
