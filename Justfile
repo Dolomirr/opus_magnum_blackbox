@@ -61,6 +61,10 @@ train-tier2-single:
 train-tier2-handoff:
     uv run opus-magnum-blackbox run configs/tier2_handoff.toml
 
+# Run tier-2 curriculum-split capacity arm (bigger model, fresh)
+train-tier2-single-big:
+    uv run opus-magnum-blackbox run configs/tier2_single_big.toml
+
 # Run the canonical tier-1 discovery recipe (BC seed + stratified self-imitation)
 train-tier1-discovery:
     uv run opus-magnum-blackbox run configs/tier1_discovery.toml
