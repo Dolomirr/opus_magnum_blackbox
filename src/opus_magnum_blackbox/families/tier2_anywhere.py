@@ -30,9 +30,14 @@ Cycles:
   grab, so B's grab is scheduled exactly one tick after A's release; a piston
   leg starts earlier only to fit its pre-grab EXTEND actions.
 
-Candidates are enumerated in a deterministic rank order (fewer arms, shorter
-peak arm length, fewer actions, lexicographic positions), cap-filtered, and
-verified one by one on a fresh simulator `Level`; the first that solves wins.
+Candidates are enumerated in a deterministic rank order (fewer arms, longer
+exit-side arm, shorter peak arm length, fewer actions, lexicographic
+positions), cap-filtered, and verified one by one on a fresh simulator `Level`;
+the first that solves wins. The exit-side rule pins the two-arm topology:
+between mirrored handoffs - the same legs with the arms swapped, which tie on
+every other measure - the variant carrying the longer arm on the exit leg wins,
+so neighboring pairs agree on the arm order instead of flipping by base
+positions.
 """
 
 from dataclasses import dataclass
@@ -143,9 +148,10 @@ def anywhere_plan(spec: LevelSpec) -> AnywherePlan | None:
     """
     Deterministically chosen simulator-verified anywhere plan for a spec, or None.
 
-    Candidates are ranked (fewer arms, shorter peak arm length, fewer actions,
-    lexicographic positions) and verified in order; `spec.target` selects the
-    class (handoffs exist only at target 1, single arms at any target).
+    Candidates are ranked (fewer arms, longer exit-side arm, shorter peak arm
+    length, fewer actions, lexicographic positions) and verified in order;
+    `spec.target` selects the class (handoffs exist only at target 1, single
+    arms at any target).
     """
     entrance = _entrypoint_pos(spec, ComponentType.ENTRANCE)
     exit_ = _entrypoint_pos(spec, ComponentType.EXIT)
@@ -321,6 +327,11 @@ def _handoff_candidates(
     and releases at X. Each leg runs on a static arm when its grab and give
     radii match, otherwise on the `arm_piston` fallback; every leg's swings pick
     the shorter turn direction.
+
+    Ranking puts the longer (or equal) arm on the exit-side leg first:
+    mirrored topology - same legs with A and B swapped - always ties on peak and
+    triplets, so without this rule the base-position tiebreak flips the arm
+    order between neighboring pairs and the reference mapping is inconsistent.
     """
     # bro.
     out = []
