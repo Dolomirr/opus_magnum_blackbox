@@ -1,0 +1,61 @@
+# Tier-2 curriculum split, round 2 stage R2: the big-model arm with the BC recipe fixed.
+# Round 1's m256 arm was invalid evidence: its BC diverged (loss 0.36 -> 0.84 by epoch 20
+# at lr 1e-3, 2x width on the same step size) — an optimization failure, not a capacity
+# verdict. First 3e-4 rerun still drifted after its epoch-15 minimum (0.029 -> 0.066 by
+# epoch 60), firing the plan's guard: BC step lowered to 1e-4, epochs extended to 200
+# (autodiscovery=5 scales it to 111). Fresh run — model-config mismatch forbids
+# warm-start, by design.
+# RL stages are identical to stage R1 (`configs/tier2_single_ext.toml`).
+# Guard: if BC loss still rises after epoch ~10, stop early — lower lr to 1e-4 and extend
+# epochs before drawing any conclusion; a diverging run says nothing about capacity.
+# Run: `just run-file configs/tier2_single_big2.toml`
+
+[run]
+levels          = ["tier2_single/train"]
+eval_levels     = ["tier2_single/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+autodiscovery   = 5      # new model: keep a real BC seed
+
+[run.model]
+d_model         = 256
+nhead           = 8
+encoder_layers  = 3
+decoder_layers  = 3
+dim_feedforward = 1024
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 200  # autodiscovery=5 scales this to 111
+lr                  = 1e-4 # 1e-3 diverged at 2x width; 3e-4 still drifted after epoch 15
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5  # prevent overfit
+
+[[stage]]
+name                = "rl-shape"
+kind                = "rl"
+iterations          = 400
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.005
+shaping_weight      = 0.5 # delivery-fraction shaping on unsolved COMPLETED
+progress_weight     = 0.3
+
+[[stage]]
+name                = "rl-consolidate"
+kind                = "rl"
+iterations          = 3000        # ceiling, not target
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.001
+shaping_weight      = 0.0         # solve reward only
+sil_coef            = 0.4
+sil_batch_size      = 32
+sil_weighting       = "stratify"
+sil_label           = "ring"      # half the replay from non-`arm` (length-rare) solves
+eval_patience       = 40          # ~400 iterations without eval-bank improvement ends the stage
+# alpha/beta/gamma stay 0, epsilon 0, temperature 1

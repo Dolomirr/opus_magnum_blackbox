@@ -1,0 +1,53 @@
+# Tier-2 curriculum split, stage A: the single-arm bank only — one concept at a time.
+# This run teaches ring selection (`arm` vs `arm_l2` vs `arm_l3`) with full input
+# coverage: all 656 in-family single-arm pairs enumerated, cut 525/131 train/eval,
+# stratified by winning ring x distance. SIL stratification uses `sil_label = "ring"`:
+# the handoff label degenerates on this bank (every solve holds exactly one arm),
+# the ring label concentrates replay on the length-rare ring-2/ring-3 classes.
+# Stage B (`configs/tier2_handoff.toml`) warm-starts from this run's best_eval.pt.
+# Run: `just train-tier2-single`
+
+[run]
+levels          = ["tier2_single/train"]
+eval_levels     = ["tier2_single/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+autodiscovery   = 5      # new family: keep a real BC seed on top of the warm start
+# Warm start (stage-4 primary source): tier-1 canonical curriculum best checkpoint.
+init_from       = "runs/20261114-232314-783352-tier1_simple_arms_train-tier1_simple_arms-lr0001-ent005-sh5-ent001/best_eval.pt"
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 100  # autodiscovery=5 scales this to 56
+lr                  = 1e-3
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5 # prevent overfit
+
+[[stage]]
+name                = "rl-shape"
+kind                = "rl"
+iterations          = 400
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.005
+shaping_weight      = 0.5 # delivery-fraction shaping on unsolved COMPLETED
+progress_weight     = 0.3
+
+[[stage]]
+name                = "rl-consolidate"
+kind                = "rl"
+iterations          = 2000        # ceiling, not target
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.001
+shaping_weight      = 0.0         # solve reward only
+sil_coef            = 0.4
+sil_batch_size      = 32
+sil_weighting       = "stratify"
+sil_label           = "ring"      # half the replay from non-`arm` (length-rare) solves
+eval_patience       = 20          # ~200 iterations without eval-bank improvement ends the stage
+# alpha/beta/gamma stay 0, epsilon 0, temperature 1

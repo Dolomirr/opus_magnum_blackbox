@@ -1,0 +1,51 @@
+# Tier-2 curriculum split, stage B: the handoff bank on top of stage A.
+# All 604 in-family handoff pairs enumerated, cut 483/121 train/eval, stratified by
+# distance. Eval covers BOTH eval banks — single-bank retention is the monitored
+# forgetting signal (some forgetting is acceptable, collapse is not).
+# Warm-start from the stage-A run's best_eval.pt: fill `[run] init_from` at launch.
+# Run: `just train-tier2-handoff`
+
+[run]
+levels          = ["tier2_handoff/train"]
+eval_levels     = ["tier2_single/eval", "tier2_handoff/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+autodiscovery   = 5      # new family: keep a real BC seed on top of the warm start
+# Warm start: stage A (`configs/tier2_single.toml`) best checkpoint, filled at launch:
+init_from       = "runs/20261115-213832-837642-tier2_single_train-tier2_single-ad5-lr0001-ent005-sh5-pg3-ent001-sil4-silb32-silwstratify-sillring/best_eval.pt"
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 100  # autodiscovery=5 scales this to 56
+lr                  = 1e-3
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5 # prevent overfit
+
+[[stage]]
+name                = "rl-shape"
+kind                = "rl"
+iterations          = 400
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.005
+shaping_weight      = 0.5 # delivery-fraction shaping on unsolved COMPLETED
+progress_weight     = 0.3
+
+[[stage]]
+name                = "rl-consolidate"
+kind                = "rl"
+iterations          = 2000        # ceiling, not target
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.001
+shaping_weight      = 0.0         # solve reward only
+sil_coef            = 0.4
+sil_batch_size      = 32
+sil_weighting       = "stratify"
+sil_label           = "handoff"   # half the replay from two-arm (handoff) solves
+eval_patience       = 20          # ~200 iterations without eval-bank improvement ends the stage
+# alpha/beta/gamma stay 0, epsilon 0, temperature 1
