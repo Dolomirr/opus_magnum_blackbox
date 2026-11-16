@@ -77,7 +77,7 @@ class _ScriptPolicy(nn.Module):
         self.dummy = nn.Parameter(torch.zeros(1))
         self._encoder: np.ndarray | None = None
 
-    def encode(self, encoder_input, encoder_length):
+    def encode(self, encoder_input, encoder_length, encoder_features=None):
         self._encoder = encoder_input.detach().cpu().numpy()
         batch = encoder_input.shape[0]
         return torch.zeros(batch, 4, 8), torch.zeros(batch, 4, dtype=torch.bool)
@@ -86,7 +86,7 @@ class _ScriptPolicy(nn.Module):
         return torch.distributions.Categorical(logits=logits.masked_fill(~action_mask.bool(), float("-inf")))
 
     def forward(  # noqa: PLR0913, PLR0917
-        self, encoder_input, encoder_length, decoder_history, decoder_length, memory=None, memory_pad_mask=None
+        self, encoder_input, encoder_length, decoder_history, decoder_length, memory=None, memory_pad_mask=None, encoder_features=None
     ):
         # BOS-shifted like `OpusPolicy`: T input tokens yield T+1 output positions.
         batch, steps = decoder_history.shape

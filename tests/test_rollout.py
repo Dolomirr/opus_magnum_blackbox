@@ -355,7 +355,7 @@ class _ScriptedPolicy(nn.Module):
         self.vocab_size = vocab_size
         self.register_buffer("logits_row", logits)
 
-    def encode(self, encoder_input, encoder_length):
+    def encode(self, encoder_input, encoder_length, encoder_features=None):
         batch = encoder_input.shape[0]
         return torch.zeros(batch, 4, 8), torch.zeros(batch, 4, dtype=torch.bool)
 
@@ -363,7 +363,7 @@ class _ScriptedPolicy(nn.Module):
         return torch.distributions.Categorical(logits=logits.masked_fill(~action_mask.bool(), float("-inf")))
 
     def forward(  # noqa: PLR0913, PLR0917
-        self, encoder_input, encoder_length, decoder_history, decoder_length, memory=None, memory_pad_mask=None
+        self, encoder_input, encoder_length, decoder_history, decoder_length, memory=None, memory_pad_mask=None, encoder_features=None
     ):
         batch, steps = decoder_history.shape
         logits = self.logits_row.to(decoder_history.device).view(1, 1, -1).expand(batch, steps + 1, -1)
