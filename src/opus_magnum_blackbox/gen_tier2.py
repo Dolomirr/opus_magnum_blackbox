@@ -20,7 +20,9 @@ Two bank shapes, selected by mode:
   with the eval share apportioned over the class's strata — (winning ring, hex
   distance) for singles, hex distance for handoffs — so together the banks
   partition the classified pair space exactly. Disjoint by construction; zero
-  rejects on the full 6x6 board.
+  rejects on the full 6x6 board. With an `oversample` spec (distance -> weight),
+  the handoff manifest additionally carries a `[level_weights]` table applied to
+  the handoff train split only (non-unity entries).
 
 Handoffs deliver exactly one molecule (target 1) — two cycles would sit at the
 32-triplet cap — and single arms deliver target 2, so the class rule follows the
@@ -32,6 +34,7 @@ Same parameters yield the same bank; regeneration overwrites in place and remove
 import argparse
 import random
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -104,6 +107,10 @@ class EnumBankParams:
     Per-class enumerated-bank parameters: every in-family pair of a class is
     kept, cut ~`(100 - eval_percent)`/`eval_percent` train/eval, stratified by
     (ring, distance) for singles and by distance for handoffs.
+
+    `oversample` maps handoff hex distance -> sampling weight; it is recorded in
+    the handoff manifest provenance and emitted as the manifest's `[level_weights]`
+    table (train split, non-unity entries only).
     """
 
     seed: int = 0
@@ -111,6 +118,7 @@ class EnumBankParams:
     steps: int = 30
     size: BoardSize = (6, 6)
     atom: AtomType = AtomType.WATER
+    oversample: dict[int, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -367,7 +375,14 @@ def generate_class_banks(out_dir: Path = LEVELS_DIR, *, params: EnumBankParams |
         _clean_stale(root / "eval", [path for variant in eval_ for path in (variant.oml, variant.oms)])
         root.mkdir(parents=True, exist_ok=True)
         manifest = root / "manifest.toml"
-        manifest.write_text(_class_manifest_text(kind, params, len(train), len(eval_), quotas, sum(rejected.values())))
+        level_weights = (
+            handoff_level_weights([(entrance, exit_) for entrance, exit_, _ in train_pairs], params.oversample)
+            if kind == HANDOFF
+            else None
+        )
+        manifest.write_text(
+            _class_manifest_text(kind, params, len(train), len(eval_), quotas, sum(rejected.values()), level_weights)
+        )
         # self-ignore
         (root / ".gitignore").write_text("# Generated bank; reproduce with `just gen-tier2-classes`.\n*\n")
         banks[CLASS_BANK_NAMES[kind]] = ClassBank(root, train, eval_, manifest, quotas)
@@ -421,6 +436,19 @@ def main(argv: list[str] | None = None) -> int:
         help="eval share of each class bank, percent",
     )
     parser.add_argument(
+        "--oversample",
+        type=str,
+        default=None,
+        help="handoff oversampling spec, `distance=weight` comma list (e.g. `5=3,7=4`);"
+        " written into the handoff manifest only",
+    )
+    parser.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help="mode classes: rewrite the existing handoff manifest with --oversample weights;"
+        " variant files are untouched",
+    )
+    parser.add_argument(
         "--steps",
         type=int,
         default=BankParams.steps,
@@ -433,6 +461,18 @@ def main(argv: list[str] | None = None) -> int:
         help="bank root directory (default: levels/ for classes, the tier2_anywhere bank for sample)",
     )
     args = parser.parse_args(argv)
+    try:
+        oversample = parse_oversample(args.oversample)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.manifest_only:
+        if args.mode != "classes":
+            parser.error("--manifest-only requires --mode classes")
+        if not oversample:
+            parser.error("--manifest-only requires --oversample")
+        manifest, weights = update_handoff_manifest(args.out_dir or LEVELS_DIR, oversample=oversample)
+        print(f"updated {manifest} with {len(weights)} weighted train variants")
+        return 0
     if args.mode == "sample":
         params = BankParams(
             seed=args.seed,
@@ -450,14 +490,33 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {kind}: train {train_n}, eval {eval_n}")
         print(f"  rejected pairs: {sum(bank.rejected.values())}")
         return 0
-    params = EnumBankParams(seed=args.seed, eval_percent=args.eval_percent, steps=args.steps)
+    params = EnumBankParams(seed=args.seed, eval_percent=args.eval_percent, steps=args.steps, oversample=oversample or None)
     banks = generate_class_banks(args.out_dir or LEVELS_DIR, params=params)
     for bank in banks.values():
         print(f"wrote {len(bank.train)} train + {len(bank.eval)} eval variants to {bank.root}")
         for (kind, ring, distance), (train_n, eval_n) in sorted(bank.quotas.items()):
             label = f"ring {ring} distance {distance}" if kind == SINGLE else f"distance {distance}"
             print(f"  {label}: train {train_n}, eval {eval_n}")
+    handoff = banks[CLASS_BANK_NAMES[HANDOFF]]
+    weighted = tomllib.loads(handoff.manifest.read_text()).get("level_weights", {})
+    print(f"  handoff level weights: {len(weighted)} train variants")
     return 0
+
+
+def parse_oversample(spec: str | None) -> dict[int, float]:
+    """`distance=weight` comma list -> {distance: weight}; None or empty -> {}."""
+    if not spec:
+        return {}
+    oversample: dict[int, float] = {}
+    for part in spec.split(","):
+        distance, sep, weight = part.partition("=")
+        if not sep or not distance.strip() or not weight.strip():
+            raise ValueError(f"malformed oversample part {part!r}; expected distance=weight")
+        try:
+            oversample[int(distance)] = float(weight)
+        except ValueError:
+            raise ValueError(f"malformed oversample part {part!r}; expected distance=weight") from None
+    return oversample
 
 
 def _apportion(total: int, capacity: dict[Stratum, int]) -> dict[Stratum, int]:
@@ -641,12 +700,14 @@ def _class_manifest_text(  # noqa: PLR0913, PLR0917
     eval_count: int,
     quotas: ClassQuotas,
     rejected: int,
+    level_weights: dict[str, float] | None = None,
 ) -> str:
     """
     Per-class manifest consumed by the corpus scanner: cost/weight defaults plus
     provenance for regeneration — mode/seed/eval share, counts, and the
     per-stratum (train, eval) quotas. Single strata nest ring then distance,
-    handoff strata nest distance only.
+    handoff strata nest distance only. `level_weights` (handoff only) records
+    the per-variant sampling-weight overrides.
     """
     stratification = "(ring, distance)" if kind == SINGLE else "distance"
     lines = [
@@ -672,6 +733,10 @@ def _class_manifest_text(  # noqa: PLR0913, PLR0917
         f"rejected = {rejected}",
         "",
     ]
+    if kind == HANDOFF and params.oversample:
+        lines += ["[provenance.oversample]"]
+        lines += [f"{distance} = {weight}" for distance, weight in sorted(params.oversample.items())]
+        lines.append("")
     for (_, ring, distance), (train_quota, eval_quota) in sorted(quotas.items()):
         table = f"strata.{ring}.{distance}" if kind == SINGLE else f"strata.{distance}"
         lines += [
@@ -680,7 +745,72 @@ def _class_manifest_text(  # noqa: PLR0913, PLR0917
             f"eval = {eval_quota}",
             "",
         ]
+    if level_weights:
+        lines += ["[level_weights]"]
+        lines += [f'"{name}" = {weight}' for name, weight in sorted(level_weights.items())]
+        lines.append("")
     return "\n".join(lines)
+
+
+def handoff_level_weights(
+    pairs: list[tuple[Hex, Hex]],
+    oversample: dict[int, float] | None,
+) -> dict[str, float]:
+    """
+    Sampling-weight overrides for the handoff train bank, in emit order:
+    `train/vNNN -> weight` per pair distance, non-unity entries only.
+    """
+    if not oversample:
+        return {}
+    weights: dict[str, float] = {}
+    for index, (entrance, exit_) in enumerate(pairs):
+        weight = oversample.get(hex_distance(entrance, exit_), 1.0)
+        if weight != 1.0:
+            weights[f"train/v{index:03d}"] = weight
+    return weights
+
+
+def update_handoff_manifest(out_dir: Path = LEVELS_DIR, *, oversample: dict[int, float]) -> tuple[Path, dict[str, float]]:
+    """
+    Rewrite the existing handoff bank manifest with `oversample` sampling
+    weights, computed from the emitted train variants' distances. Variant files
+    are untouched; other provenance is re-emitted from the parsed manifest, so
+    the bank itself stays exactly as generated.
+    """
+    root = out_dir / CLASS_BANK_NAMES[HANDOFF]
+    manifest = root / "manifest.toml"
+    data = tomllib.loads(manifest.read_text())
+    provenance = data["provenance"]
+    if provenance.get("mode") != "enumerate":
+        raise ValueError(f"{manifest}: expected an enumerated handoff bank manifest, got mode {provenance.get('mode')!r}")
+    params = EnumBankParams(
+        seed=provenance["seed"],
+        eval_percent=provenance["eval_percent"],
+        steps=provenance["steps"],
+        size=(provenance["size"][0], provenance["size"][1]),
+        atom=AtomType[provenance["atom"].upper()],
+        oversample=oversample,
+    )
+    pairs = [_disk_entrypoints(root / "train" / f"v{index:03d}.oml") for index in range(provenance["train_count"])]
+    weights = handoff_level_weights(pairs, oversample)
+    quotas = {
+        (HANDOFF, 0, int(distance)): (table["train"], table["eval"])
+        for distance, table in provenance["strata"].items()
+    }
+    manifest.write_text(
+        _class_manifest_text(HANDOFF, params, provenance["train_count"], provenance["eval_count"], quotas, provenance["rejected"], weights)
+    )
+    return manifest, weights
+
+
+def _disk_entrypoints(oml: Path) -> tuple[Hex, Hex]:
+    """(entrance, exit) cells of one emitted bank variant, read back from disk."""
+    entrypoints = {}
+    for ep in Level.from_file(oml).spec.entrypoints:
+        if ep.pos is None:
+            raise FamilyError(f"{oml.name}: bank variants need fixed entrypoints")
+        entrypoints[ep.kind.name.lower()] = ep.pos
+    return entrypoints["entrance"], entrypoints["exit"]
 
 
 if __name__ == "__main__":

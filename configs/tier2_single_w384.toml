@@ -1,0 +1,61 @@
+# E-a width probe: is 384 the right default for the next lineage, or does 256 already saturate?
+# Same single-bank recipe as round-2 R2 (`configs/tier2_single_big2.toml`, the run that hit
+# eval 0.962 from cloning alone), scaled one width step: d_model 384 (nhead 12, ffn 1536),
+# same 3+3 layers. Fresh run — a bigger model cannot warm-start from a smaller checkpoint.
+# Readout: single-bank held-out vs R2's 0.962 and the d1 slice vs 0.88 (see plan E-a).
+# Both RL stages carry `skip_when_bc_eval_gte = 0.95` (E-e exercised here): the R2 precedent
+# says BC hits the ceiling and RL only craters it, so a cloning run at ceiling skips RL
+# entirely (a `stage_skip` metrics row names the rate).
+# Run: `just run-file configs/tier2_single_w384.toml`
+
+[run]
+levels          = ["tier2_single/train"]
+eval_levels     = ["tier2_single/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+autodiscovery   = 5      # keep the R2 supervision level
+
+[run.model]
+d_model         = 384
+nhead           = 12
+encoder_layers  = 3
+decoder_layers  = 3
+dim_feedforward = 1536
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 200  # autodiscovery=5 scales this to 111
+lr                  = 1e-4 # R2's validated wide-model BC step (1e-3 diverged, 3e-4 drifted)
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5  # prevent overfit
+
+[[stage]]
+name                   = "rl-shape"
+kind                   = "rl"
+iterations             = 400
+episodes               = 32
+lr                     = 1e-4
+entropy_coef           = 0.005
+shaping_weight         = 0.5 # delivery-fraction shaping on unsolved COMPLETED
+progress_weight        = 0.3
+skip_when_bc_eval_gte  = 0.95
+
+[[stage]]
+name                   = "rl-consolidate"
+kind                   = "rl"
+iterations             = 3000        # ceiling, not target
+episodes               = 32
+lr                     = 1e-4
+entropy_coef           = 0.001
+shaping_weight         = 0.0         # solve reward only
+sil_coef               = 0.4
+sil_batch_size         = 32
+sil_weighting          = "stratify"
+sil_label              = "ring"      # half the replay from non-`arm` (length-rare) solves
+eval_patience          = 40          # ~400 iterations without eval-bank improvement ends the stage
+skip_when_bc_eval_gte  = 0.95
+# alpha/beta/gamma stay 0, epsilon 0, temperature 1

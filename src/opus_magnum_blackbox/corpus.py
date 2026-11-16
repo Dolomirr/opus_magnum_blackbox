@@ -10,7 +10,10 @@ of every level under it (recursively, sorted).
 Config comes from the nearest `manifest.toml` in or above the level's directory:
 
 - `cost_max` (int, required)
-- `weight` (default 1.0).
+- `weight` (default 1.0)
+- `level_weights` (optional table): `"train/v123" = 3.0` overrides the directory
+  weight for that named variant, with the key relative to the manifest directory
+  (suffix dropped); a key matching no scanned level raises.
 
 Top-level levels without any manifest keep default (`RewardConfig().cost_max`).
 
@@ -62,13 +65,17 @@ def scan_levels(levels_dir: Path = LEVELS_DIR) -> dict[str, LevelEntry]:
     """
     registry = {entry.name: entry for entry in TIER0_LEVELS}
     manifests: dict[Path, dict | None] = {}
+    weighted: dict[Path, set[str]] = {}
     for oml in sorted(levels_dir.rglob("*.oml")):
         name = oml.relative_to(levels_dir).with_suffix("").as_posix()
         solutions = (oms,) if (oms := oml.with_suffix(".oms")).exists() else ()
-        cost_max, weight = _entry_config(oml, levels_dir, manifests)
+        cost_max, weight, override = _entry_config(oml, levels_dir, manifests, weighted)
+        if override is not None:
+            weight = override
         registry.setdefault(
             name, LevelEntry(source=oml, cost_max=cost_max, name=name, weight=weight, solutions=solutions)
         )
+    _check_level_weights(manifests, weighted)
     return registry
 
 
@@ -101,10 +108,13 @@ def _entry_config(
     oml: Path,
     levels_dir: Path,
     manifests: dict[Path, dict | None],
-) -> tuple[int, float]:
+    weighted: dict[Path, set[str]],
+) -> tuple[int, float, float | None]:
     """
-    For each scanned level reads (`cost_max`, `weight`)
-    from manifest in or above its directory.
+    For each scanned level reads (`cost_max`, `weight`) from the manifest in or
+    above its directory, plus an optional per-level `level_weights` override.
+
+    Consumed manifest-relative names are recorded per manifest.
     """
     for directory in (oml.parent, *oml.parent.parents):
         manifest = directory / MANIFEST_NAME
@@ -112,11 +122,13 @@ def _entry_config(
             manifests[manifest] = _read_manifest(manifest)
         data = manifests[manifest]
         if data is not None:
-            return _manifest_config(data, manifest)
+            name = oml.relative_to(directory).with_suffix("").as_posix()
+            weighted.setdefault(manifest, set()).add(name)
+            return (*_manifest_config(data, manifest), _level_weight(data, name, manifest))
         if directory == levels_dir:
             break
     if oml.parent == levels_dir:
-        return RewardConfig().cost_max, 1.0
+        return RewardConfig().cost_max, 1.0, None
     name = oml.relative_to(levels_dir).as_posix()
     raise ValueError(
         f"level {name!r}: no {MANIFEST_NAME} in {oml.parent} or any directory above it;"
@@ -139,3 +151,34 @@ def _manifest_config(data: dict, manifest: Path) -> tuple[int, float]:
     if not isinstance(weight, (int, float)):
         raise TypeError(f"{manifest}: `weight` must be a number, got {weight!r}")
     return cost_max, float(weight)
+
+
+def _level_weight(data: dict, name: str, manifest: Path) -> float | None:
+    """
+    Per-level sampling weight for level from the manifest.
+    """
+    weights = data.get("level_weights")
+    if weights is None:
+        return None
+    if not isinstance(weights, dict):
+        raise TypeError(f"{manifest}: `level_weights` must be a table, got {weights!r}")
+    weight = weights.get(name)
+    if weight is None:
+        return None
+    if not isinstance(weight, (int, float)):
+        raise TypeError(f"{manifest}: `level_weights[{name!r}]` must be a number, got {weight!r}")
+    if weight <= 0:
+        raise ValueError(f"{manifest}: `level_weights[{name!r}]` must be positive, got {weight!r}")
+    return float(weight)
+
+
+def _check_level_weights(manifests: dict[Path, dict | None], weighted: dict[Path, set[str]]) -> None:
+    """
+    Every level_weights key must name level scanned under its related manifest.
+    """
+    for manifest, data in manifests.items():
+        if not isinstance(data, dict) or not isinstance(data.get("level_weights"), dict):
+            continue
+        unknown = sorted(set(data["level_weights"]) - weighted.get(manifest, set()))
+        if unknown:
+            raise ValueError(f"{manifest}: `level_weights` name(s) not in the corpus: {unknown}")

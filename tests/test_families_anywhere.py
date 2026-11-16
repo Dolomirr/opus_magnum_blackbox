@@ -13,10 +13,12 @@ from opus_magnum_blackbox.families import (
     anywhere_reference_solution,
     anywhere_reference_tokens,
     anywhere_spec,
+    anywhere_spec_plan,
     hex_distance,
     verify,
 )
 from opus_magnum_blackbox.families.tier2_anywhere import (
+    ArmProgram,
     _anywhere_level_spec,
     _handoff_candidates,
     _leg_program,
@@ -308,3 +310,55 @@ def test_sweep_full_pair_classes():
         arms, target = _classify_pair(entrance, exit_)
         counts[(arms, target)] = counts.get((arms, target), 0) + 1
     assert counts == {(1, 2): 656, (2, 1): 604}
+
+
+
+def _arm_length(arm: ArmProgram) -> int:
+    """
+    Physical arm length: static parts sit at their ring piston's rest radius is 1
+    and its trace peaks at the farthest reached ring.
+    """
+    if arm.blueprint == "arm":
+        return 1
+    if arm.blueprint.startswith("arm_l"):
+        return int(arm.blueprint.removeprefix("arm_l"))
+    radius, peak = 1, 1
+    for _, action in arm.ticks:
+        if action is StepActionType.EXTEND:
+            radius += 1
+            peak = max(peak, radius)
+        elif action is StepActionType.RETRACT:
+            radius -= 1
+    return peak
+
+
+D5_PAIRS = [(entrance, exit_) for entrance in ALL_CELLS for exit_ in ALL_CELLS if hex_distance(entrance, exit_) == 5]
+
+
+@pytest.mark.corpus
+def test_d5_handoffs_carry_longer_arm_on_exit_side():
+    """
+    Canonical ranking: every distance-5 handoff winner keeps its longer (or equal)
+    arm on the exit side.
+    """
+    checked = 0
+    for entrance, exit_ in D5_PAIRS:
+        _, plan = anywhere_spec_plan(entrance, exit_)
+        if len(plan.arms) != 2:
+            continue
+        assert _arm_length(plan.arms[1]) >= _arm_length(plan.arms[0]), (entrance, exit_)
+        checked += 1
+    assert checked > 0  # d5 has no single-arm geometry, so every pair is a handoff
+
+
+def test_reference_solves_sample_including_mirror_pairs():
+    """
+    The canonical winners still deliver: a seeded sample across the pair space,
+    plus both directions of ten d5 pairs (the formerly mirror-ambiguous class).
+    """
+    rng = random.Random(0)
+    d5 = rng.sample(D5_PAIRS, 10)
+    pairs = rng.sample(ALL_PAIRS, 40) + d5 + [(exit_, entrance) for entrance, exit_ in d5]
+    for entrance, exit_ in pairs:
+        spec = anywhere_spec(entrance, exit_)
+        assert verify(spec, anywhere_reference_solution(spec)) > 0, (entrance, exit_)
