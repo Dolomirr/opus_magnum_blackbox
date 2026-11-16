@@ -90,6 +90,17 @@ def _remap_vocab_ids(
     return out
 
 
+def bc_cycle_indices(num_batches: int, cycle: int, seed: int, epoch: int) -> list[int]:
+    """
+    Cycled BC feeding: per-epoch subset of `cycle` of `num_batches` supervised entry batches.
+    Deterministic in (seed, epoch) via dedicated generator,
+    so selection is independent of global rng stream.
+    """
+    generator = torch.Generator().manual_seed(zlib.crc32(f"bc-cycle:{seed}:{epoch}".encode()))
+    picks = torch.randperm(num_batches, generator=generator)[:cycle].tolist()
+    return sorted(picks)
+
+
 class Trainer:
     """
     Owns policy, optimizer, envs, configs, run directory and rng.
@@ -593,9 +604,12 @@ class Trainer:
 
         stage_name = stage or "pretrain"
         for epoch in range(1, config.epochs + 1):
+            epoch_batches = batches
+            if 0 < config.bc_cycle < len(batches):
+                epoch_batches = [batches[pick] for pick in bc_cycle_indices(len(batches), config.bc_cycle, self.train_config.seed, epoch)]
             losses: list[float] = []
             accuracies: list[float] = []
-            for batch in batches:
+            for batch in epoch_batches:
                 order = torch.randperm(len(batch.decoder_length))
                 for start in range(0, len(order), config.batch_size):
                     loss, accuracy = self._bc_update(batch, order[start : start + config.batch_size])

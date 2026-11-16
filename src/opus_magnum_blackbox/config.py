@@ -107,6 +107,7 @@ class PretrainConfig:
     eval_interval         : int   = 10
     early_stop_solve_rate : float = 1.0
     early_stop_loss       : float = 1e-3
+    bc_cycle              : int   = 0   # per-epoch supervised-entry subset size (cycled feeding); 0 = fixed-set (all entries every epoch)
     # fmt: on
 
 
