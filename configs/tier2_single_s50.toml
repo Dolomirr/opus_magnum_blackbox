@@ -1,0 +1,53 @@
+# Bank-size sweep, 50%: 262 stratified solutions of tier2_single/train (seed 0).
+# Identical to `configs/tier2_single_dial5.toml` except the train bank; eval always the
+# complete tier2_single/eval. The dial5 run is the 100% anchor at this exact recipe.
+# Run: `just run-file configs/tier2_single_s50.toml`
+
+[run]
+levels          = ["tier2_single_s50/train"]
+eval_levels     = ["tier2_single/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+autodiscovery   = 5
+
+[run.model]
+d_model         = 256
+nhead           = 8
+encoder_layers  = 3
+decoder_layers  = 3
+dim_feedforward = 1024
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 200
+lr                  = 1e-4
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5
+
+[[stage]]
+name                = "rl-shape"
+kind                = "rl"
+iterations          = 400
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.005
+shaping_weight      = 0.5
+progress_weight     = 0.3
+
+[[stage]]
+name                = "rl-consolidate"
+kind                = "rl"
+iterations          = 3000
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.001
+shaping_weight      = 0.0
+sil_coef            = 0.4
+sil_batch_size      = 32
+sil_weighting       = "stratify"
+sil_label           = "ring"
+eval_patience       = 40
