@@ -43,8 +43,9 @@ class ProfiledEnv(OpusEnv):
         levels: list[LevelEntry],
         tokenizer_config=None,
         reward_config=None,
+        encoder_features: tuple[str, ...] = (),
     ) -> None:
-        super().__init__(levels, tokenizer_config, reward_config)
+        super().__init__(levels, tokenizer_config, reward_config, encoder_features)
         self.prof = PhaseStats()
 
     def _observation(self) -> dict:

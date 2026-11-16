@@ -149,7 +149,7 @@ def _train(args: argparse.Namespace) -> None:
         payload = torch.load(args.resume, map_location="cpu", weights_only=False)
         train_config = _train_config(args, TrainConfig(**payload["train_config"]))
         reward_config = _reward_config(args, RewardConfig(**payload["reward_config"]))
-        env = OpusEnv([entry], reward_config=reward_config)
+        env = OpusEnv([entry], reward_config=reward_config, encoder_features=tuple(payload.get("encoder_features", ())))
         trainer = Trainer.resume(args.resume, [env], train_config=train_config, reward_config=reward_config)
     else:
         reward_config = _reward_config(args, RewardConfig())
@@ -170,9 +170,10 @@ def _run(args: argparse.Namespace) -> None:
 
 def _eval(args: argparse.Namespace) -> None:
     entries = _find_entries(args.level)
-    env = OpusEnv(entries)
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    policy = OpusPolicy(env.tokenizer.config, ModelConfig(**payload["model_config"]))
+    features = tuple(payload.get("encoder_features", ()))
+    env = OpusEnv(entries, encoder_features=features)
+    policy = OpusPolicy(env.tokenizer.config, ModelConfig(**payload["model_config"]), encoder_features=features)
     policy.load_state_dict(payload["model_state"])
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy.to(device).eval()
@@ -181,7 +182,7 @@ def _eval(args: argparse.Namespace) -> None:
     solved = 0
     rewards: list[float] = []
     for entry in entries:
-        episode = collect_episode(OpusEnv([entry]), policy, device, greedy=True)
+        episode = collect_episode(OpusEnv([entry], encoder_features=features), policy, device, greedy=True)
         solved += episode.solved
         rewards.append(sum(episode.rewards))
         if args.dump_tokens:
@@ -195,9 +196,10 @@ def _eval(args: argparse.Namespace) -> None:
 
 def _generate(args: argparse.Namespace) -> None:
     entry = _find_entry(args.level)
-    env = OpusEnv([entry])
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    policy = OpusPolicy(env.tokenizer.config, ModelConfig(**payload["model_config"]))
+    features = tuple(payload.get("encoder_features", ()))
+    env = OpusEnv([entry], encoder_features=features)
+    policy = OpusPolicy(env.tokenizer.config, ModelConfig(**payload["model_config"]), encoder_features=features)
     policy.load_state_dict(payload["model_state"])
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy.to(device).eval()

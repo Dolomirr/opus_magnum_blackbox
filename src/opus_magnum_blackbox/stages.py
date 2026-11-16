@@ -14,6 +14,10 @@ Config schema:
     `init_from` (optional checkpoint path; a fresh run loads the checkpoint's
         model weights before stage 1 - fresh optimizer, iteration counter and
         run dir; model-config mismatch is a hard error. Ignored on resume).
+    `encoder_features` (optional list of derived relational encoder feature
+        names; empty = off, byte-identical observations and model shapes).
+        Threaded env->observation->model: the env appends the per-spec feature
+        vector to observations, the policy projects it into the encoder.
 - `[[stage]]`: `name`, `kind` (`pretrain` or `rl`),
     plus keys routed by field name into `PretrainConfig`/`RewardConfig` (pretrain)
     or `TrainConfig`/`RewardConfig` (rl).
@@ -45,9 +49,9 @@ from pathlib import Path
 import torch
 from opus_magnum_sym import Level, LevelSpec
 
-from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfig, TrainConfig
+from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfig, TrainConfig, encoder_feature_dim
 from opus_magnum_blackbox.corpus import resolve_entries
-from opus_magnum_blackbox.env import LevelEntry, OpusEnv
+from opus_magnum_blackbox.env import LevelEntry, OpusEnv, spec_encoder_features
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import ProfiledEnv, ProfiledEnvs
 from opus_magnum_blackbox.rollout import RolloutBatch, build_supervised
@@ -119,6 +123,7 @@ class PipelineConfig:
     autodiscovery: int = 1  # supervision switch: 1 keeps full BC, 10 removes it
     tag: str = ""  # run-dir suffix; empty derives from the source stem + non-default knobs
     init_from: Path | None = None  # warm-start checkpoint; model weights only
+    encoder_features: tuple[str, ...] = ()  # derived relational encoder side channel; empty = off
     model_config: ModelConfig = field(
         default_factory=ModelConfig
     )  # `[run] model` overrides; default is the size-128 model
@@ -152,12 +157,21 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         "tag",
         "init_from",
         "model",
+        "encoder_features",
     }
     if unknown_run_keys:
         raise ValueError(
             f"unknown [run] keys: {sorted(unknown_run_keys)}; known keys: "
-            + "levels, eval_levels, seed, device, autodiscovery, tag, init_from, model"
+            + "levels, eval_levels, seed, device, autodiscovery, tag, init_from, model, encoder_features"
         )
+    raw_features = run.get("encoder_features", [])
+    if not isinstance(raw_features, list) or any(not isinstance(name, str) for name in raw_features):
+        raise ValueError(f"[run] `encoder_features` must be a list of feature names, got {raw_features!r}")
+    encoder_features = tuple(raw_features)
+    try:
+        encoder_feature_dim(encoder_features)  # knob validation
+    except ValueError as error:
+        raise ValueError(f"[run] {error}") from error
     model_config = _parse_model_config(run.get("model", {}))
     init_from = run.get("init_from")
     if init_from is not None and (not isinstance(init_from, str) or not init_from):
@@ -203,6 +217,7 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         autodiscovery=autodiscovery,
         tag=tag if tag is not None else _derive_tag(Path(path), tuple(parsed), autodiscovery, model_config),
         init_from=Path(init_from) if init_from else None,
+        encoder_features=encoder_features,
         model_config=model_config,
         source=Path(path),
     )
@@ -366,13 +381,15 @@ def run_pipeline(
     if eval_entries is None:
         eval_entries = resolve_entries(list(config.eval_levels)) if config.eval_levels else []
     env_cls = ProfiledEnv if config.profile else OpusEnv
-    envs: list[OpusEnv] = [env_cls(entries)]
-    eval_envs: list[OpusEnv] = [env_cls(eval_entries)] if eval_entries else []
+    envs: list[OpusEnv] = [env_cls(entries, encoder_features=config.encoder_features)]
+    eval_envs: list[OpusEnv] = (
+        [env_cls(eval_entries, encoder_features=config.encoder_features)] if eval_entries else []
+    )
     profiled = [env for env in (*envs, *eval_envs) if isinstance(env, ProfiledEnv)]
     if resume_dir is None:
         torch.manual_seed(config.train_config.seed)
         trainer = Trainer(
-            OpusPolicy(envs[0].tokenizer.config, config.model_config),
+            OpusPolicy(envs[0].tokenizer.config, config.model_config, encoder_features=config.encoder_features),
             envs,
             config.train_config,
             eval_envs=eval_envs,
@@ -454,6 +471,7 @@ def _resume_trainer(
 
 def _run_pretrain_stage(trainer: Trainer, entries: list[LevelEntry], stage: PretrainStage, seed: int) -> None:
     tokenizer, masker = trainer.envs[0].tokenizer, trainer.envs[0].masker
+    features = trainer.envs[0].encoder_features
     batches: list[RolloutBatch] = []
     variant_seed = seed
     for entry in entries:
@@ -465,7 +483,8 @@ def _run_pretrain_stage(trainer: Trainer, entries: list[LevelEntry], stage: Pret
                 variants.extend(augment(sequence, spec, seed=variant_seed, max_variants=stage.config.max_variants))
             variant_seed += 1
         if variants:
-            batches.append(build_supervised(variants, spec, tokenizer, masker))
+            side_channel = spec_encoder_features(spec, features) if features else None
+            batches.append(build_supervised(variants, spec, tokenizer, masker, encoder_features=side_channel))
     if not batches:
         raise ValueError(f"pretrain stage {stage.name!r}: no solution sequences found on the configured levels")
     trainer.pretrain(batches, stage.config, stage=stage.name)

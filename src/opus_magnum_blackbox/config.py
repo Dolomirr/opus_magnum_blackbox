@@ -57,6 +57,29 @@ class ModelConfig:
     # fmt: on
 
 
+ENCODER_FEATURE_NAMES = ("distance", "ring_reach")
+"""
+Derived relational encoder features, in canonical vector order:
+
+- `distance`: normalized entrance->exit hex distance scalar.
+- `ring_reach`: per static-arm ring (arm, arm_l2, arm_l3), whether one ring-L
+  arm's in-board orbit passes through both entrypoint cells.
+"""
+
+
+def encoder_feature_dim(features: tuple[str, ...]) -> int:
+    """
+    Width of the derived-feature vector for the `encoder_features` knob.
+    Unknown or duplicate names raise.
+    """
+    unknown = [name for name in features if name not in ENCODER_FEATURE_NAMES]
+    if unknown:
+        raise ValueError(f"unknown encoder features {unknown}; known names: {list(ENCODER_FEATURE_NAMES)}")
+    if len(set(features)) != len(features):
+        raise ValueError(f"duplicate encoder features: {list(features)}")
+    return (1 if "distance" in features else 0) + (3 if "ring_reach" in features else 0)
+
+
 @dataclass(frozen=True)
 class TrainConfig:
     """

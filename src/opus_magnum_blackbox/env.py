@@ -20,8 +20,8 @@ from gymnasium import spaces
 from opus_magnum_sym import ComponentType, Hex, Level, LevelSpec
 
 from opus_magnum_blackbox.codec import OpusTokenizer
-from opus_magnum_blackbox.config import RewardConfig, TokenizerConfig
-from opus_magnum_blackbox.families import hex_distance
+from opus_magnum_blackbox.config import RewardConfig, TokenizerConfig, encoder_feature_dim
+from opus_magnum_blackbox.families import MAX_RING, hex_distance
 from opus_magnum_blackbox.geometry import footprint, occupied_cells
 from opus_magnum_blackbox.grammar import GrammarError, ParseState, advance, spec_model
 from opus_magnum_blackbox.masking import ActionMasker
@@ -49,14 +49,7 @@ def progress_distances(level: Level) -> tuple[float | None, float | None]:
     Atoms still held by manipulators also counts.
     Returns `(None, None)` when entrypoint cells are unavailable.
     """
-    entrances: set[Hex] = set()
-    exits: set[Hex] = set()
-    for comp in level.sim.entrypoints.values():
-        cells = set(comp.footprint())
-        if comp.type is ComponentType.EXIT:
-            exits |= cells
-        else:
-            entrances |= cells
+    entrances, exits = _entrypoint_cells(level.sim.entrypoints)
     if not entrances or not exits:
         return None, None
     initial = min(hex_distance(cell, exit_cell) for cell in entrances for exit_cell in exits)
@@ -69,6 +62,59 @@ def progress_distances(level: Level) -> tuple[float | None, float | None]:
     return float(initial), float(final)
 
 
+def _entrypoint_cells(entrypoints) -> tuple[set[Hex], set[Hex]]:
+    """
+    Entrance and exit footprint cells of a level's fixed entrypoints.
+    """
+    entrances: set[Hex] = set()
+    exits: set[Hex] = set()
+    for comp in entrypoints.values():
+        cells = set(comp.footprint())
+        if comp.type is ComponentType.EXIT:
+            exits |= cells
+        else:
+            entrances |= cells
+    return entrances, exits
+
+
+def spec_encoder_features(spec: LevelSpec, features: tuple[str, ...], entrypoints=None) -> np.ndarray:
+    """
+    Derived relational encoder features as one float32 vector (canonical order,
+    see `ENCODER_FEATURE_NAMES`), a pure function of the spec:
+
+    - `distance`: entrance->exit hex distance normalized by the board diameter.
+    - `ring_reach` per ring L: whether some in-board base cell lies exactly L
+      rings from both an entrance and an exit cell — i.e. both lie on one
+      ring-L static arm's orbit (family geometry: a static arm's hand sweeps
+      the hex ring of its radius around its base).
+
+    Missing entrypoints degrade to zeros. `entrypoints` injects an already
+    built level's fixed entrypoints (the env's reset path) instead of building
+    a fresh `Level(spec)`.
+    """
+    if entrypoints is None:
+        entrypoints = Level(spec).sim.entrypoints
+    rows, cols = spec.size
+    entrances, exits = _entrypoint_cells(entrypoints)
+    values: list[float] = []
+    if "distance" in features:
+        diameter = rows + cols - 2
+        distance = min((hex_distance(cell, exit_cell) for cell in entrances for exit_cell in exits), default=0)
+        values.append(distance / diameter if diameter else 0.0)
+    if "ring_reach" in features:
+        bases = [Hex(r, s) for r in range(rows) for s in range(cols)]
+        for ring in range(1, MAX_RING + 1):
+            reach = any(
+                hex_distance(base, cell) == ring and hex_distance(base, exit_cell) == ring
+                for base in bases
+                for cell in entrances
+                for exit_cell in exits
+            )
+            values.append(float(reach))
+    vector = np.array(values, dtype=np.float32)
+    return vector
+
+
 class OpusEnv(gym.Env):
     metadata = {  # noqa: RUF012
         "render_modes": [],
@@ -79,6 +125,7 @@ class OpusEnv(gym.Env):
         levels: list[LevelEntry],
         tokenizer_config: TokenizerConfig | None = None,
         reward_config: RewardConfig | None = None,
+        encoder_features: tuple[str, ...] = (),
     ) -> None:
         if not levels:
             raise ValueError("OpusEnv requires at least one level")
@@ -86,18 +133,22 @@ class OpusEnv(gym.Env):
         self.tokenizer = OpusTokenizer(tokenizer_config)
         self.masker = ActionMasker(self.tokenizer.vocab)
         self.reward_config = reward_config or RewardConfig()
+        self.encoder_features = tuple(encoder_features)
 
         vocab_size = len(self.tokenizer.vocab)
         max_enc = self.tokenizer.config.max_encoder_len
         max_dec = self.tokenizer.config.max_decoder_len
         # fmt: off
-        self.observation_space = spaces.Dict({
+        observation = spaces.Dict({
             "encoder_input"   : spaces.Box(low=0, high=vocab_size - 1, shape=(max_enc,), dtype=np.int64),
             "encoder_length"  : spaces.Discrete(max_enc + 1),
             "decoder_history" : spaces.Box(low=0, high=vocab_size - 1, shape=(max_dec,), dtype=np.int64),
             "decoder_length"  : spaces.Discrete(max_dec + 1),
             "action_mask"     : spaces.MultiBinary(vocab_size),
         })
+        if self.encoder_features:
+            observation["encoder_features"] = spaces.Box(low=0.0, high=1.0, shape=(encoder_feature_dim(self.encoder_features),), dtype=np.float32)
+        self.observation_space = observation
         self.action_space = spaces.Discrete(vocab_size)
 
         self._level_cache    : dict[str, Level]                 = {}
@@ -105,6 +156,7 @@ class OpusEnv(gym.Env):
         self._spec           : LevelSpec | None                 = None
         self._encoder_input  : np.ndarray | None                = None
         self._encoder_length : int                              = 0
+        self._features       : np.ndarray | None                = None  # derived per-spec side channel, fixed per episode
         self._history        : list[int]                        = []
         self._mask_state     : ParseState | GrammarError | None = None  # running parse, rebuilt on reset
         self._occupied       : set[tuple[int, int]] | None      = None  # fixed entrypoints + placements so far
@@ -137,6 +189,11 @@ class OpusEnv(gym.Env):
         level = self._level_for(self._current)
         self._spec = level.spec
         self._encoder_input, self._encoder_length = self.tokenizer.encode_level_spec(self._spec)
+        self._features = (
+            spec_encoder_features(self._spec, self.encoder_features, level.sim.entrypoints)
+            if self.encoder_features
+            else None
+        )
         self._history = []
         self._mask_state = ParseState()
         self._occupied = set(occupied_cells(self._spec, spec_model(self._spec), ()))
@@ -222,13 +279,16 @@ class OpusEnv(gym.Env):
         self._mask = self.masker.mask_state(self._mask_state, self._spec, self._occupied)
 
         # fmt: off
-        return {
+        observation = {
             "encoder_input"   : self._encoder_input.copy(),
             "encoder_length"  : self._encoder_length,
             "decoder_history" : history,
             "decoder_length"  : len(self._history),
             "action_mask"     : self._mask.astype(np.int8),
         }
+        if self._features is not None:
+            observation["encoder_features"] = self._features.copy()
+        return observation
         # fmt: on
 
     def _sync_mask_state(self) -> None:

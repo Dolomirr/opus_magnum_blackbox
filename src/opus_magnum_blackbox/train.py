@@ -35,12 +35,13 @@ class SILRow:
     """
 
     # fmt: off
-    level          : str
-    encoder_input  : torch.Tensor # [E] int64
-    encoder_length : int
-    actions        : torch.Tensor # [T] int64
-    action_masks   : torch.Tensor # [T, V] bool
-    valid          : torch.Tensor # [T] bool
+    level            : str
+    encoder_input    : torch.Tensor               # [E] int64
+    encoder_length   : int
+    actions          : torch.Tensor               # [T] int64
+    action_masks     : torch.Tensor               # [T, V] bool
+    valid            : torch.Tensor               # [T] bool
+    encoder_features : torch.Tensor | None = None # [F] derived side channel, None when off
     # fmt: on
 
 
@@ -56,6 +57,7 @@ def _sil_row(batch: RolloutBatch, row: int) -> SILRow:
         actions=batch.actions[row, :length],
         action_masks=batch.action_masks[row, :length],
         valid=batch.valid[row, :length],
+        encoder_features=None if batch.encoder_features is None else batch.encoder_features[row],
     )
 
 
@@ -277,7 +279,9 @@ class Trainer:
         action_masks = action_masks.clone()
         action_masks[~valid, self.pad_id] = True
 
-        logits, values = self.policy(encoder_input, encoder_length, actions, decoder_length)
+        logits, values = self.policy(
+            encoder_input, encoder_length, actions, decoder_length, encoder_features=batch.encoder_features
+        )
         # Drop the extra BOS output position: position t is distribution for target t.
         logits, values = logits[:, :-1], values[:, :-1]
 
@@ -485,6 +489,7 @@ class Trainer:
             valid[i, :length] = row.valid
 
         zeros = torch.zeros(batch_size, max_len)
+        features = None if rows[0].encoder_features is None else torch.stack([row.encoder_features for row in rows])
         return RolloutBatch(
             encoder_input=torch.stack([row.encoder_input for row in rows]),
             encoder_length=torch.tensor([row.encoder_length for row in rows], dtype=torch.long),
@@ -500,6 +505,7 @@ class Trainer:
             mean_return=0.0,
             solve_rate=0.0,
             mean_length=float(max_len),
+            encoder_features=features,
         )
 
     def _timed(self, name: str):
@@ -555,7 +561,7 @@ class Trainer:
         cache = self._entry_env_pools.setdefault(tuple(pool), {})
         env = cache.get(entry.name)
         if env is None:
-            env = OpusEnv([entry])
+            env = OpusEnv([entry], encoder_features=self.envs[0].encoder_features)
             cache[entry.name] = env
         return env
 
@@ -653,7 +659,9 @@ class Trainer:
         action_masks = action_masks.clone()
         action_masks[~valid, self.pad_id] = True
 
-        logits, _ = self.policy(encoder_input, encoder_length, actions, decoder_length)
+        logits, _ = self.policy(
+            encoder_input, encoder_length, actions, decoder_length, encoder_features=batch.encoder_features
+        )
         dist = self.policy.masked_distribution(logits[:, :-1], action_masks)
         logprobs = dist.log_prob(actions)
         accuracy = dist.probs.argmax(dim=-1)[valid].eq(actions[valid]).float().mean()
@@ -674,6 +682,7 @@ class Trainer:
             "model_config"    : asdict(self.model_config),
             "train_config"    : asdict(self.train_config),
             "reward_config"   : asdict(self.reward_config),
+            "encoder_features": list(self.envs[0].encoder_features),
             "best_eval_rate"  : self._best_eval_rate,
             "last_bc_eval_rate": self._last_bc_eval_rate,
             "rng": {
@@ -718,7 +727,9 @@ class Trainer:
         train_config = train_config or TrainConfig(**payload["train_config"])
         reward_config = reward_config or RewardConfig(**payload["reward_config"])
 
-        policy = OpusPolicy(envs[0].tokenizer.config, model_config)
+        policy = OpusPolicy(
+            envs[0].tokenizer.config, model_config, encoder_features=tuple(payload.get("encoder_features", ()))
+        )
         policy.load_state_dict(payload["model_state"])
         trainer = cls(policy, envs, train_config, reward_config, model_config, eval_envs=eval_envs)
         trainer.optimizer.load_state_dict(payload["optimizer_state"])
