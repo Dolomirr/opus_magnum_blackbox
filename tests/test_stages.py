@@ -137,6 +137,37 @@ eval_patience = 20
         load_pipeline(path)
 
 
+def test_skip_when_bc_eval_gte_routes_to_rl_stage_only(tmp_path):
+    text = """
+[run]
+levels = ["tier0_typed_delivery"]
+
+[[stage]]
+name = "rl-consolidate"
+kind = "rl"
+iterations = 5
+skip_when_bc_eval_gte = 0.95
+"""
+    path = _write_pipeline(tmp_path, text)
+    stage = load_pipeline(path).stages[0]
+    assert isinstance(stage, RLStage)
+    assert stage.skip_when_bc_eval_gte == 0.95
+
+    path.write_text(text.replace("skip_when_bc_eval_gte = 0.95\n", ""))
+    assert load_pipeline(path).stages[0].skip_when_bc_eval_gte is None  # absent key: never skip
+
+    for bad in ("skip_when_bc_eval_gte = 1.5", "skip_when_bc_eval_gte = -0.5", "skip_when_bc_eval_gte = true", 'skip_when_bc_eval_gte = "0.9"'):
+        path.write_text(text.replace("skip_when_bc_eval_gte = 0.95", bad))
+        with pytest.raises(ValueError, match="skip_when_bc_eval_gte"):
+            load_pipeline(path)
+
+    # pretrain stages do not take the rl-only key; unknown keys still hard-error
+    pretrain = text.replace('name = "rl-consolidate"\nkind = "rl"\niterations = 5', 'name = "bc"\nkind = "pretrain"')
+    path.write_text(pretrain)
+    with pytest.raises(ValueError, match=r"stage 'bc': unknown key 'skip_when_bc_eval_gte'"):
+        load_pipeline(path)
+
+
 def test_invalid_kind_and_missing_stages_rejected(tmp_path):
     path = _write_pipeline(
         tmp_path,
@@ -428,6 +459,79 @@ def test_autodiscovery_one_is_keyless_behavior(tmp_path):
     # k=1 keeps historical run naming on both runs
     assert "-ad" not in keyless_dir.name
     assert "-ad" not in dialed_dir.name
+
+
+def _run_skip_pipeline(tmp_path, *, eval_bank: bool, threshold: bool):
+    """
+    Tiny bc + rl-a + rl-b pipeline; `eval_bank` gives bc a held-out bank so the
+    bc-end eval rate exists, `threshold` toggles the `skip_when_bc_eval_gte`
+    key on rl-a (0.0: any existing rate meets it).
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    oms = tmp_path / "tier0_test.oms"
+    oms.write_text(TIER0_OMS.read_text())
+    path = _write_pipeline(
+        tmp_path,
+        f"""
+[run]
+levels = ["tier0_typed_delivery"]
+seed = 0
+device = "cpu"
+{'eval_levels = ["tier0_typed_delivery"]' if eval_bank else ""}
+[[stage]]
+name = "bc"
+kind = "pretrain"
+epochs = 1
+batch_size = 32
+augment = false
+eval_interval = 1
+
+[[stage]]
+name = "rl-a"
+kind = "rl"
+iterations = 1
+episodes = 2
+{"skip_when_bc_eval_gte = 0.0" if threshold else ""}
+[[stage]]
+name = "rl-b"
+kind = "rl"
+iterations = 1
+episodes = 2
+""",
+    )
+    pipeline = load_pipeline(path)
+    pipeline = replace(pipeline, train_config=replace(pipeline.train_config, run_dir=str(tmp_path)))
+    entries = [LevelEntry(source=make_spec(), cost_max=50, name="tier0_test", solutions=(oms,))]
+    run_dir = run_pipeline(pipeline, entries=entries)
+    metrics = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
+    return run_dir, metrics
+
+
+def test_rl_stage_skips_when_bc_eval_meets_threshold(tmp_path):
+    """Threshold met: the stage is skipped with a `stage_skip` row naming the rate, and still checkpoints."""
+    run_dir, metrics = _run_skip_pipeline(tmp_path, eval_bank=True, threshold=True)
+
+    skips = [entry for entry in metrics if entry.get("stage_skip") and entry.get("stage") == "rl-a"]
+    assert len(skips) == 1
+    assert isinstance(skips[0]["eval_solve_rate"], float)  # the row names the rate
+    assert "skip_when_bc_eval_gte 0" in skips[0]["reason"]
+    # rl-a never trained: its only iteration slot goes to rl-b
+    assert [entry["iteration"] for entry in metrics if "policy_loss" in entry] == [1]
+    assert [entry["stage"] for entry in metrics if "policy_loss" in entry] == ["rl-b"]
+    # skipped stages still checkpoint, so resume treats them as completed
+    assert (run_dir / "stage_rl-a.pt").exists()
+    assert torch.load(run_dir / "stage_bc.pt", weights_only=False)["last_bc_eval_rate"] == skips[0]["eval_solve_rate"]
+
+
+def test_rl_stage_runs_when_bc_rate_unknown_or_key_absent(tmp_path):
+    """No held-out bank (rate unknown) or absent key: rl-a runs normally, no skip row."""
+    _, no_bank = _run_skip_pipeline(tmp_path / "no-bank", eval_bank=False, threshold=True)
+    assert not [entry for entry in no_bank if entry.get("stage_skip")]
+    assert [entry["stage"] for entry in no_bank if "policy_loss" in entry] == ["rl-a", "rl-b"]
+
+    _, keyless = _run_skip_pipeline(tmp_path / "keyless", eval_bank=True, threshold=False)
+    assert not [entry for entry in keyless if entry.get("stage_skip")]
+    assert [entry["stage"] for entry in keyless if "policy_loss" in entry] == ["rl-a", "rl-b"]
 
 
 def test_run_tag_derivation_from_knobs(tmp_path):

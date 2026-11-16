@@ -8,6 +8,7 @@ import pytest
 from opus_magnum_sym import Hex
 
 from opus_magnum_blackbox import gen_tier2
+from opus_magnum_blackbox.corpus import scan_levels
 from opus_magnum_blackbox.env import LevelEntry
 from opus_magnum_blackbox.families import hex_distance
 from opus_magnum_blackbox.solutions import load_solutions
@@ -369,6 +370,69 @@ def test_class_bank_manifests_match_files(small_class_banks):
         assert provenance["size"] == [3, 3]
         assert provenance["atom"] == "water"
         assert _flat_class_strata(provenance["strata"], kind) == _file_stratum_counts(bank.root)
+
+
+def test_class_bank_without_oversample_has_no_weights(small_class_banks):
+    """Banks generated without an oversample spec carry no `[level_weights]` table."""
+    for bank in small_class_banks.values():
+        manifest = tomllib.loads(bank.manifest.read_text())
+        assert "level_weights" not in manifest
+        assert "oversample" not in manifest["provenance"]
+
+
+def test_class_bank_oversample_weights_written_for_handoff_only(tmp_path):
+    """`oversample` lands as `[level_weights]` in the handoff manifest only: train split, non-unity entries."""
+    params = gen_tier2.EnumBankParams(seed=5, eval_percent=CLASS_EVAL_PERCENT, size=(3, 3), oversample={3: 3.0})
+    banks = gen_tier2.generate_class_banks(tmp_path, params=params)
+    single = tomllib.loads(banks["tier2_single"].manifest.read_text())
+    assert "level_weights" not in single
+    handoff = banks["tier2_handoff"]
+    manifest = tomllib.loads(handoff.manifest.read_text())
+    assert manifest["provenance"]["oversample"] == {"3": 3.0}
+    weights = manifest["level_weights"]
+    # 3x3 handoffs are all distance 3, so every train variant is weighted; eval variants never are
+    assert len(weights) == len(handoff.train)
+    assert set(weights) == {f"train/v{index:03d}" for index in range(len(handoff.train))}
+    assert set(weights.values()) == {3.0}
+
+
+def test_corpus_applies_handoff_oversample_weights(tmp_path):
+    """The corpus scanner applies the handoff manifest's `[level_weights]` to train entries only."""
+    params = gen_tier2.EnumBankParams(seed=5, eval_percent=CLASS_EVAL_PERCENT, size=(3, 3), oversample={3: 3.0})
+    gen_tier2.generate_class_banks(tmp_path, params=params)
+    registry = scan_levels(levels_dir=tmp_path)
+    assert registry["tier2_handoff/train/v000"].weight == 3.0
+    assert registry["tier2_handoff/eval/v000"].weight == gen_tier2.MANIFEST_WEIGHT
+    assert registry["tier2_single/train/v000"].weight == gen_tier2.MANIFEST_WEIGHT
+
+
+def test_manifest_only_update_weights_existing_bank(tmp_path):
+    """`update_handoff_manifest` adds weights without touching variant files, preserving provenance."""
+    root = tmp_path / "banks"
+    gen_tier2.generate_class_banks(root, params=gen_tier2.EnumBankParams(seed=5, eval_percent=CLASS_EVAL_PERCENT, size=(3, 3)))
+    handoff_root = root / "tier2_handoff"
+    before = {
+        path.relative_to(handoff_root).as_posix(): path.read_bytes()
+        for path in handoff_root.rglob("*")
+        if path.is_file()
+    }
+    manifest, weights = gen_tier2.update_handoff_manifest(root, oversample={3: 3.0})
+    data = tomllib.loads(manifest.read_text())
+    assert data["level_weights"] == weights
+    assert data["provenance"]["seed"] == 5
+    assert data["provenance"]["oversample"] == {"3": 3.0}
+    after = {
+        path.relative_to(handoff_root).as_posix(): path.read_bytes()
+        for path in handoff_root.rglob("*")
+        if path.is_file()
+    }
+    assert {name: bytes_ for name, bytes_ in after.items() if name != "manifest.toml"} == {
+        name: bytes_ for name, bytes_ in before.items() if name != "manifest.toml"
+    }
+    # idempotent: re-applying rewrites the same weights into the same manifest
+    _, weights_again = gen_tier2.update_handoff_manifest(root, oversample={3: 3.0})
+    assert weights_again == weights
+    assert tomllib.loads(manifest.read_text())["level_weights"] == weights
 
 
 def test_class_bank_generation_is_deterministic(tmp_path, small_class_banks):

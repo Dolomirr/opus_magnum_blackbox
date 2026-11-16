@@ -100,6 +100,36 @@ def test_manifest_applies_to_family_subdirs(tree):
     assert eval_.solutions == ()
 
 
+def test_level_weights_override_directory_default(tree):
+    """`[level_weights]` entries replace the directory weight for named variants only."""
+    (tree / "family/manifest.toml").write_text(
+        'cost_max = 7\nweight = 2.5\n\n[level_weights]\n"train/v00" = 5.0\n'
+    )
+    [weighted, sibling, eval_] = resolve_entries(
+        ["family/train/v00", "family/train/v01", "family/eval/v00"], levels_dir=tree
+    )
+    assert weighted.weight == 5.0
+    assert sibling.weight == 2.5
+    assert eval_.weight == 2.5
+
+
+def test_level_weights_unknown_name_raises(tree):
+    """A `[level_weights]` key matching no scanned level is a hard error."""
+    (tree / "family/manifest.toml").write_text(
+        'cost_max = 7\n\n[level_weights]\n"train/v99" = 3.0\n'
+    )
+    with pytest.raises(ValueError, match=r"level_weights.*train/v99"):
+        resolve_entries(["family/train/v00"], levels_dir=tree)
+
+
+def test_level_weights_non_number_raises(tree):
+    (tree / "family/manifest.toml").write_text(
+        'cost_max = 7\n\n[level_weights]\n"train/v00" = "heavy"\n'
+    )
+    with pytest.raises(TypeError, match="number"):
+        resolve_entries(["family/train/v00"], levels_dir=tree)
+
+
 def test_top_level_without_manifest_uses_default(tree):
     [entry] = resolve_entries(["toplevel"], levels_dir=tree)
     assert entry.cost_max == RewardConfig().cost_max
