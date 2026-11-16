@@ -33,6 +33,14 @@ om-validate file:
 gen-tier1 seed="0":
     uv run python -m opus_magnum_blackbox.gen_tier1 --seed {{seed}}
 
+# Regenerate tier-2 anywhere level bank
+gen-tier2 seed="0":
+    uv run python -m opus_magnum_blackbox.gen_tier2 --seed {{seed}}
+
+# Regenerate tier-2 per-class enumerated banks (tier2_single + tier2_handoff)
+gen-tier2-classes seed="0" eval_percent="20":
+    uv run python -m opus_magnum_blackbox.gen_tier2 --mode classes --seed {{seed}} --eval-percent {{eval_percent}}
+
 # Train the baseline policy on tier-0 level (default overfit config)
 train:
     uv run opus-magnum-blackbox train
@@ -40,6 +48,22 @@ train:
 # Run tier-1 curriculum training pipeline
 train-tier1:
     uv run opus-magnum-blackbox run configs/tier1_simple_arms.toml
+
+# Run tier-2 anywhere curriculum pipeline
+train-tier2:
+    uv run opus-magnum-blackbox run configs/tier2_anywhere.toml
+
+# Run tier-2 curriculum-split s(single-arm bank, ring-stratified SIL)
+train-tier2-single:
+    uv run opus-magnum-blackbox run configs/tier2_single.toml
+
+# Run tier-2 curriculum-split (handoff bank; fill [run] init_from first)
+train-tier2-handoff:
+    uv run opus-magnum-blackbox run configs/tier2_handoff.toml
+
+# Run tier-2 curriculum-split capacity arm (bigger model, fresh)
+train-tier2-single-big:
+    uv run opus-magnum-blackbox run configs/tier2_single_big.toml
 
 # Run the canonical tier-1 discovery recipe (BC seed + stratified self-imitation)
 train-tier1-discovery:
@@ -65,9 +89,13 @@ profile-config config="configs/profile_tier0.toml":
 # Tests
 # ===============================
 
-# Run test suite
+# Run default test suite
 test:
     uv run pytest
+
+# Run full test suite including corpus-scale coverage
+test-corpus:
+    uv run pytest --corpus
 
 # Run test suite with verbose logging
 test-verbose:

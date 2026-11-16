@@ -91,3 +91,20 @@ def known_solution_tokens(vocab: Vocab) -> list[int]:
         vocab.special_id("[SUBMIT]"),
     ]
     return tokens
+
+
+def pytest_addoption(parser):
+    parser.addoption("--corpus", action="store_true", default=False, help="include corpus-scale sweep tests")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "corpus: full-corpus sweeps; skipped unless --corpus is passed")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--corpus"):
+        return
+    skip = pytest.mark.skip(reason="corpus sweep; pass --corpus to include")
+    for item in items:
+        if "corpus" in item.keywords:
+            item.add_marker(skip)

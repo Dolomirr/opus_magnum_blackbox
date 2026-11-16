@@ -10,7 +10,8 @@ Token categories (each is a contiguous id range):
 | modes      | MODE_UNFIXED MODE_FIXED UNPLACED    | level config                  |
 | ctypes     | CTYPE_ENTRANCE CTYPE_EXIT           | encoder shape segments        |
 | atoms      | ATOM_NONE + one per real AtomType   | encoder typed cells           |
-| builtins   | BP_<name> implemented built-in      |                               |
+| builtins   | BP_<name> implemented built-in      | arm_lN = fixed-length arm,    |
+|            |                                     | hand rests on ring N          |
 | entrypoint | shape slots: ESHAPE_0..K-1          | resolved against current spec |
 | rotations  | ROT_0..5                            |                               |
 | coords     | Q_0..max_cols-1 , R_0..max_rows-1   | maps to Hex.s/r               |
@@ -104,6 +105,10 @@ def _resolve_builtins() -> tuple[Builtin, ...]:
 
 
 BUILTINS = _resolve_builtins()
+
+# Builtins registered mid-vocabulary right after `arm_piston` (static-length arms).
+# Frozen history: `insertion_permutation` relies on it; `tests/test_vocab.py` pins it.
+INSERTED_BUILTINS = ("arm_l2", "arm_l3", "arm_l4", "arm_l5", "arm_l6")
 
 # Debug prefixes for numeric categories; `name()` reproduces the token spelling.
 # fmt: off
@@ -223,3 +228,23 @@ class Vocab:
         `StepActionType` for action token, or None for NOP.
         """
         return self._step_types[action_id - self.base("action")]
+
+
+def insertion_permutation(old_vocab_size: int, vocab: Vocab) -> tuple[int, ...]:
+    """
+    Old->new token id map for a checkpoint predating the `INSERTED_BUILTINS` registration:
+    ids below inserted block keep their value,
+    ids at or above it shift by the block length.
+    The map is exact for old tokens, so remapped checkpoints reproduce previos behavior.
+
+    Raises ValueError when `old_vocab_size` is not aligned with current vocab + inserted
+    (for checkpoints continuity).
+    """
+    expected = len(vocab) - len(INSERTED_BUILTINS)
+    if old_vocab_size != expected:
+        raise ValueError(
+            f"checkpoint vocab {old_vocab_size} does not match the pre-insertion vocabulary {expected}"
+            f" (current {len(vocab)} minus the {len(INSERTED_BUILTINS)} inserted builtins)"
+        )
+    cut = vocab.builtin_id(INSERTED_BUILTINS[0])
+    return tuple(token_id if token_id < cut else token_id + len(INSERTED_BUILTINS) for token_id in range(old_vocab_size))

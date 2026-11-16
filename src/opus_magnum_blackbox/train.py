@@ -19,9 +19,11 @@ from torch import nn
 
 from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfig, TrainConfig
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv
+from opus_magnum_blackbox.grammar import LAYOUT_GROUP
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.profile import Timer
 from opus_magnum_blackbox.rollout import RolloutBatch, collect_batched, replicate_envs
+from opus_magnum_blackbox.vocab import INSERTED_BUILTINS, Vocab, insertion_permutation
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,37 @@ def _sil_row(batch: RolloutBatch, row: int) -> SILRow:
         action_masks=batch.action_masks[row, :length],
         valid=batch.valid[row, :length],
     )
+
+
+def _remap_vocab_ids(
+    state: dict[str, torch.Tensor], vocab: Vocab, perm: tuple[int, ...], seed: int
+) -> dict[str, torch.Tensor]:
+    """
+    Move vocab-indexed checkpoint weights onto current token ids:
+    embedding rows and policy-head columns accroding old->new permutation,
+    inserted builtins get small fresh random values.
+    Remap is reproducible within local rng.
+    """
+    fresh_ids = torch.tensor([vocab.builtin_id(name) for name in INSERTED_BUILTINS])
+    generator = torch.Generator().manual_seed(seed)
+    out = dict(state)
+
+    d_model = state["embed.weight"].shape[1]
+    embed = torch.empty(len(vocab) + 1, d_model)
+    embed[fresh_ids] = torch.randn(len(INSERTED_BUILTINS), d_model, generator=generator) * 0.02
+    embed[torch.tensor([*perm, len(vocab)])] = state["embed.weight"]
+    out["embed.weight"] = embed
+
+    head_weight = torch.empty(len(vocab), d_model)
+    head_weight[fresh_ids] = torch.randn(len(INSERTED_BUILTINS), d_model, generator=generator) * 0.02
+    head_weight[torch.tensor(perm)] = state["policy_head.weight"]
+    out["policy_head.weight"] = head_weight
+
+    head_bias = torch.empty(len(vocab))
+    head_bias[fresh_ids] = torch.randn(len(INSERTED_BUILTINS), generator=generator) * 0.02
+    head_bias[torch.tensor(perm)] = state["policy_head.bias"]
+    out["policy_head.bias"] = head_bias
+    return out
 
 
 class Trainer:
@@ -109,6 +142,13 @@ class Trainer:
         self._greedy_passes: dict[str, bool] = {}
         # Failed-and-buffered group size of the latest "fail" draw; logged as `sil_fail_group`.
         self._sil_fail_group: int | None = None
+        # Buffered handoff-class row count of the latest "stratify" draw; logged as `sil_handoff_group`.
+        self._sil_handoff_group: int | None = None
+        # Buffered ring-class row count of the latest "stratify" draw with `sil_label = "ring"`;
+        # logged as `sil_ring_group`.
+        self._sil_ring_group: int | None = None
+        # Vocab permutation applied by the latest warm start; logged in its metrics row.
+        self._warm_start_remap: dict | None = None
 
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
         """Sub-second precision: trainer + resume within one second must not share a run dir.
@@ -306,13 +346,22 @@ class Trainer:
         "fail": half from buffered levels whose latest greedy eval failed, half from
         the rest, both with replacement; falls back to uniform while either group
         is empty (also before the first eval).
+        "stratify": half from buffered rows of `sil_label`'s class — "handoff":
+        solutions with two or more arm placements (two or more arm placements in
+        the layout); "ring": solutions holding at least one non-`arm` arm
+        blueprint (a length-rare single) — half from the class, half from the
+        rest, both with replacement; falls back to uniform while either class
+        is empty.
         Records per-level picks into `_sil_replay_counts` for the `sil_replay_top` metric,
-        and the failed-group size into `_sil_fail_group` for the `sil_fail_group` metric.
+        the failed-group size into `_sil_fail_group` for the `sil_fail_group` metric,
+        the buffered handoff-class count into `_sil_handoff_group` for the
+        `sil_handoff_group` metric, and the buffered ring-class count into
+        `_sil_ring_group` for the `sil_ring_group` metric.
         """
         config = self.train_config
-        if config.sil_weighting not in ("uniform", "scarcity", "fail"):
+        if config.sil_weighting not in ("uniform", "scarcity", "fail", "stratify"):
             raise ValueError(
-                f"unknown sil_weighting: {config.sil_weighting!r}; expected 'uniform', 'scarcity' or 'fail'"
+                f"unknown sil_weighting: {config.sil_weighting!r}; expected 'uniform', 'scarcity', 'fail' or 'stratify'"
             )
         all_rows = list(self._sil_buffer.values())
         size = min(config.sil_batch_size, len(all_rows))
@@ -337,11 +386,73 @@ class Trainer:
                 rows = [failed[pick] for pick in failed_picks.tolist()] + [rest[pick] for pick in rest_picks.tolist()]
             else:
                 rows = uniform_rows()
+        elif config.sil_weighting == "stratify":
+            rows = self._stratify_rows(all_rows, size)
         else:
             rows = uniform_rows()
         for row in rows:
             self._sil_replay_counts[row.level] = self._sil_replay_counts.get(row.level, 0) + 1
         return rows
+
+    def _stratify_rows(self, all_rows: list[SILRow], size: int) -> list[SILRow]:
+        """
+        "stratify" draw: half from `sil_label`'s class, half from the rest, both
+        with replacement; uniform fallback while either class is empty.
+
+        "handoff": two or more arm placements; "ring": at least one non-`arm` arm
+        blueprint. The buffered class size is stamped onto the label's group
+        metric (`sil_handoff_group` / `sil_ring_group`).
+        """
+        config = self.train_config
+        if config.sil_label not in ("handoff", "ring"):
+            raise ValueError(f"unknown sil_label: {config.sil_label!r}; expected 'handoff' or 'ring'")
+        label, group_metric = (
+            (self._row_handoff, "_sil_handoff_group") if config.sil_label == "handoff" else (self._row_ring, "_sil_ring_group")
+        )
+        first = [row for row in all_rows if label(row)]
+        rest = [row for row in all_rows if not label(row)]
+        setattr(self, group_metric, len(first))
+        if first and rest:
+            half = size // 2
+            first_picks = torch.randint(len(first), (half,))
+            rest_picks = torch.randint(len(rest), (size - half,))
+            return [first[pick] for pick in first_picks.tolist()] + [rest[pick] for pick in rest_picks.tolist()]
+        picks = set(torch.randperm(len(all_rows))[:size].tolist())
+        return [row for index, row in enumerate(all_rows) if index in picks]
+
+    def _row_handoff(self, row: SILRow) -> bool:
+        """
+        Arm-count class label read off the buffered solution tokens: a layout with
+        two or more arm placements passes the atom between arms (handoff class).
+        """
+        vocab = self.envs[0].tokenizer.vocab
+        tokens = row.actions.tolist()
+        start = tokens.index(vocab.special_id("[START_LAYOUT]"))
+        end = tokens.index(vocab.special_id("[END_LAYOUT]"))
+        arms = sum(
+            vocab.is_in(name_token, "builtin") and vocab.builtin(name_token).manipulator
+            for name_token in tokens[start + 1 : end : LAYOUT_GROUP]
+        )
+        return arms >= 2
+
+    def _row_ring(self, row: SILRow) -> bool:
+        """
+        Arm-length class label read off the buffered solution tokens: a layout
+        holding at least one non-`arm` manipulator placement (an `arm_lN` ring or
+        a piston leg). On the single bank this concentrates replay on the
+        length-rare ring-2/ring-3 classes; the handoff label degenerates there
+        (every solve holds exactly one arm).
+        """
+        vocab = self.envs[0].tokenizer.vocab
+        tokens = row.actions.tolist()
+        start = tokens.index(vocab.special_id("[START_LAYOUT]"))
+        end = tokens.index(vocab.special_id("[END_LAYOUT]"))
+        return any(
+            vocab.is_in(name_token, "builtin")
+            and vocab.builtin(name_token).manipulator
+            and vocab.builtin(name_token).name != "arm"
+            for name_token in tokens[start + 1 : end : LAYOUT_GROUP]
+        )
 
     def _sil_minibatch(self, rows: list[SILRow]) -> RolloutBatch:
         """
@@ -607,6 +718,39 @@ class Trainer:
         np.random.set_state(rng["numpy"])
         return trainer
 
+    def warm_start(self, path: str | Path) -> None:
+        """
+        Load model weights from a checkpoint into the fresh policy; optimizer,
+        iteration counter and eval bookkeeping stay untouched (unlike `resume`).
+        A checkpoint model-config mismatch is a hard error.
+        A checkpoint from before the `INSERTED_BUILTINS` vocab insertion is
+        remapped onto current ids (`_remap_vocab_ids`; the permutation is exact
+        for old tokens) and recorded for the warm-start metrics row; a checkpoint
+        vocab incompatible with that event is a hard error.
+        """
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        model_config = payload["model_config"]
+        if model_config != asdict(self.model_config):
+            raise ValueError(
+                f"warm start from {path}: checkpoint model config {model_config} does not match {asdict(self.model_config)}"
+            )
+        state = dict(payload["model_state"])
+        vocab = self.envs[0].tokenizer.vocab
+        old_vocab_size = int(state["policy_head.weight"].shape[0])
+        self._warm_start_remap = None
+        if old_vocab_size != len(vocab):
+            embed_rows = int(state["embed.weight"].shape[0])
+            bias_size = int(state["policy_head.bias"].shape[0])
+            if embed_rows != old_vocab_size + 1 or bias_size != old_vocab_size:
+                raise ValueError(
+                    f"warm start from {path}: checkpoint has inconsistent vocab-sized shapes "
+                    f"(embed {embed_rows}, head {old_vocab_size}, bias {bias_size})"
+                )
+            perm = insertion_permutation(old_vocab_size, vocab)
+            state = _remap_vocab_ids(state, vocab, perm, self.train_config.seed)
+            self._warm_start_remap = {"from": old_vocab_size, "to": len(vocab), "inserted": list(INSERTED_BUILTINS)}
+        self.policy.load_state_dict(state)
+
     def _seed(self) -> None:
         seed = self.train_config.seed
         torch.manual_seed(seed)
@@ -652,6 +796,10 @@ class Trainer:
             entry["sil_replay_top"] = [[name, count] for name, count in ranked[:5]]
             if self._sil_fail_group is not None:
                 entry["sil_fail_group"] = self._sil_fail_group
+            if self._sil_handoff_group is not None:
+                entry["sil_handoff_group"] = self._sil_handoff_group
+            if self._sil_ring_group is not None:
+                entry["sil_ring_group"] = self._sil_ring_group
         if self.stage is not None:
             entry["stage"] = self.stage
         self._stamp_autodiscovery(entry)
@@ -712,6 +860,25 @@ class Trainer:
         with (self.run_dir / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(entry) + "\n")
         print(f"stage {stage} skipped | {reason}")
+
+    def _log_warm_start(self, source: str) -> None:
+        """
+        `warm_start` metrics row: this fresh run initialized its weights from a checkpoint.
+        """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "iteration": 0,
+            "warm_start": source,
+        }
+        if self._warm_start_remap is not None:
+            entry["vocab_remap"] = self._warm_start_remap
+        self._stamp_autodiscovery(entry)
+        entry["timestamp"] = datetime.now().isoformat()
+        with (self.run_dir / "metrics.jsonl").open("a") as file:
+            file.write(json.dumps(entry) + "\n")
+        remap = self._warm_start_remap
+        suffix = f" | vocab remapped {remap['from']}->{remap['to']}" if remap else ""
+        print(f"warm start | weights from {source}{suffix}")
 
     def _bank_counts(self) -> str:
         """

@@ -31,42 +31,30 @@ keeps the deterministic winner (lowest base, then clockwise, then shortest).
 
 from dataclasses import dataclass
 
-from opus_magnum_sym import (
-    AtomType,
-    ComponentType,
-    Hex,
-    Level,
-    LevelSpec,
-    ShapeCell,
-    ShapeTemplate,
-    StepActionType,
-    mkentr,
-    mkexit,
-)
+from opus_magnum_sym import AtomType, ComponentType, Hex, Level, LevelSpec, StepActionType, mkentr, mkexit
 
 from opus_magnum_blackbox.codec import OpusTokenizer, apply_solution, decode_solution, solution_to_oms
 from opus_magnum_blackbox.config import TokenizerConfig, VocabConfig
+from opus_magnum_blackbox.families._common import (
+    _CCLW,
+    _CLW,
+    _GRAB,
+    _RELEASE,
+    ENTRANCE_SHAPE,
+    EXIT_SHAPE,
+    RING_OFFSETS,
+    BoardSize,
+    FamilyError,
+    _cell_shape,
+    _entrypoint_pos,
+    hex_distance,
+)
 from opus_magnum_blackbox.grammar import Action, GrammarError, Placement, Solution
 from opus_magnum_blackbox.masking import ActionMasker
 from opus_magnum_blackbox.vocab import Vocab
 
-ENTRANCE_SHAPE = "entrance_1"
-EXIT_SHAPE = "exit_1"
-
-# rotation -> (dr, ds) hand offset around the arm base; rotation 0 is (-1, +1), CLW is +1
-RING_OFFSETS = ((-1, 1), (0, 1), (1, 0), (1, -1), (0, -1), (-1, 0))
-
 # one delivery cycle is GRAB + k turns + RELEASE + (6 - k) turns back: always 8 actions
 CYCLE_ACTIONS = 8
-
-_GRAB = StepActionType.GRAB
-_RELEASE = StepActionType.RELEASE
-_CLW = StepActionType.ROTATE_CLW
-_CCLW = StepActionType.ROTATE_CCLW
-
-
-class FamilyError(ValueError):
-    """Entrance/exit pair cannot be served by the single-arm family."""
 
 
 @dataclass(frozen=True)
@@ -78,14 +66,6 @@ class ArmPlan:
     base: Hex
     rotation: int  # starting rotation: the hand rests on the entrance
     program: tuple[StepActionType, ...]  # one action per step; step 0 is the first grab
-
-
-def hex_distance(a: Hex, b: Hex) -> int:
-    return (abs(a.r - b.r) + abs(a.s - b.s) + abs(a.r + a.s - b.r - b.s)) // 2
-
-
-# rows, cols of the rectangular board a spec is cut from
-type BoardSize = tuple[int, int]
 
 
 def single_atom_spec(  # noqa: PLR0913
@@ -208,6 +188,8 @@ def verify(spec: LevelSpec, sol: Solution | None = None) -> int:
     """
     Full builder check mirroring `solutions._validate`: token round-trip,
     mask-prefix validity, apply + run solves. Returns the solved step count.
+
+    Family-generic: pass `sol` explicitly for non-tier-1 reference solutions.
     """
     tokenizer = OpusTokenizer()
     vocab = tokenizer.vocab
@@ -284,17 +266,6 @@ def _solves(spec: LevelSpec, plan: ArmPlan) -> bool:
     for tick, action in enumerate(plan.program, 1):
         level.assign_step_action(arm.comp_id, tick, action)
     return level.run().solved
-
-
-def _cell_shape(name: str, kind: ComponentType, atom: AtomType) -> ShapeTemplate:
-    return ShapeTemplate(name=name, comp_type=kind, cells=(ShapeCell(offset=Hex(0, 0), atom_type=atom),), links=())
-
-
-def _entrypoint_pos(spec: LevelSpec, kind: ComponentType) -> Hex:
-    for ep in spec.entrypoints:
-        if ep.kind is kind and ep.pos is not None:
-            return ep.pos
-    raise FamilyError(f"spec has no fixed {kind.name.lower()} entrypoint")
 
 
 def _ring_neighbors(cell: Hex) -> list[Hex]:

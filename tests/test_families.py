@@ -157,3 +157,28 @@ def test_verify_rejects_unfixed_spec():
     assert not unfixed.entrypoints_fixed
     with pytest.raises(FamilyError):
         reference_oms(unfixed)
+
+
+# --- corpus sweep (marked, skipped unless `pytest --corpus`) ----------------------
+
+
+@pytest.mark.corpus
+def test_sweep_tier1_short_pairs_solve():
+    """
+    Every ordered pair in the family's domain (hex-distance 1-2) builds and verifies.
+
+    Pins the tier-1 domain against the board geometry: 170 distance-1 + 258
+    distance-2 pairs, target 2, no FamilyError anywhere.
+    """
+    cells = [Hex(row, col) for row in range(6) for col in range(6)]
+    counts: dict[int, int] = {}
+    for entrance in cells:
+        for exit_ in cells:
+            distance = hex_distance(entrance, exit_)
+            if entrance == exit_ or distance > 2:
+                continue
+            spec = single_atom_spec(entrance, exit_)
+            assert spec.target == 2
+            assert verify(spec) > 0
+            counts[distance] = counts.get(distance, 0) + 1
+    assert counts == {1: 170, 2: 258}

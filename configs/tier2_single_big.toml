@@ -1,0 +1,59 @@
+# Tier-2 curriculum split, stage E4: capacity arm, conditional on stage A (E3) failing.
+# Identical bank, seed and stage recipe to `configs/tier2_single.toml`; the only varied
+# knob is model capacity via the `[run] model` table (d_model 256, nhead 8, 3+3 layers,
+# feedforward 1024). No warm start: a bigger model cannot take the tier-1 checkpoint
+# (`Trainer.warm_start` treats a model-config mismatch as a hard error), and stage A
+# showed the size-128 model is not capacity-starved by initialization but by shape.
+# Readout: same thresholds as E3 (BC-end eval >= 0.35; ring-1 d1/d2 >= 0.6;
+# ring-2/ring-3 >= 0.5; wrong-blueprint demoted to a minor bucket).
+# Run: `just train-tier2-single-big`
+
+[run]
+levels          = ["tier2_single/train"]
+eval_levels     = ["tier2_single/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+autodiscovery   = 5      # new model: keep a real BC seed
+
+[run.model]
+d_model         = 256
+nhead           = 8
+encoder_layers  = 3
+decoder_layers  = 3
+dim_feedforward = 1024
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 100  # autodiscovery=5 scales this to 56
+lr                  = 1e-3
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5 # prevent overfit
+
+[[stage]]
+name                = "rl-shape"
+kind                = "rl"
+iterations          = 400
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.005
+shaping_weight      = 0.5 # delivery-fraction shaping on unsolved COMPLETED
+progress_weight     = 0.3
+
+[[stage]]
+name                = "rl-consolidate"
+kind                = "rl"
+iterations          = 2000        # ceiling, not target
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.001
+shaping_weight      = 0.0         # solve reward only
+sil_coef            = 0.4
+sil_batch_size      = 32
+sil_weighting       = "stratify"
+sil_label           = "ring"      # half the replay from non-`arm` (length-rare) solves
+eval_patience       = 20          # ~200 iterations without eval-bank improvement ends the stage
+# alpha/beta/gamma stay 0, epsilon 0, temperature 1
