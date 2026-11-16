@@ -24,6 +24,7 @@ lists) with the exact measurements, and the text refers to them.
 | hardening matrix | all label-free signals fail in distinct ways | keep the label; widen the family |
 | tier-2 mixed bank | held-out collapses to zero despite healthy train | augment fix, error taxonomy, static arms |
 | curriculum split | width was the ceiling; per-concept banks and rehearsal fix the rest | 256-wide model becomes the working default |
+| follow-up batch | width closed at 256; bootstrap cost measured; handoff held-out plateaus ~0.6 | tier-2 near-done; multi-reference supervision the one open lever; tier-3 next |
 
 ---
 
@@ -567,7 +568,115 @@ imperfectly.
 
 ---
 
-## 11. Measurement-methodology limitations (bugs that changed conclusions)
+## 11. Phase 10 — the follow-up batch: width closed, bootstrap cost measured, handoff plateau mapped (Nov 16)
+
+One preparation phase (per-level manifest weights, RL-skip rule, canonical handoff ranking,
+coverage probe script) plus a single unattended chain of six runs: a 384-wide probe on the
+single bank, a cloning-budget dial at the working width, and two handoff interventions
+(rare-slice oversampling, canonical references) against the standing mixed-rehearsal baseline.
+
+**Findings.**
+
+1. **Width is closed: 256 is the sweet spot.** The 384-wide model *underperformed* 256 under
+   the same recipe — its cloning stage reached a lower held-out rate and its best checkpoint
+   stayed below the 256 model's cloning-alone result, with the hardest slice (d1) worse, not
+   better. Combined with the earlier cliff, the picture is: 128 cannot extract the
+   length-selection concept even with full coverage and heavy RL; 256 extracts it from cloning
+   alone; 384 does not improve on 256. The capacity story is a step function at 256, not a
+   slope. (Caveat kept honestly: recipe sensitivity has burned one width comparison before —
+   the first 256 attempt diverged until its cloning recipe was fixed — so "384 worse" means
+   "384 worse under the recipe that works for 256", not "384 useless".)
+2. **The bootstrap cost of a new mechanic is now measured.** At the working width, on the
+   single-arm bank: roughly a third of the cloning budget already yields full-quality results;
+   at about an eighth of the budget the discovery stack (RL + ring-stratified replay) rescues
+   a half-learned policy to near-parity. A new datapoint on RL's role came for free: RL adds
+   *nothing* at ceiling (again) but adds enormously below it — its largest recorded gain on
+   this family.
+3. **Handoff held-out generalization has a plateau at roughly six-tenths, and it is robust.**
+   Neither oversampling the weak classes nor canonicalizing the mirrored reference topologies
+   moved held-out handoff beyond a few points over the baseline — and the canonical run shows
+   the earlier "d5 anomaly" framing was too narrow: the held-out gap is spread across all
+   handoff distances beyond d3, while the training slices are solved essentially perfectly
+   under every intervention. Three different levers now produce the same signature: the model
+   memorizes every trained handoff pair and generalizes the two-arm placement geometry only
+   partially to unseen positions. This looks like a structural property of the
+   two-arm-mapping function at this capacity, not a data or consistency artifact.
+4. **The best tier-2 agent to date is the oversampling run** — slightly better than the
+   previous best on combined held-out and clearly better on full-space coverage, with the
+   single-bank skill essentially retained.
+5. **The bootstrap cost of a mechanic is a data-volume cliff, not a smooth curve.** A
+   follow-up bank-size sweep (subsampling the single bank at 25/50/75/100 % of its 525
+   solutions, everything else fixed, eval always the complete 131-variant bank) showed held-out
+   performance that is essentially zero at a quarter coverage, a third at half coverage, most
+   of the way at three-quarters, and full only at full coverage (Data 11.5). Passes were held
+   fixed, so the binding variable is the number of *distinct* solutions, not total exposure.
+   The earlier "a few dozen instances per mode" rule was wrong in both directions: too little
+   for this concept, and coverage near the top still buys real held-out performance.
+
+**What it says about the architecture:** the stack's remaining tier-2 weakness is not
+capacity (384 did not help), not supervision volume (oversampling did not help held-out), and
+not reference consistency (canonicalization did not help) — it is that one arbitrary verified
+solution per level teaches a single-point target for a genuinely multi-modal function, and the
+model learns the trained points perfectly while interpolating the rest at ~0.6. The one untried
+lever that targets exactly this signature is multi-reference supervision: emit several
+distinct verified topologies per handoff pair, so cloning sees the solution *set* rather than
+one ranked member.
+
+**Data 11.1 — batch summary**
+
+| run | BC end: train / eval | best eval | final eval | end |
+|---|---|---|---|---|
+| 384-wide, single bank | 0.899 / 0.809 | 0.878 | 0.870 | early stop @ 800 |
+| dial k=9 (22 BC epochs) | 0.571 / 0.496 | 0.893 | 0.863 | early stop @ 1160 |
+| dial k=7 (67 BC epochs) | 0.971 / 0.863 | 0.947 | 0.947 | early stop @ 1250 |
+| dial k=5 (105 BC epochs) | 1.000 / 0.962 | 0.962 | 0.947 | early stop @ 800 |
+| oversample (E-c) | 0.975 / 0.762 | 0.810 combined | 0.802 | early stop @ 1500 |
+| canonical (E-d) | 0.952 / 0.726 | 0.798 combined | 0.790 | early stop @ 1770 |
+
+**Data 11.2 — width comparison on the single bank** (identical bank and recipe family)
+
+| model | cloning-alone held-out | best held-out | d1 slice at best | path |
+|---|---|---|---|---|
+| 128d | ≈ 0.16 | 0.763 | 19/34 (0.56) | ~3,700 RL iterations |
+| 256d | 0.962 | 0.962 | 30/34 (0.88) | cloning alone |
+| 384d | 0.809 | 0.878 | 27/34 (0.79) | cloning + 800 RL iters |
+
+**Data 11.3 — dial at 256d, single bank** (full budget = k=1 ≈ 190 epochs)
+
+| k | effective BC epochs | BC-end held-out | best after RL + replay | RL gain |
+|---|---|---|---|---|
+| 9 | 22 | 0.496 | 0.893 | +0.397 |
+| 7 | 67 | 0.863 | 0.947 | +0.084 |
+| 5 | 105 | 0.962 | 0.962 | 0.000 |
+
+**Data 11.4 — handoff arms** (held-out handoff bank, 121 variants; single-bank held-out for
+retention; full space = all 1260 pairs)
+
+| arm | handoff held-out | d5 held-out | d7–d10 held-out | single held-out | full-space total |
+|---|---|---|---|---|---|
+| baseline (R3, mixed rehearsal) | 72/121 (0.595) | 20/34 (0.588) | 3/14 | 127/131 (0.969) | 1172/1260 (0.930) |
+| oversample (E-c) | 80/121 (0.661) | 22/34 (0.647) | 5/14 | 124/131 (0.947) | 1211/1260 (0.961) |
+| canonical (E-d) | 73/121 (0.603) | 17/34 (0.500) | 4/14 | 128/131 (0.977) | 1205/1260 (0.956) |
+
+Handoff training slices under both interventions: solved at 0.998–1.000. The plateau is
+held-out only.
+
+**Data 11.5 — bank-size sweep** (single bank; subsample fractions of the 525 train solutions,
+fixed recipe m256 / 111 BC epochs, eval always the complete 131-variant bank)
+
+| train solutions | share of space | BC-end held-out | best held-out (RL + replay) |
+|---|---|---|---|
+| 131 | 25% | 0.061 | 0.076 |
+| 262 | 50% | 0.237 | 0.351 |
+| 394 | 75% | 0.786 | 0.840 |
+| 525 | 100% | 0.962 | 0.962 |
+
+All subsampled runs reached near-perfect *train* solve (≥ 0.958), i.e. they memorized their
+subsets; the differences are purely held-out generalization. RL + replay added little at the
+thin end (0.061 → 0.076), confirming the count of distinct solutions, not passes, is the
+binding variable at fixed budget.
+
+## 12. Measurement-methodology limitations (bugs that changed conclusions)
 
 Recorded separately because they are about the *ruler*, not the learner. Each changed a
 conclusion before it was found.
@@ -588,7 +697,7 @@ conclusion before it was found.
 
 ---
 
-## 12. Architecture conclusions (the distilled list)
+## 13. Architecture conclusions (the distilled list)
 
 1. **Policy gradient consolidates; it does not generate.** The gradient is an expectation over
    current behavior. What matters for learning a new behavior is its *reinforcement*
@@ -625,11 +734,19 @@ conclusion before it was found.
     via blur (temperature) failed in distinct, diagnostic ways (Data 8.1).
 11. **When cloning reaches the ceiling, RL adds nothing but risk.** The guard pattern
     (best-eval checkpointing + patience) is mandatory; an explicit skip rule is a cheap future
-    improvement (Data 10.3).
+    improvement (Data 10.3). Refined in phase 10: below ceiling, RL + replay is the strongest
+    refinement tool on record (Data 11.3) — the rule is "skip at ceiling, not always".
+12. **Width is a step function, not a slope.** The length-selection concept was unlearnable at
+    128, free at 256, and no better at 384 (Data 11.2). Capacity questions on this family are
+    settled by one bounded probe per width, not by scaling defaults.
+13. **One reference solution per level teaches a single-point target for a multi-modal
+    function.** Perfect training-slice memorization with ~0.6 held-out interpolation survived
+    oversampling and reference canonicalization (Data 11.4) — the remaining tier-2 gap is a
+    property of the supervision shape, and multi-reference emission is the matching lever.
 
 ---
 
-## 13. Decisions ledger
+## 14. Decisions ledger
 
 **Chosen:** sampled-stratified then enumerated banks; exhaustive per-variant eval; best-eval
 checkpointing; eval patience early stop; low entropy in consolidation; autodiscovery dial;
@@ -647,16 +764,21 @@ seed (zero signal — Data 5.3, 6.1); skipping the eval bank (unmeasurable); tie
 stage (distribution mismatch); procedural per-reset generation (deferred — bank sizes remain
 tractable); static-length grammar fields (wire-format break; blueprint insertion chosen
 instead); sharing the wider model across incompatible checkpoints (shape mismatch is a hard
-error by design).
+error by design); **384-wide default** (below 256 under the same recipe — Data 11.2);
+**further handoff tuning via oversampling or reference canonicalization** (held-out plateau
+robust to both — Data 11.4).
 
-**Open at the time of writing:** long-distance handoffs are data-limited (few dozen pairs per
-distance); oversampling them via manifest weights is the untried cheap lever. Solver
-canonicalization of mirrored handoff topologies is the next lever if the middle-distance class
-stalls again. Tier-3 (unfixed entrypoints) is planned on the validated per-concept skeleton.
+**Open at the time of writing:** multi-reference supervision for handoff pairs (emit several
+distinct verified topologies per level; targets the single-point-supervision signature
+directly) — the one untried tier-2 lever. Tier-3 (unfixed entrypoints) is next on the
+validated skeleton: per-concept bank + mixed rehearsal + the 256 model + the measured
+bootstrap recipe (roughly a third of the cloning budget per new mechanic, less with the
+discovery stack), warm-started from the oversampling run's checkpoint (the best tier-2 agent
+to date).
 
 ---
 
-## 14. Artifact index
+## 15. Artifact index
 
 Session reports (some later removed from the repo; their content is preserved above and in
 this session's transcript): `MODE_TOKEN.md` (mode-token naming diagnosis), `REPORT.md`
@@ -687,6 +809,11 @@ Key run directories (under `runs/`):
 | `20261115-230641` | round 2: extend A | 0.763 best @ 2000 |
 | `20261115-235504` | round 2: wide model | 0.962 from cloning alone |
 | `20261116-005140` | round 2: rehearsed handoff | handoff 0.595, single 0.969 |
+| `20261116-060738` | follow-up: 384-wide probe | 0.878 — below 256 |
+| `20261116-063808` / `065509` / `071930` | follow-up: dial at 256 | bootstrap cost measured |
+| `20261116-074844` | follow-up: oversample | best tier-2 agent; full-space 0.961 |
+| `20261116-084635` | follow-up: canonical refs | held-out unchanged — plateau confirmed |
+| `runs/batch_F3` | follow-up batch chain log | — |
 
 Config lineage: `configs/tier1_simple_arms.toml` (canonical tier-1), `tier1_disc_sil2.toml`
 (best tier-1 stack), `tier1_ad*.toml` (dial), `tier1_disc_{full,shaping,eps,sil,full_k10,sil2,
