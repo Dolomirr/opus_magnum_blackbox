@@ -670,3 +670,115 @@ def test_init_from_run_key_validation(tmp_path):
     path.write_text(template.format(key="init_form = 'runs/warm.pt'"))
     with pytest.raises(ValueError, match=r"unknown \[run\] keys"):
         load_pipeline(path)
+
+
+# --- [run] model: capacity arm (tier-2 E4) ---
+
+
+def test_model_override_parses_and_defaults_to_size_128(tmp_path):
+    """
+    An absent `[run] model` builds the current 128/4/2+2 model exactly;
+    a present table routes `ModelConfig` fields and tags the run dir with `m<d_model>`.
+    """
+    template = (
+        '[run]\nlevels = ["tier0_typed_delivery"]\n{key}\n[[stage]]\nname = "rl-a"\nkind = "rl"\niterations = 1\n'
+    )
+    path = _write_pipeline(tmp_path, template.format(key=""))
+    pipeline = load_pipeline(path)
+    assert pipeline.model_config == ModelConfig()
+    assert "m128" not in pipeline.tag
+
+    path.write_text(
+        template.format(
+            key="[run.model]\nd_model = 256\nnhead = 8\nencoder_layers = 3\ndecoder_layers = 3\ndim_feedforward = 1024"
+        )
+    )
+    pipeline = load_pipeline(path)
+    assert pipeline.model_config == ModelConfig(
+        d_model=256, nhead=8, encoder_layers=3, decoder_layers=3, dim_feedforward=1024
+    )
+    assert "m256" in pipeline.tag
+
+
+def test_model_override_rejects_unknown_and_mistyped_keys(tmp_path):
+    template = '[run]\nlevels = ["tier0_typed_delivery"]\n[run.model]\n{key}\n[[stage]]\nname = "rl-a"\nkind = "rl"\niterations = 1\n'
+    path = _write_pipeline(tmp_path, template.format(key="d_model = 256\nhidden_size = 512"))
+    with pytest.raises(ValueError, match=r"unknown \[run.model\] keys"):
+        load_pipeline(path)
+
+    for bad in ("d_model = 256.0", "d_model = true", "dropout = 1", "nhead = '8'"):
+        path.write_text(template.format(key=bad))
+        with pytest.raises(ValueError, match=r"\[run.model\]"):
+            load_pipeline(path)
+
+
+def test_model_override_builds_the_bigger_policy(tmp_path):
+    """The pipeline constructs `OpusPolicy` from the overridden `ModelConfig`."""
+    oms = tmp_path / "tier0_test.oms"
+    oms.write_text(TIER0_OMS.read_text())
+    path = _write_pipeline(
+        tmp_path,
+        """
+[run]
+levels = ["tier0_typed_delivery"]
+seed = 0
+device = "cpu"
+
+[run.model]
+d_model = 64
+nhead = 2
+encoder_layers = 1
+decoder_layers = 1
+dim_feedforward = 128
+
+[[stage]]
+name = "rl-a"
+kind = "rl"
+iterations = 1
+episodes = 2
+""",
+    )
+    pipeline = load_pipeline(path)
+    pipeline = replace(pipeline, train_config=replace(pipeline.train_config, run_dir=str(tmp_path)))
+    entries = [LevelEntry(source=make_spec(), cost_max=50, name="tier0_test", solutions=(oms,))]
+
+    run_dir = run_pipeline(pipeline, entries=entries)
+
+    payload = torch.load(run_dir / "stage_rl-a.pt", weights_only=False)
+    stored = payload["model_config"]
+    stored = asdict(stored) if isinstance(stored, ModelConfig) else stored
+    assert stored["d_model"] == 64
+    assert stored["nhead"] == 2
+
+
+def test_model_override_still_rejects_mismatched_warm_start(tmp_path):
+    """A bigger-model run cannot warm-start from a size-128 checkpoint."""
+    checkpoint = _warm_start_checkpoint(tmp_path)  # size-128 weights
+    oms = tmp_path / "tier0_test.oms"
+    oms.write_text(TIER0_OMS.read_text())
+    path = _write_pipeline(
+        tmp_path,
+        f"""
+[run]
+levels = ["tier0_typed_delivery"]
+seed = 0
+device = "cpu"
+init_from = "{checkpoint}"
+
+[run.model]
+d_model = 64
+nhead = 2
+
+[[stage]]
+name = "rl-a"
+kind = "rl"
+iterations = 1
+episodes = 2
+""",
+    )
+    pipeline = load_pipeline(path)
+    pipeline = replace(pipeline, train_config=replace(pipeline.train_config, run_dir=str(tmp_path)))
+    entries = [LevelEntry(source=make_spec(), cost_max=50, name="tier0_test", solutions=(oms,))]
+
+    with pytest.raises(ValueError, match="model config"):
+        run_pipeline(pipeline, entries=entries)

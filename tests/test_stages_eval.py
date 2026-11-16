@@ -188,7 +188,9 @@ def test_tier2_split_configs_parse_and_route_sil_label():
     handoff = load_pipeline("configs/tier2_handoff.toml")
     assert handoff.levels == ("tier2_handoff/train",)
     assert handoff.eval_levels == ("tier2_single/eval", "tier2_handoff/eval")
-    assert handoff.init_from is None  # filled with stage A's best_eval.pt at launch
+    assert handoff.init_from is not None  # stage A's best_eval.pt, filled at E5 launch
+    assert handoff.init_from.exists()
+    assert "tier2_single" in handoff.init_from.as_posix()  # stage A (single bank), not stage B
     assert handoff.stages[-1].train_config.sil_label == "handoff"
 
 
