@@ -19,7 +19,10 @@ Config schema:
     or `TrainConfig`/`RewardConfig` (rl).
     Unknown keys are a hard error naming the stage;
     `episodes` is alias for `episodes_per_iteration`;
-    `eval_patience` is an rl-only stage-level key (early stop on eval plateau).
+    `eval_patience` is an rl-only stage-level key (early stop on eval plateau);
+    `skip_when_bc_eval_gte` is an rl-only stage-level key (skip the stage when
+    the trainer's most recent bc-end held-out eval rate meets the threshold;
+    the `stage_skip` metrics row names the rate).
 
 Stages execute in order against one `Trainer` (one run dir).
 Each rl stage's `iterations` is absolute target over the global iteration counter,
@@ -103,6 +106,7 @@ class RLStage:
     train_config: TrainConfig  # run-level values (seed, device) overlaid with the routed keys
     reward_config: RewardConfig
     eval_patience: int | None = None  # end the stage after this many evals without eval-rate improvement
+    skip_when_bc_eval_gte: float | None = None  # skip entirely when the bc-end held-out eval rate meets this
 
 
 @dataclass(frozen=True)
@@ -283,6 +287,7 @@ def _parse_stage(raw: dict, run_config: TrainConfig) -> PretrainStage | RLStage:
         config = replace(PretrainConfig(), **routed.get(PretrainConfig, {}))
         return PretrainStage(name=name, config=config)
     eval_patience = _parse_eval_patience(keys, name)
+    skip_when_bc_eval_gte = _parse_skip_when_bc_eval_gte(keys, name)
     routed = _route_keys(keys, (RewardConfig, TrainConfig), name)
     train_fields = routed.get(TrainConfig, {})
     if "iterations" not in train_fields:
@@ -295,6 +300,7 @@ def _parse_stage(raw: dict, run_config: TrainConfig) -> PretrainStage | RLStage:
         train_config=train_config,
         reward_config=reward_config,
         eval_patience=eval_patience,
+        skip_when_bc_eval_gte=skip_when_bc_eval_gte,
     )
 
 
@@ -309,6 +315,18 @@ def _parse_eval_patience(raw: dict, stage_name: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"stage {stage_name!r}: `eval_patience` must be a positive integer, got {value!r}")
     return value
+
+
+def _parse_skip_when_bc_eval_gte(raw: dict, stage_name: str) -> float | None:
+    """
+    Stage-level rl key: skip the stage when the bc-end held-out eval rate meets this.
+    """
+    value = raw.pop("skip_when_bc_eval_gte", None)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        raise ValueError(f"stage {stage_name!r}: `skip_when_bc_eval_gte` must be a number in [0, 1], got {value!r}")
+    return float(value)
 
 
 def _route_keys(keys: dict, targets: tuple[type, ...], stage_name: str) -> dict[type, dict]:
@@ -389,7 +407,18 @@ def run_pipeline(
             else:
                 _run_pretrain_stage(trainer, entries, stage, seed=config.train_config.seed)
         else:
-            _run_rl_stage(trainer, envs, stage)
+            threshold = stage.skip_when_bc_eval_gte
+            bc_rate = trainer._last_bc_eval_rate
+            if threshold is not None and bc_rate is not None and bc_rate >= threshold:
+                # Cloning already at ceiling: RL can only risk it. Skip, but still checkpoint
+                # so resume sees the stage done.
+                trainer._log_stage_skip(
+                    stage.name,
+                    f"bc-end eval {bc_rate:.3f} meets skip_when_bc_eval_gte {threshold:g}",
+                    eval_solve_rate=bc_rate,
+                )
+            else:
+                _run_rl_stage(trainer, envs, stage)
         latest = trainer.save_checkpoint()
         shutil.copyfile(latest, trainer.run_dir / f"stage_{stage.name}.pt")
     return trainer.run_dir

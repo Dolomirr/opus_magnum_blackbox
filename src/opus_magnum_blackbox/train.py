@@ -132,6 +132,8 @@ class Trainer:
         self._entry_env_pools: dict[tuple[OpusEnv, ...], dict[str, OpusEnv]] = {}
         # Best eval-bank solve rate seen so far; drives `best_eval.pt`.
         self._best_eval_rate: float | None = None
+        # Most recent bc-end held-out eval rate (None before the first pretrain eval).
+        self._last_bc_eval_rate: float | None = None
         # Self-imitation buffer: latest solved episode per level name (see `_sil_step`).
         self._sil_buffer: dict[str, SILRow] = {}
         # Buffered solve counters per level name; drives replay weighting.
@@ -604,6 +606,7 @@ class Trainer:
             if epoch % config.eval_interval == 0 or epoch == config.epochs:
                 solve_rate = self.evaluate()
                 eval_solve_rate = self._greedy_solve_rate(self.eval_envs) if self.eval_envs else None
+                self._last_bc_eval_rate = eval_solve_rate
                 self._log_pretrain(stage_name, epoch, mean_loss, mean_accuracy, solve_rate, eval_solve_rate)
                 self._track_best_eval(eval_solve_rate)
                 if solve_rate >= config.early_stop_solve_rate and mean_loss <= config.early_stop_loss:
@@ -658,6 +661,7 @@ class Trainer:
             "train_config"    : asdict(self.train_config),
             "reward_config"   : asdict(self.reward_config),
             "best_eval_rate"  : self._best_eval_rate,
+            "last_bc_eval_rate": self._last_bc_eval_rate,
             "rng": {
                 "torch" : torch.get_rng_state(),
                 "cuda"  : torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -710,6 +714,7 @@ class Trainer:
             group["lr"] = trainer.train_config.lr
         trainer.iteration = payload["iteration"]
         trainer._best_eval_rate = payload.get("best_eval_rate")
+        trainer._last_bc_eval_rate = payload.get("last_bc_eval_rate")
 
         rng = payload["rng"]
         torch.set_rng_state(rng["torch"])
@@ -844,9 +849,10 @@ class Trainer:
             file.write(json.dumps(entry) + "\n")
         print(f"iter {self.iteration} | stage early stop | best eval {best_rate:.2f} / last {last_rate:.2f}")
 
-    def _log_stage_skip(self, stage: str, reason: str) -> None:
+    def _log_stage_skip(self, stage: str, reason: str, eval_solve_rate: float | None = None) -> None:
         """
-        `stage_skip` metrics row: the pipeline skipped this stage before it ran.
+        `stage_skip` metrics row: the pipeline skipped this stage before it ran;
+        `eval_solve_rate` names the rate the decision was based on, when there was one.
         """
         self.run_dir.mkdir(parents=True, exist_ok=True)
         entry = {
@@ -855,6 +861,8 @@ class Trainer:
             "stage_skip": True,
             "reason": reason,
         }
+        if eval_solve_rate is not None:
+            entry["eval_solve_rate"] = eval_solve_rate
         self._stamp_autodiscovery(entry)
         entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
