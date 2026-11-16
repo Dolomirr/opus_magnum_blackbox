@@ -1,0 +1,63 @@
+# E-d canonical handoff ranking: the supervision-side fix for the d5 anomaly.
+# Config is byte-identical to `configs/tier2_handoff_oversample.toml` (same R3 recipe,
+# same warm start); the intervention is the BANK itself: this run must execute AFTER
+# `just gen-tier2-classes` regenerates both banks under the canonical exit-side-longer
+# ranking, with NO `[level_weights]` table in the handoff manifest (the fresh manifest
+# has none — the regen wipes E-c's oversampling weights by design). Canonical references
+# remove the mirrored-topology flip, so the only difference vs E-c is consistency.
+# Readout: same thresholds as E-c; compare d5 held-out against R3 (0.588) and E-c to
+# isolate the consistency effect.
+# Position in the F3 chain: strictly AFTER `just gen-tier2-classes`.
+# Run: `just run-file configs/tier2_handoff_canon.toml`
+
+[run]
+levels          = ["tier2_handoff/train", "tier2_single/train"]
+eval_levels     = ["tier2_single/eval", "tier2_handoff/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+autodiscovery   = 5      # keep a real BC seed on top of the warm start
+# Warm start: stage R2 (`configs/tier2_single_big2.toml`) best checkpoint, eval 0.962:
+init_from       = "runs/20261115-235504-849534-tier2_single_train-tier2_single_big2-ad5-m256-lr0001-ent005-sh5-pg3-ent001-sil4-silb32-silwstratify-sillring/best_eval.pt"
+
+[run.model]
+d_model         = 256
+nhead           = 8
+encoder_layers  = 3
+decoder_layers  = 3
+dim_feedforward = 1024
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 200  # autodiscovery=5 scales this to 111
+lr                  = 1e-4 # validated m256 BC step (1e-3 diverges at 2x width)
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5  # prevent overfit
+
+[[stage]]
+name                = "rl-shape"
+kind                = "rl"
+iterations          = 400
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.005
+shaping_weight      = 0.5 # delivery-fraction shaping on unsolved COMPLETED
+progress_weight     = 0.3
+
+[[stage]]
+name                = "rl-consolidate"
+kind                = "rl"
+iterations          = 3000        # ceiling, not target
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.001
+shaping_weight      = 0.0         # solve reward only
+sil_coef            = 0.4
+sil_batch_size      = 32
+sil_weighting       = "stratify"
+sil_label           = "handoff"   # half the replay from two-arm (handoff) solves
+eval_patience       = 40          # ~400 iterations without eval-bank improvement ends the stage
+# alpha/beta/gamma stay 0, epsilon 0, temperature 1
