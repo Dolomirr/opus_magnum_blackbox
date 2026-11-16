@@ -36,7 +36,7 @@ The resolved TOML is copied into the run dir as `config.toml`.
 
 import shutil
 import tomllib
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 import torch
@@ -115,6 +115,9 @@ class PipelineConfig:
     autodiscovery: int = 1  # supervision switch: 1 keeps full BC, 10 removes it
     tag: str = ""  # run-dir suffix; empty derives from the source stem + non-default knobs
     init_from: Path | None = None  # warm-start checkpoint; model weights only
+    model_config: ModelConfig = field(
+        default_factory=ModelConfig
+    )  # `[run] model` overrides; default is the size-128 model
     source: Path | None = None  # resolved TOML path; copied into the run dir as config.toml
 
 
@@ -136,12 +139,22 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
     eval_levels = run.get("eval_levels", [])
     if eval_levels:
         resolve_entries(list(eval_levels))  # corpus validation
-    unknown_run_keys = set(run) - {"levels", "eval_levels", "seed", "device", "autodiscovery", "tag", "init_from"}
+    unknown_run_keys = set(run) - {
+        "levels",
+        "eval_levels",
+        "seed",
+        "device",
+        "autodiscovery",
+        "tag",
+        "init_from",
+        "model",
+    }
     if unknown_run_keys:
         raise ValueError(
             f"unknown [run] keys: {sorted(unknown_run_keys)}; known keys: "
-            + "levels, eval_levels, seed, device, autodiscovery, tag, init_from"
+            + "levels, eval_levels, seed, device, autodiscovery, tag, init_from, model"
         )
+    model_config = _parse_model_config(run.get("model", {}))
     init_from = run.get("init_from")
     if init_from is not None and (not isinstance(init_from, str) or not init_from):
         raise ValueError(f"[run] `init_from` must be a non-empty checkpoint path string, got {init_from!r}")
@@ -151,7 +164,7 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         isinstance(autodiscovery, bool)
         or not isinstance(autodiscovery, int)
         or not 1 <= autodiscovery <= 10
-    ): # fmt: skip
+    ):  # fmt: skip
         raise ValueError(f"[run] `autodiscovery` must be an integer in 1..10, got {autodiscovery!r}")
 
     tag = run.get("tag")
@@ -184,13 +197,37 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         profile=bool(profile.get("enabled", False)),
         eval_levels=tuple(eval_levels),
         autodiscovery=autodiscovery,
-        tag=tag if tag is not None else _derive_tag(Path(path), tuple(parsed), autodiscovery),
+        tag=tag if tag is not None else _derive_tag(Path(path), tuple(parsed), autodiscovery, model_config),
         init_from=Path(init_from) if init_from else None,
+        model_config=model_config,
         source=Path(path),
     )
 
 
-def _derive_tag(source: Path, stages: tuple[PretrainStage | RLStage, ...], autodiscovery: int) -> str:
+def _parse_model_config(raw: dict) -> ModelConfig:
+    """
+    `[run] model` table: `ModelConfig` field overrides; unknown key is a hard error.
+    An absent table keeps the default (size-128) model exactly.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"[run] `model` must be a table, got {raw!r}")  # noqa: TRY004 (config validation)
+    known = {item.name: item.type for item in fields(ModelConfig)}
+    unknown = sorted(set(raw) - set(known))
+    if unknown:
+        raise ValueError(f"unknown [run.model] keys: {unknown}; known keys: {sorted(known)}")
+    for key, value in raw.items():
+        expected = known[key]
+        if isinstance(value, bool) or not isinstance(value, int if expected is int else float):
+            raise ValueError(f"[run.model] `{key}` must be {expected.__name__}, got {value!r}")  # noqa: TRY004
+    return replace(ModelConfig(), **raw)
+
+
+def _derive_tag(
+    source: Path,
+    stages: tuple[PretrainStage | RLStage, ...],
+    autodiscovery: int,
+    model_config: ModelConfig,
+) -> str:
     """
     Run-dir suffix: config stem + autodiscovery dial + RL knobs that differ from
     `TrainConfig`/`RewardConfig` defaults, deduped in stage order. Config stems are
@@ -199,6 +236,9 @@ def _derive_tag(source: Path, stages: tuple[PretrainStage | RLStage, ...], autod
     tokens = [source.stem]
     if autodiscovery > 1:
         tokens.append(f"ad{autodiscovery}")
+    # non-default model shapes: distinguish capacity arms from the size-128 runs
+    if model_config != ModelConfig():
+        tokens.append(f"m{model_config.d_model}")
     seen = set(tokens)
     for stage in stages:
         if not isinstance(stage, RLStage):
@@ -314,7 +354,7 @@ def run_pipeline(
     if resume_dir is None:
         torch.manual_seed(config.train_config.seed)
         trainer = Trainer(
-            OpusPolicy(envs[0].tokenizer.config, ModelConfig()),
+            OpusPolicy(envs[0].tokenizer.config, config.model_config),
             envs,
             config.train_config,
             eval_envs=eval_envs,
