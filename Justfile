@@ -81,6 +81,10 @@ train-tier1-ad k:
 run-file file:
     uv run opus-magnum-blackbox run {{file}}
 
+# Coverage probe: greedy solved/total by class x distance x bank
+probe-file run ckpt banks="tier2_single/train tier2_single/eval tier2_handoff/train tier2_handoff/eval":
+    uv run python scripts/coverage.py {{run}} {{ckpt}} {{banks}}
+
 # Profile run: per-iteration sim vs model attribution (prints summary table)
 profile-config config="configs/profile_tier0.toml":
     uv run opus-magnum-blackbox run {{config}}
