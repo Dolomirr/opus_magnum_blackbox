@@ -16,7 +16,7 @@ from opus_magnum_blackbox.grammar import Action, GrammarError, Placement, spec_m
 from opus_magnum_blackbox.model import OpusPolicy
 from opus_magnum_blackbox.rollout import Episode, build_batch, build_supervised
 from opus_magnum_blackbox.solutions import SolutionLoadError, augment, load_solutions
-from opus_magnum_blackbox.train import Trainer
+from opus_magnum_blackbox.train import Trainer, bc_cycle_indices
 
 TIER0_OML = LEVELS_DIR / "tier0_typed_delivery.oml"
 TIER0_OMS = LEVELS_DIR / "tier0_typed_delivery.oms"
@@ -202,3 +202,105 @@ def test_pretrain_smoke_loss_decreases_and_resumes(tmp_path):
         assert torch.equal(resumed.policy.state_dict()[key], value)
     # BC stage lr must not leak into the restored RL optimizer state.
     assert resumed.optimizer.param_groups[0]["lr"] == resumed.train_config.lr
+
+
+@pytest.fixture
+def supervised_calls(monkeypatch) -> list[int]:
+    """
+    Batch identities passed to `_bc_update`, in call order — one call per
+    supervised entry batch per epoch at batch_size >= rows.
+    """
+    calls: list[int] = []
+    original = Trainer._bc_update
+
+    def spy(self, batch, rows, loss_scale=1.0):
+        calls.append(id(batch))
+        return original(self, batch, rows, loss_scale)
+
+    monkeypatch.setattr(Trainer, "_bc_update", spy)
+    return calls
+
+
+def _cycle_setup(tmp_path, names: list[str]) -> tuple[Trainer, list]:
+    """One cpu trainer plus one single-row supervised batch per entry name."""
+    oms = tmp_path / "tier0_test.oms"
+    oms.write_text(TIER0_OMS.read_text())
+    env = OpusEnv([LevelEntry(source=make_spec(), cost_max=50, name="tier0_test")])
+    config = TrainConfig(
+        iterations=1,
+        episodes_per_iteration=2,
+        eval_interval=10,
+        eval_episodes=2,
+        checkpoint_interval=10,
+        device="cpu",
+        run_dir=str(tmp_path),
+    )
+    torch.manual_seed(0)
+    trainer = Trainer(OpusPolicy(env.tokenizer.config, TINY), [env], config)
+    batches = []
+    for name in names:
+        entry = LevelEntry(source=make_spec(), cost_max=50, name=name, solutions=(oms,))
+        (tokens,) = load_solutions(entry)
+        batches.append(build_supervised([tokens], make_spec(), env.tokenizer, env.masker))
+    return trainer, batches
+
+
+def _epoch_groups(calls: list[int], batches: list, names: list[str], epochs: int) -> list[set[str]]:
+    id_to_name = {id(batch): name for batch, name in zip(batches, names, strict=True)}
+    per_epoch = len(calls) // epochs
+    return [
+        {id_to_name[calls[start + offset]] for offset in range(per_epoch)}
+        for start in range(0, len(calls), per_epoch)
+    ]
+
+
+def test_bc_cycle_indices_union_and_stream_independence():
+    picks = [tuple(bc_cycle_indices(6, 3, seed=7, epoch=epoch)) for epoch in range(1, 25)]
+    assert all(len(group) == 3 and len(set(group)) == 3 for group in picks)
+    assert sorted({index for group in picks for index in group}) == list(range(6))
+
+    torch.manual_seed(0)
+    first = bc_cycle_indices(6, 3, seed=7, epoch=9)
+    torch.manual_seed(1234)
+    assert bc_cycle_indices(6, 3, seed=7, epoch=9) == first  # dedicated generator: stream position is irrelevant
+
+
+def test_pretrain_without_bc_cycle_supervises_every_entry_every_epoch(tmp_path, supervised_calls):
+    names = [f"entry_{index}" for index in range(4)]
+    trainer, batches = _cycle_setup(tmp_path, names)
+    config = PretrainConfig(epochs=3, batch_size=32, eval_interval=1000, early_stop_solve_rate=1.0, early_stop_loss=0.0)
+    trainer.pretrain(batches, config)
+
+    groups = _epoch_groups(supervised_calls, batches, names, epochs=3)
+    assert groups == [{*names}] * 3  # absent key: fixed-set feeding, exactly today's behavior
+
+
+def test_pretrain_bc_cycle_supervises_subset_and_covers_all(tmp_path, supervised_calls):
+    names = [f"entry_{index}" for index in range(4)]
+    trainer, batches = _cycle_setup(tmp_path, names)
+    config = PretrainConfig(
+        epochs=8, batch_size=32, bc_cycle=2, eval_interval=1000, early_stop_solve_rate=1.0, early_stop_loss=0.0
+    )
+    trainer.pretrain(batches, config)
+
+    groups = _epoch_groups(supervised_calls, batches, names, epochs=8)
+    assert all(len(group) == 2 for group in groups)
+    assert set().union(*groups) == set(names)  # seeded cycling covers the whole bank
+
+
+def test_pretrain_bc_cycle_selection_is_seed_epoch_deterministic(tmp_path, supervised_calls):
+    names = [f"entry_{index}" for index in range(4)]
+    config = PretrainConfig(
+        epochs=4, batch_size=32, bc_cycle=2, eval_interval=1000, early_stop_solve_rate=1.0, early_stop_loss=0.0
+    )
+    trainer, batches = _cycle_setup(tmp_path, names)
+    trainer.pretrain(batches, config)
+    baseline = _epoch_groups(supervised_calls, batches, names, epochs=4)
+
+    # A resumed/restored trainer lands at an arbitrary global-rng position; the
+    # per-epoch subset must depend only on (seed, epoch), not the stream.
+    supervised_calls.clear()
+    trainer, batches = _cycle_setup(tmp_path, names)
+    torch.rand(1000)  # advance the global torch stream
+    trainer.pretrain(batches, config)
+    assert _epoch_groups(supervised_calls, batches, names, epochs=4) == baseline

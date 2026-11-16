@@ -168,6 +168,26 @@ skip_when_bc_eval_gte = 0.95
         load_pipeline(path)
 
 
+def test_bc_cycle_routes_to_pretrain_config(tmp_path):
+    text = """
+[run]
+levels = ["tier0_typed_delivery"]
+
+[[stage]]
+name = "bc"
+kind = "pretrain"
+epochs = 3
+bc_cycle = 131
+"""
+    path = _write_pipeline(tmp_path, text)
+    stage = load_pipeline(path).stages[0]
+    assert isinstance(stage, PretrainStage)
+    assert stage.config.bc_cycle == 131
+
+    path.write_text(text.replace("bc_cycle = 131\n", ""))
+    assert load_pipeline(path).stages[0].config.bc_cycle == 0  # absent key: fixed-set feeding
+
+
 def test_invalid_kind_and_missing_stages_rejected(tmp_path):
     path = _write_pipeline(
         tmp_path,
