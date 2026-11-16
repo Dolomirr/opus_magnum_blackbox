@@ -363,7 +363,7 @@ def _handoff_candidates(
                             peak = max(r_a_e, r_a_h) + max(r_b_h, r_b_x)
                             triplets = sum(len(arm.ticks) for arm in plan.arms)
                             key = (
-                                2, peak, triplets,
+                                2, -max(r_b_h, r_b_x), peak, triplets,
                                 a_base.r, a_base.s, b_base.r, b_base.s,
                                 r_a_e, r_a_h, r_b_x, hand.r, hand.s,
                             )  # fmt: skip
