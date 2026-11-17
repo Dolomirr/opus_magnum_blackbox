@@ -13,12 +13,14 @@ from opus_magnum_blackbox import stages
 from opus_magnum_blackbox.config import PretrainConfig
 from opus_magnum_blackbox.corpus import LEVELS_DIR
 from opus_magnum_blackbox.env import LevelEntry
-from opus_magnum_blackbox.families import anywhere_spec, anywhere_spec_plan, hex_distance
+from opus_magnum_blackbox.families import anywhere_spec, anywhere_spec_plan, hex_distance, placed_spec
 from opus_magnum_blackbox.gen_tier2 import SINGLE_BANK_DIR
+from opus_magnum_blackbox.gen_tier3 import split_configs
 from opus_magnum_blackbox.procedural import (
     build_pool,
     guard_excludes_eval,
     pair_key,
+    pool_family,
     procedural_epoch_batches,
 )
 from opus_magnum_blackbox.stages import PretrainStage, load_pipeline, run_pipeline
@@ -72,23 +74,27 @@ def _assert_same_data(first, second):
 
 def test_epoch_batches_solve_deterministically_and_are_epoch_keyed(tokenizer, masker, tiny_pool):
     config = _proc_config()
-    batches, failures = procedural_epoch_batches(tiny_pool, config, tokenizer, masker, (), seed=0, epoch=1)
+    batches, failures = procedural_epoch_batches(tiny_pool, pool_family("full"), config, tokenizer, masker, (), seed=0, epoch=1)
     assert failures == 0
     assert len(batches) == config.bc_cycle  # one supervised batch per sampled pair
 
     torch.rand(1000)  # advance the global stream: the epoch draw must not depend on it
-    repeated, repeated_failures = procedural_epoch_batches(tiny_pool, config, tokenizer, masker, (), seed=0, epoch=1)
+    repeated, repeated_failures = procedural_epoch_batches(
+        tiny_pool, pool_family("full"), config, tokenizer, masker, (), seed=0, epoch=1
+    )
     assert repeated_failures == 0
     _assert_same_data(batches, repeated)
 
-    other_epoch, other_failures = procedural_epoch_batches(tiny_pool, config, tokenizer, masker, (), seed=0, epoch=2)
+    other_epoch, other_failures = procedural_epoch_batches(
+        tiny_pool, pool_family("full"), config, tokenizer, masker, (), seed=0, epoch=2
+    )
     assert other_failures == 0
     assert any(
         not torch.equal(batch_a.encoder_input, batch_b.encoder_input)
         for batch_a, batch_b in zip(batches, other_epoch, strict=True)
     )  # different epochs draw different fresh instances
 
-    other_seed, _ = procedural_epoch_batches(tiny_pool, config, tokenizer, masker, (), seed=9, epoch=1)
+    other_seed, _ = procedural_epoch_batches(tiny_pool, pool_family("full"), config, tokenizer, masker, (), seed=9, epoch=1)
     assert any(
         not torch.equal(batch_a.encoder_input, batch_b.encoder_input)
         for batch_a, batch_b in zip(batches, other_seed, strict=True)
@@ -97,7 +103,7 @@ def test_epoch_batches_solve_deterministically_and_are_epoch_keyed(tokenizer, ma
 
 def test_epoch_batches_augment_variants_and_reject_oversized_cycle(tokenizer, masker, tiny_pool):
     config = _proc_config(augment=True, max_variants=4)
-    batches, failures = procedural_epoch_batches(tiny_pool, config, tokenizer, masker, (), seed=0, epoch=1)
+    batches, failures = procedural_epoch_batches(tiny_pool, pool_family("full"), config, tokenizer, masker, (), seed=0, epoch=1)
     assert failures == 0
     for batch in batches:
         # every emitted row is mask-valid padding-free supervision (augment validates on build)
@@ -105,7 +111,7 @@ def test_epoch_batches_augment_variants_and_reject_oversized_cycle(tokenizer, ma
         assert batch.decoder_length.eq(batch.valid.sum(dim=1)).all()
 
     with pytest.raises(ValueError, match="exceeds the 'full' pool size 6"):
-        procedural_epoch_batches(tiny_pool, _proc_config(bc_cycle=7), tokenizer, masker, (), seed=0, epoch=1)
+        procedural_epoch_batches(tiny_pool, pool_family("full"), _proc_config(bc_cycle=7), tokenizer, masker, (), seed=0, epoch=1)
 
 
 def test_procedural_keys_route_and_validate_at_load(tmp_path):
@@ -147,9 +153,9 @@ bc_cycle = 131
 
 def test_guard_rejects_eval_overlap_and_passes_disjoint_pools(tiny_pool):
     disjoint = anywhere_spec(Hex(0, 0), Hex(3, 3))  # d6 single, not among the tiny pairs
-    guard_excludes_eval(tiny_pool, [disjoint])
+    guard_excludes_eval(tiny_pool, [disjoint], pool_family("full"))
     with pytest.raises(ValueError, match="overlaps the eval bank"):
-        guard_excludes_eval(tiny_pool, [tiny_pool[1][2]])
+        guard_excludes_eval(tiny_pool, [tiny_pool[1][2]], pool_family("full"))
 
 
 def _bank_pair_keys(split: str) -> set[tuple[int, int, int, int]]:
@@ -206,7 +212,7 @@ def test_pool_compositions_match_spec():
 def test_real_pool_epoch_build_has_zero_failures(tokenizer, masker):
     pool = build_pool("full")
     config = _proc_config(bc_cycle=8)
-    batches, failures = procedural_epoch_batches(pool, config, tokenizer, masker, (), seed=0, epoch=1)
+    batches, failures = procedural_epoch_batches(pool, pool_family("full"), config, tokenizer, masker, (), seed=0, epoch=1)
     assert failures == 0  # every pool pair carries a simulator-verified spec
     assert len(batches) == 8
 
@@ -269,3 +275,74 @@ def test_pipeline_procedural_stage_runs_and_logs_failures(tmp_path, monkeypatch,
     bank_entries = [LevelEntry(source=make_spec(), cost_max=50, name="tier0_test", solutions=(TIER0_OMS,))]
     bank_run = run_pipeline(bank_pipeline, entries=bank_entries)
     assert all("bc_solve_failures" not in row for row in _read_stage_rows(bank_run, "bc"))
+
+
+# --- tier3_placed pool (placed-family registry entry) ---
+
+
+def test_tier3_pool_is_train_split_with_verified_specs():
+    pool = build_pool("tier3_placed")
+    train, eval_ = split_configs()
+    assert len(pool) == len(train) == 12
+    assert [config for config, _ in pool] == list(train)  # exactly the generator's train split, in emit order
+    assert all(not spec.entrypoints_fixed for _, spec in pool)
+    assert all(spec == placed_spec(config) for config, spec in pool)
+    pool_keys = {pool_family("tier3_placed").entry_key(entry) for entry in pool}
+    eval_keys = {(config.atom.name, config.target, config.long_arms) for config in eval_}
+    assert not pool_keys & eval_keys
+    assert len(pool_keys) == 12  # config identity is unique per entry
+
+
+def test_tier3_epoch_batches_zero_failures_and_seed_epoch_keying(tokenizer, masker):
+    pool = build_pool("tier3_placed")
+    family = pool_family("tier3_placed")
+    config = _proc_config(bc_cycle=4)
+    batches, failures = procedural_epoch_batches(pool, family, config, tokenizer, masker, (), seed=0, epoch=1)
+    assert failures == 0
+    assert len(batches) == 4
+
+    torch.rand(1000)  # advance the global stream: the draw must not depend on it
+    repeated, repeated_failures = procedural_epoch_batches(pool, family, config, tokenizer, masker, (), seed=0, epoch=1)
+    assert repeated_failures == 0
+    _assert_same_data(batches, repeated)
+
+    other_seed, _ = procedural_epoch_batches(pool, family, config, tokenizer, masker, (), seed=9, epoch=1)
+    assert any(
+        not torch.equal(batch_a.encoder_input, batch_b.encoder_input)
+        for batch_a, batch_b in zip(batches, other_seed, strict=True)
+    )
+
+
+def test_tier3_guard_passes_eval_split_and_raises_on_train_overlap():
+    family = pool_family("tier3_placed")
+    pool = build_pool("tier3_placed")
+    train, eval_ = split_configs()
+    guard_excludes_eval(pool, [placed_spec(config) for config in eval_], family)
+    with pytest.raises(ValueError, match="overlaps the eval bank"):
+        guard_excludes_eval(pool, [placed_spec(train[0])], family)
+
+
+def test_tier3_pool_routes_and_validates_at_load(tmp_path):
+    text = """
+[run]
+levels = ["tier0_typed_delivery"]
+
+[[stage]]
+name = "bc"
+kind = "pretrain"
+epochs = 1
+bc_source = "procedural"
+procedural_pool = "tier3_placed"
+bc_cycle = 4
+"""
+    path = tmp_path / "pipeline.toml"
+    path.write_text(text)
+    stage = load_pipeline(path).stages[0]
+    assert isinstance(stage, PretrainStage)
+    assert stage.config.bc_source == "procedural"
+    assert stage.config.procedural_pool == "tier3_placed"
+    assert stage.config.bc_cycle == 4
+
+    path.write_text(text.replace('procedural_pool = "tier3_placed"', 'procedural_pool = "everything"'))
+    with pytest.raises(ValueError, match="procedural_pool"):
+        load_pipeline(path)
