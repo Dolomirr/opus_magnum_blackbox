@@ -147,7 +147,7 @@ def placed_plan(spec: LevelSpec) -> PlacedPlan | None:
     a spec outside the family (fixed entrypoints, foreign shapes, allow-list,
     atom or target) raises `FamilyError`.
     """
-    config = _config_from_spec(spec)
+    config = placed_config(spec)
     _check_config(config, spec.steps, spec.size)
     return _solve_config(config, spec.steps, spec.size)
 
@@ -276,9 +276,10 @@ def _placed_level_spec(config: PlacedConfig, steps: int, size: BoardSize) -> Lev
     )
 
 
-def _config_from_spec(spec: LevelSpec) -> PlacedConfig:
+def placed_config(spec: LevelSpec) -> PlacedConfig:
     """
-    Re-derive the family config from a spec, for the reference functions.
+    Re-derive the family config from a spec, without solving: the identity the
+    procedural eval guard and pool keys compare.
     """
     if spec.entrypoints_fixed:
         raise FamilyError("the placed family serves unfixed-entrypoint specs only")

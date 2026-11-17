@@ -53,7 +53,13 @@ from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfi
 from opus_magnum_blackbox.corpus import resolve_entries
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv, spec_encoder_features
 from opus_magnum_blackbox.model import OpusPolicy
-from opus_magnum_blackbox.procedural import POOL_NAMES, build_pool, guard_excludes_eval, procedural_epoch_batches
+from opus_magnum_blackbox.procedural import (
+    POOL_NAMES,
+    build_pool,
+    guard_excludes_eval,
+    pool_family,
+    procedural_epoch_batches,
+)
 from opus_magnum_blackbox.profile import ProfiledEnv, ProfiledEnvs
 from opus_magnum_blackbox.rollout import RolloutBatch, build_supervised
 from opus_magnum_blackbox.solutions import augment, load_solutions
@@ -494,13 +500,14 @@ def _run_pretrain_stage(trainer: Trainer, entries: list[LevelEntry], stage: Pret
     tokenizer, masker = trainer.envs[0].tokenizer, trainer.envs[0].masker
     features = trainer.envs[0].encoder_features
     if stage.config.bc_source == "procedural":
+        family = pool_family(stage.config.procedural_pool)
         pool = build_pool(stage.config.procedural_pool, seed=seed)
         eval_specs = [_entry_spec(entry) for env in trainer.eval_envs for entry in env.levels]
-        guard_excludes_eval(pool, eval_specs)
+        guard_excludes_eval(pool, eval_specs, family)
 
         def epoch_batches(epoch: int) -> list[RolloutBatch]:
             batches, failures = procedural_epoch_batches(
-                pool, stage.config, tokenizer, masker, features, seed=seed, epoch=epoch
+                pool, family, stage.config, tokenizer, masker, features, seed=seed, epoch=epoch
             )
             trainer.bc_solve_failures = failures
             return batches
