@@ -37,6 +37,7 @@ class Episode:
     terminated     : bool             # False for truncated episodes
     level          : str = ""         # source level name (per-level dedup key)
     dead_end       : bool = False     # terminated by an empty grammar mask (env-forced failure)
+    encoder_features : np.ndarray | None = None  # derived per-spec side channel (None when off)
     # fmt: on
 
 
@@ -63,6 +64,7 @@ class RolloutBatch:
     solve_rate     : float
     mean_length    : float
     dead_ends      : int = 0      # episodes terminated by an empty grammar mask
+    encoder_features : torch.Tensor | None = None  # [B, F] derived side channel, None when off
     # fmt: on
 
 
@@ -98,7 +100,11 @@ def _forward_observation(policy: OpusPolicy, obs: dict, device) -> tuple[torch.T
     encoder_length = torch.tensor([obs["encoder_length"]], dtype=torch.long, device=device)
     decoder_history = torch.from_numpy(obs["decoder_history"]).unsqueeze(0).to(device)
     decoder_length_tensor = torch.tensor([decoder_length], dtype=torch.long, device=device)
-    logits, values = policy(encoder_input, encoder_length, decoder_history, decoder_length_tensor)
+    features = obs.get("encoder_features")
+    feature_tensor = None if features is None else torch.from_numpy(features).unsqueeze(0).to(device)
+    logits, values = policy(
+        encoder_input, encoder_length, decoder_history, decoder_length_tensor, encoder_features=feature_tensor
+    )
     return logits[0, decoder_length], values[0, decoder_length]
 
 
@@ -125,6 +131,7 @@ def collect_episode(  # noqa: PLR0913, PLR0917
     obs, _ = env.reset()
     encoder_input = obs["encoder_input"]
     encoder_length = int(obs["encoder_length"])
+    encoder_features = obs.get("encoder_features")
     tokens, masks, logprobs, values, rewards = [], [], [], [], []
     solved = terminated = False
     dead_end = False
@@ -172,6 +179,7 @@ def collect_episode(  # noqa: PLR0913, PLR0917
         terminated=terminated,
         level=str(info.get("level", "")),
         dead_end=dead_end,
+        encoder_features=encoder_features,
     )
 
 
@@ -200,11 +208,13 @@ class _Slot:
     values: list[float]
     rewards: list[float]
     dead_end: bool
+    encoder_features: np.ndarray | None = None
 
     def reset(self) -> None:
         self.obs, _ = self.env.reset()
         self.encoder_input = self.obs["encoder_input"]
         self.encoder_length = int(self.obs["encoder_length"])
+        self.encoder_features = self.obs.get("encoder_features")
         self.tokens, self.masks, self.logprobs, self.values, self.rewards, self.dead_end = [], [], [], [], [], False
 
     def episode(self, terminated: bool, info: dict, gamma: float) -> Episode:
@@ -224,6 +234,7 @@ class _Slot:
             terminated=terminated,
             level=str(info.get("level", "")),
             dead_end=bool(info.get("dead_end", False)),
+            encoder_features=self.encoder_features,
         )
 
 
@@ -246,7 +257,9 @@ def _shared_encoder_memory(
     if entry is None:
         encoder_input = torch.from_numpy(slots[0].encoder_input).unsqueeze(0).to(device)
         encoder_length = torch.tensor([slots[0].encoder_length], dtype=torch.long, device=device)
-        entry = policy.encode(encoder_input, encoder_length)
+        features = slots[0].encoder_features
+        feature_tensor = None if features is None else torch.from_numpy(features).unsqueeze(0).to(device)
+        entry = policy.encode(encoder_input, encoder_length, feature_tensor)
         cache[key] = entry
     memory, pad_mask = entry
     return memory.expand(len(slots), -1, -1), pad_mask.expand(len(slots), -1)
@@ -263,6 +276,7 @@ def _batched_step(  # noqa: PLR0913, PLR0917
     greedy: bool,
     explore_epsilon: float = 0.0,
     sample_temperature: float = 1.0,
+    encoder_features: torch.Tensor | None = None,
 ) -> tuple[list[int], list[float], list[float]]:
     """
     One policy decision for `rows` stacked observations
@@ -281,7 +295,7 @@ def _batched_step(  # noqa: PLR0913, PLR0917
     decoder_length = buffer[:, max_dec]
     action_mask = buffer[:, max_dec + 1 :] != 0
 
-    logits, values = policy(None, None, decoder_history, decoder_length, memory, memory_pad_mask)
+    logits, values = policy(None, None, decoder_history, decoder_length, memory, memory_pad_mask, encoder_features)
     index = decoder_length.view(-1, 1, 1)
     step_logits = logits.gather(1, index.expand(-1, 1, logits.shape[2])).squeeze(1)
     step_values = values.gather(1, decoder_length.view(-1, 1)).squeeze(1)
@@ -370,6 +384,7 @@ def collect_batched(  # noqa: PLR0913, PLR0917
     ]
     for slot in slots:
         slot.reset()
+    carry_features = slots[0].encoder_features is not None
 
     finished: list[Episode] = []
     active = list(slots)  # active count tracks remaining demand: no discarded replacement episodes
@@ -385,7 +400,12 @@ def collect_batched(  # noqa: PLR0913, PLR0917
             if shared is None:
                 encoder_input = torch.from_numpy(np.stack([slot.encoder_input for slot in active])).to(device)
                 encoder_length = torch.tensor([slot.encoder_length for slot in active], dtype=torch.long, device=device)
-                memory, memory_pad_mask = policy.encode(encoder_input, encoder_length)
+                features = (
+                    torch.from_numpy(np.stack([slot.encoder_features for slot in active])).to(device)
+                    if carry_features
+                    else None
+                )
+                memory, memory_pad_mask = policy.encode(encoder_input, encoder_length, features)
             else:
                 memory, memory_pad_mask = shared
 
@@ -394,6 +414,11 @@ def collect_batched(  # noqa: PLR0913, PLR0917
                 staging_rows[row, :max_dec] = obs["decoder_history"]
                 staging_rows[row, max_dec] = obs["decoder_length"]
                 staging_rows[row, max_dec + 1 :] = obs["action_mask"]
+            step_features = (
+                torch.from_numpy(np.stack([slot.encoder_features for slot in active])).to(device)
+                if carry_features
+                else None
+            )
             actions, logprobs, values = _batched_step(
                 policy,
                 staging,
@@ -405,6 +430,7 @@ def collect_batched(  # noqa: PLR0913, PLR0917
                 greedy,
                 explore_epsilon,
                 sample_temperature,
+                step_features,
             )
 
             # Snapshot: finishing slots may retire from `active` below.
@@ -442,6 +468,11 @@ def build_batch(episodes: list[Episode], pad_id: int) -> RolloutBatch:
     encoder_input  = torch.stack([torch.from_numpy(e.encoder_input) for e in episodes])
     encoder_length = torch.tensor([e.encoder_length for e in episodes], dtype=torch.long)
     decoder_length = torch.tensor([len(e.tokens) for e in episodes], dtype=torch.long)
+    features = (
+        torch.from_numpy(np.stack([e.encoder_features for e in episodes])).float()
+        if episodes[0].encoder_features is not None
+        else None
+    )
 
     actions        = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
     action_masks   = torch.zeros((batch_size, max_len, vocab_size), dtype=torch.bool)
@@ -476,6 +507,7 @@ def build_batch(episodes: list[Episode], pad_id: int) -> RolloutBatch:
         solve_rate=sum(e.solved for e in episodes) / batch_size,
         mean_length=sum(len(e.tokens) for e in episodes) / batch_size,
         dead_ends=sum(e.dead_end for e in episodes),
+        encoder_features=features,
     )
 
 
@@ -484,11 +516,12 @@ def build_supervised(
     spec: LevelSpec,
     tokenizer: OpusTokenizer,
     masker: ActionMasker,
+    encoder_features: np.ndarray | None = None,
 ) -> RolloutBatch:
     """
     Stack static solution sequences into the `RolloutBatch` format.
 
-    All rows share the given spec;
+    All rows share the given spec (and, when given, its derived feature vector);
     per-position masks are recomputed over each prefix,
     reward-derived fields are zeroed.
     """
@@ -500,6 +533,9 @@ def build_supervised(
     encoder_input = torch.from_numpy(padded).unsqueeze(0).repeat(batch_size, 1)
     encoder_length = torch.full((batch_size,), encoder_length, dtype=torch.long)
     decoder_length = torch.tensor([len(tokens) for tokens in sequences], dtype=torch.long)
+    features = (
+        torch.from_numpy(np.stack([encoder_features] * batch_size)).float() if encoder_features is not None else None
+    )
 
     actions = torch.full((batch_size, max_len), vocab.pad_id, dtype=torch.long)
     action_masks = torch.zeros((batch_size, max_len, len(vocab)), dtype=torch.bool)
@@ -526,4 +562,5 @@ def build_supervised(
         mean_return=0.0,
         solve_rate=0.0,
         mean_length=sum(len(tokens) for tokens in sequences) / batch_size,
+        encoder_features=features,
     )

@@ -40,14 +40,15 @@ def main(argv: list[str] | None = None) -> int:
         names = config["eval_levels"]
     entries = resolve_entries(list(names))
 
-    envs = [OpusEnv([entry]) for entry in entries]
+    features = tuple(torch.load(args.ckpt, map_location="cpu", weights_only=False).get("encoder_features", ()))
+    envs = [OpusEnv([entry], encoder_features=features) for entry in entries]
     policy, payload = load_policy(args.ckpt, envs[0].tokenizer.config)
     remap = payload.get("vocab_remap")
     remap_note = f" | vocab remapped {remap['from']}->{remap['to']}" if remap else ""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     policy.to(device)
 
-    tables = error_taxonomy(policy, entries, device)
+    tables = error_taxonomy(policy, entries, device, encoder_features=features)
     print(f"{args.ckpt} (iter {payload.get('iteration')}{remap_note}) over {len(entries)} variants: {', '.join(names)}")
     for group, table in tables.items():
         solved = sum(counts.get("solved", 0) for counts in table.values())

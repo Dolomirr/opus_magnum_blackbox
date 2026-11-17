@@ -124,11 +124,11 @@ def batch_taxonomy(batch: RolloutBatch, entries: list[LevelEntry], vocab: Vocab)
     }
 
 
-def error_taxonomy(policy: OpusPolicy, entries: list[LevelEntry], device) -> GroupTables:
+def error_taxonomy(policy: OpusPolicy, entries: list[LevelEntry], device, encoder_features: tuple[str, ...] = ()) -> GroupTables:
     """
     One deterministic greedy episode per entry, classified against its reference.
     """
-    envs = [OpusEnv([entry]) for entry in entries]
+    envs = [OpusEnv([entry], encoder_features=encoder_features) for entry in entries]
     batch = collect_batched(envs, policy, len(envs), device, greedy=True)
     return batch_taxonomy(batch, entries, envs[0].tokenizer.vocab)
 
@@ -146,7 +146,7 @@ def load_policy(path: str | Path, tokenizer_config) -> tuple[OpusPolicy, dict]:
     model_config = payload["model_config"]
     if not isinstance(model_config, ModelConfig):
         model_config = ModelConfig(**model_config)
-    policy = OpusPolicy(tokenizer_config, model_config)
+    policy = OpusPolicy(tokenizer_config, model_config, encoder_features=tuple(payload.get("encoder_features", ())))
     state = dict(payload["model_state"])
     vocab = Vocab(tokenizer_config.vocab)
     old_vocab_size = int(state["policy_head.weight"].shape[0])

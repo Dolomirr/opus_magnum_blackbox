@@ -1,0 +1,52 @@
+# Stage R1 — tier-1 modern baseline: the canonical tier-1 curriculum on the m256 model
+# with cycled BC feeding (stage-D recipe). Held-out target >= 0.90 on the complete
+# tier1_simple_arms/eval bank (old 128d lineage: 0.814). Doubles as the second-family
+# check of bc_cycle and the warm-start lineage anchor for later stages.
+# BC lr is the m256-standard 1e-4 (the tier-1 128d value 1e-3 diverged on m256 in the
+# first arm: runs/20261116-234310-308893-*), epochs doubled for cycled coverage.
+# Run: `just run-file configs/tier1_modern.toml`
+
+[run]
+levels          = ["tier1_simple_arms/train"]
+eval_levels     = ["tier1_simple_arms/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+
+[run.model]
+d_model         = 256
+nhead           = 8
+encoder_layers  = 3
+decoder_layers  = 3
+dim_feedforward = 1024
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 200 # cycled coverage (C1 precedent; early stop cuts it when train-bank greedy hits 1.0)
+lr                  = 1e-4 # m256-standard; first arm at 1e-3 churned (loss rose 0.18 -> 0.81, train-greedy stuck at ~0.01)
+batch_size          = 32
+augment             = true
+max_variants        = 16
+bc_cycle            = 85  # 25% of the 342-entry bank per epoch (C1 ratio)
+eval_interval       = 5
+early_stop_loss     = 0.5 # prevent overfit
+
+[[stage]]
+name                = "rl-shape"
+kind                = "rl"
+iterations          = 400
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.005
+shaping_weight      = 0.5 # delivery-fraction shaping on unsolved COMPLETED
+
+[[stage]]
+name                = "rl-consolidate"
+kind                = "rl"
+iterations          = 1000 # ceiling, not target
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.001
+shaping_weight      = 0.0  # solve reward only
+eval_patience       = 20   # ~200 iterations without eval-bank improvement ends the stage
+# alpha/beta/gamma stay 0

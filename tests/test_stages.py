@@ -168,6 +168,69 @@ skip_when_bc_eval_gte = 0.95
         load_pipeline(path)
 
 
+def test_encoder_features_routes_and_threads_through_pipeline(tmp_path):
+    oms = tmp_path / "tier0_test.oms"
+    oms.write_text(TIER0_OMS.read_text())
+    text = """
+[run]
+levels = ["tier0_typed_delivery"]
+seed = 0
+device = "cpu"
+encoder_features = ["distance", "ring_reach"]
+
+[[stage]]
+name = "bc"
+kind = "pretrain"
+epochs = 1
+batch_size = 32
+augment = false
+eval_interval = 1
+"""
+    path = _write_pipeline(tmp_path, text)
+    pipeline = load_pipeline(path)
+    assert pipeline.encoder_features == ("distance", "ring_reach")
+
+    path.write_text(text.replace('encoder_features = ["distance", "ring_reach"]', 'encoder_features = ["radius"]'))
+    with pytest.raises(ValueError, match=r"\[run\] unknown encoder features"):
+        load_pipeline(path)
+    path.write_text(text.replace('encoder_features = ["distance", "ring_reach"]\n', ""))
+    assert load_pipeline(path).encoder_features == ()  # absent key: off
+
+    entries = [LevelEntry(source=make_spec(), cost_max=50, name="tier0_test", solutions=(oms,))]
+    pipeline = replace(pipeline, train_config=replace(pipeline.train_config, run_dir=str(tmp_path)))
+    run_dir = run_pipeline(pipeline, entries=entries)
+
+    state = torch.load(run_dir / "stage_bc.pt", weights_only=False)["model_state"]
+    assert "encoder_feature_proj.weight" in state  # feature policy lineage
+    assert state["encoder_feature_proj.weight"].shape == (128, 4)
+    bc_entries = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text().splitlines()
+        if json.loads(line).get("stage") == "bc"
+    ]
+    assert [entry["iteration"] for entry in bc_entries] == [1]  # training ran end-to-end with the side channel
+
+
+def test_bc_cycle_routes_to_pretrain_config(tmp_path):
+    text = """
+[run]
+levels = ["tier0_typed_delivery"]
+
+[[stage]]
+name = "bc"
+kind = "pretrain"
+epochs = 3
+bc_cycle = 131
+"""
+    path = _write_pipeline(tmp_path, text)
+    stage = load_pipeline(path).stages[0]
+    assert isinstance(stage, PretrainStage)
+    assert stage.config.bc_cycle == 131
+
+    path.write_text(text.replace("bc_cycle = 131\n", ""))
+    assert load_pipeline(path).stages[0].config.bc_cycle == 0  # absent key: fixed-set feeding
+
+
 def test_invalid_kind_and_missing_stages_rejected(tmp_path):
     path = _write_pipeline(
         tmp_path,

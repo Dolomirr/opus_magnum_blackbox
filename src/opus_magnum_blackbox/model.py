@@ -13,7 +13,7 @@ and estimate value of state `s_t`.
 import torch
 from torch import nn
 
-from opus_magnum_blackbox.config import ModelConfig, TokenizerConfig
+from opus_magnum_blackbox.config import ModelConfig, TokenizerConfig, encoder_feature_dim
 from opus_magnum_blackbox.vocab import Vocab
 
 
@@ -26,10 +26,13 @@ class OpusPolicy(nn.Module):
         self,
         tokenizer_config: TokenizerConfig,
         model_config: ModelConfig | None = None,
+        encoder_features: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
 
         self.model_config = model_config or ModelConfig()
+        self.encoder_features = tuple(encoder_features)
+        self.encoder_feature_dim = encoder_feature_dim(self.encoder_features)
         self.vocab_size = len(Vocab(tokenizer_config.vocab))
         self.max_encoder_len = tokenizer_config.max_encoder_len
         self.max_decoder_len = tokenizer_config.max_decoder_len
@@ -41,6 +44,10 @@ class OpusPolicy(nn.Module):
         self.encoder_pos = nn.Embedding(tokenizer_config.max_encoder_len, cfg.d_model)
         # decoder input is shifted, so its one position longer than history
         self.decoder_pos = nn.Embedding(tokenizer_config.max_decoder_len + 1, cfg.d_model)
+        # derived relational side channel, projected once and added to every encoder position
+        self.encoder_feature_proj = (
+            nn.Linear(self.encoder_feature_dim, cfg.d_model) if self.encoder_feature_dim else None
+        )
 
         encoder_layer = nn.TransformerEncoderLayer(
             cfg.d_model,
@@ -79,6 +86,7 @@ class OpusPolicy(nn.Module):
         decoder_length: torch.Tensor,
         encoder_memory: torch.Tensor | None = None,
         encoder_pad_mask: torch.Tensor | None = None,
+        encoder_features: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Per-position logits `[B, W, vocab_size]` and values `[B, W]`,
@@ -99,6 +107,8 @@ class OpusPolicy(nn.Module):
                               (already sliced to `max(encoder_length)`);
                               when given, encoder_input/encoder_length are unused
             encoder_pad_mask: [B, E'] padding mask matching `encode` (True on padding)
+            encoder_features: [B, F] derived per-spec side channel, consumed by
+                              `encode` only (ignored by feature-less policies)
 
         Returns:
             Tuple:
@@ -113,7 +123,7 @@ class OpusPolicy(nn.Module):
         t_max = min(decoder_history.shape[1] + 1, int(decoder_length.max()) + 1)
         decoder_history = decoder_history[:, : t_max - 1]
         if encoder_memory is None:
-            encoder_memory, encoder_pad_mask = self.encode(encoder_input, encoder_length)
+            encoder_memory, encoder_pad_mask = self.encode(encoder_input, encoder_length, encoder_features)
 
         # BOS-shift: position 0 holds BOS, position i holds history token i-1.
         bos = torch.full((decoder_history.shape[0], 1), self.vocab_size, dtype=torch.long, device=device)
@@ -131,7 +141,12 @@ class OpusPolicy(nn.Module):
         )
         return self.policy_head(hidden), self.value_head(hidden).squeeze(-1)
 
-    def encode(self, encoder_input: torch.Tensor, encoder_length: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(
+        self,
+        encoder_input: torch.Tensor,
+        encoder_length: torch.Tensor,
+        encoder_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Encoder memory `[B, enc_max, d_model]` and
         padding mask `[B, enc_max]` (True on padding),
@@ -139,12 +154,15 @@ class OpusPolicy(nn.Module):
         columns beyond that are padding for every row,
         so the encoder never runs over them and they never reach cross-attention.
 
-        Pure function of the spec tokens:
+        Pure function of the spec tokens (plus the derived side channel when enabled):
         reusable across decoder steps while spec stays fixed.
 
         Args:
-            encoder_input:  [B, E] padded spec token ids
-            encoder_length: [B] true spec token counts
+            encoder_input:    [B, E] padded spec token ids
+            encoder_length:   [B] true spec token counts
+            encoder_features: [B, F] derived side channel; required by feature
+                              policies, ignored (must be None or any tensor) by
+                              feature-less ones
 
         Returns:
             Tuple:
@@ -156,9 +174,12 @@ class OpusPolicy(nn.Module):
         enc_max = int(encoder_length.max())
         enc_positions = torch.arange(enc_max, device=device)
         enc_pad = enc_positions.unsqueeze(0) >= encoder_length.unsqueeze(1)
-        memory = self.encoder(
-            self.embed(encoder_input[:, :enc_max]) + self.encoder_pos(enc_positions), src_key_padding_mask=enc_pad
-        )
+        embedded = self.embed(encoder_input[:, :enc_max]) + self.encoder_pos(enc_positions)
+        if self.encoder_feature_proj is not None:
+            if encoder_features is None:
+                raise ValueError("policy was built with encoder features but none were given")
+            embedded = embedded + self.encoder_feature_proj(encoder_features.to(device)).unsqueeze(1)
+        memory = self.encoder(embedded, src_key_padding_mask=enc_pad)
         return memory, enc_pad
 
     def masked_distribution(self, logits: torch.Tensor, action_mask: torch.Tensor) -> torch.distributions.Categorical:

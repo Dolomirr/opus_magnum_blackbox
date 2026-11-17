@@ -57,6 +57,29 @@ class ModelConfig:
     # fmt: on
 
 
+ENCODER_FEATURE_NAMES = ("distance", "ring_reach")
+"""
+Derived relational encoder features, in canonical vector order:
+
+- `distance`: normalized entrance->exit hex distance scalar.
+- `ring_reach`: per static-arm ring (arm, arm_l2, arm_l3), whether one ring-L
+  arm's in-board orbit passes through both entrypoint cells.
+"""
+
+
+def encoder_feature_dim(features: tuple[str, ...]) -> int:
+    """
+    Width of the derived-feature vector for the `encoder_features` knob.
+    Unknown or duplicate names raise.
+    """
+    unknown = [name for name in features if name not in ENCODER_FEATURE_NAMES]
+    if unknown:
+        raise ValueError(f"unknown encoder features {unknown}; known names: {list(ENCODER_FEATURE_NAMES)}")
+    if len(set(features)) != len(features):
+        raise ValueError(f"duplicate encoder features: {list(features)}")
+    return (1 if "distance" in features else 0) + (3 if "ring_reach" in features else 0)
+
+
 @dataclass(frozen=True)
 class TrainConfig:
     """
@@ -107,6 +130,9 @@ class PretrainConfig:
     eval_interval         : int   = 10
     early_stop_solve_rate : float = 1.0
     early_stop_loss       : float = 1e-3
+    bc_cycle              : int   = 0   # per-epoch supervised-entry subset size (cycled feeding); 0 = fixed-set (all entries every epoch); procedural mode: fresh instances sampled per epoch
+    bc_source             : str  = "bank" # supervised source: "bank" (materialized .oms entries) | "procedural" (solver-fed fresh pairs per epoch, bc_cycle sizes the draw)
+    procedural_pool       : str  = "full" # procedural pair pool: "full" (all train pairs) | "stratified_half" (seeded 50% per distance stratum) | "ring1" (d1/d2 pairs only)
     # fmt: on
 
 

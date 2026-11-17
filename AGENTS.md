@@ -51,6 +51,8 @@ src/opus_magnum_blackbox/
 ├── taxonomy.py  # greedy error-taxonomy probe: per-variant failure classes vs reference solutions
 ├── cli.py       # `train` / `eval` subcommands
 ├── corpus.py    # recursive levels/ scanner: entries, manifests, group resolution
+├── procedural.py # solver-fed BC source: procedural pools (train-split reproduction),
+                  # per-epoch fresh pair sampling, eval-exclusion guard
 ├── families/    # family modules: _common helpers, tier1, tier2_anywhere
 ├── gen_tier1.py # seeded tier-1 bank generator (.oml/.oms files + manifest)
 └── gen_tier2.py # tier-2 anywhere bank generator: sampled-stratified mixed bank (`--mode sample`, the default) + enumerated per-class banks (`--mode classes`)

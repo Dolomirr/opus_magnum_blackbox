@@ -39,11 +39,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    features = tuple(torch.load(args.ckpt, map_location="cpu", weights_only=False).get("encoder_features", ()))
     policy = None
     print(f"{args.ckpt} coverage over {args.run_dir} | banks: {', '.join(args.banks)}")
     for bank in args.banks:
         entries = resolve_entries([bank])
-        envs = [OpusEnv([entry]) for entry in entries]
+        envs = [OpusEnv([entry], encoder_features=features) for entry in entries]
         if policy is None:
             policy, payload = load_policy(args.ckpt, envs[0].tokenizer.config)
             policy.to(device)

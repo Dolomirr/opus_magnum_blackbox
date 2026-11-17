@@ -8,6 +8,7 @@ upgrades algorithm; batch format and everything outside is unaffected.
 import json
 import time
 import zlib
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -35,12 +36,13 @@ class SILRow:
     """
 
     # fmt: off
-    level          : str
-    encoder_input  : torch.Tensor # [E] int64
-    encoder_length : int
-    actions        : torch.Tensor # [T] int64
-    action_masks   : torch.Tensor # [T, V] bool
-    valid          : torch.Tensor # [T] bool
+    level            : str
+    encoder_input    : torch.Tensor               # [E] int64
+    encoder_length   : int
+    actions          : torch.Tensor               # [T] int64
+    action_masks     : torch.Tensor               # [T, V] bool
+    valid            : torch.Tensor               # [T] bool
+    encoder_features : torch.Tensor | None = None # [F] derived side channel, None when off
     # fmt: on
 
 
@@ -56,6 +58,7 @@ def _sil_row(batch: RolloutBatch, row: int) -> SILRow:
         actions=batch.actions[row, :length],
         action_masks=batch.action_masks[row, :length],
         valid=batch.valid[row, :length],
+        encoder_features=None if batch.encoder_features is None else batch.encoder_features[row],
     )
 
 
@@ -88,6 +91,17 @@ def _remap_vocab_ids(
     head_bias[torch.tensor(perm)] = state["policy_head.bias"]
     out["policy_head.bias"] = head_bias
     return out
+
+
+def bc_cycle_indices(num_batches: int, cycle: int, seed: int, epoch: int) -> list[int]:
+    """
+    Cycled BC feeding: per-epoch subset of `cycle` of `num_batches` supervised entry batches.
+    Deterministic in (seed, epoch) via dedicated generator,
+    so selection is independent of global rng stream.
+    """
+    generator = torch.Generator().manual_seed(zlib.crc32(f"bc-cycle:{seed}:{epoch}".encode()))
+    picks = torch.randperm(num_batches, generator=generator)[:cycle].tolist()
+    return sorted(picks)
 
 
 class Trainer:
@@ -151,6 +165,8 @@ class Trainer:
         self._sil_ring_group: int | None = None
         # Vocab permutation applied by the latest warm start; logged in its metrics row.
         self._warm_start_remap: dict | None = None
+        # Solver failures in latest procedural BC epoch, None in bank mode.
+        self.bc_solve_failures: int | None = None
 
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
         """Sub-second precision: trainer + resume within one second must not share a run dir.
@@ -266,7 +282,9 @@ class Trainer:
         action_masks = action_masks.clone()
         action_masks[~valid, self.pad_id] = True
 
-        logits, values = self.policy(encoder_input, encoder_length, actions, decoder_length)
+        logits, values = self.policy(
+            encoder_input, encoder_length, actions, decoder_length, encoder_features=batch.encoder_features
+        )
         # Drop the extra BOS output position: position t is distribution for target t.
         logits, values = logits[:, :-1], values[:, :-1]
 
@@ -474,6 +492,7 @@ class Trainer:
             valid[i, :length] = row.valid
 
         zeros = torch.zeros(batch_size, max_len)
+        features = None if rows[0].encoder_features is None else torch.stack([row.encoder_features for row in rows])
         return RolloutBatch(
             encoder_input=torch.stack([row.encoder_input for row in rows]),
             encoder_length=torch.tensor([row.encoder_length for row in rows], dtype=torch.long),
@@ -489,6 +508,7 @@ class Trainer:
             mean_return=0.0,
             solve_rate=0.0,
             mean_length=float(max_len),
+            encoder_features=features,
         )
 
     def _timed(self, name: str):
@@ -544,7 +564,7 @@ class Trainer:
         cache = self._entry_env_pools.setdefault(tuple(pool), {})
         env = cache.get(entry.name)
         if env is None:
-            env = OpusEnv([entry])
+            env = OpusEnv([entry], encoder_features=self.envs[0].encoder_features)
             cache[entry.name] = env
         return env
 
@@ -577,12 +597,23 @@ class Trainer:
         self._best_eval_rate = eval_solve_rate
         torch.save(self._checkpoint_payload(), self.run_dir / "best_eval.pt")
 
-    def pretrain(self, batches: list[RolloutBatch], config: PretrainConfig, stage: str | None = None) -> None:
+    def pretrain(
+        self,
+        batches: list[RolloutBatch] | Callable[[int], list[RolloutBatch]],
+        config: PretrainConfig,
+        stage: str | None = None,
+    ) -> None:
         """
         Behavior cloning: masked NLL on known solution sequences.
 
-        Each batch holds one level's supervised rows;
-        rows are reshuffled every epoch and sliced into `config.batch_size` steps.
+        `batches` is one supervised batch per level in bank mode (materialized
+        once), or an epoch-keyed callable returning that epoch's batches
+        (procedural source: the callable owns `bc_cycle` sizing and stamps
+        `bc_solve_failures`).
+
+        Bank-mode rows are reshuffled every epoch and sliced into
+        `config.batch_size` steps; `bc_cycle` selects a per-epoch subset via
+        `bc_cycle_indices`.
         Early-stops when train-bank greedy rate and mean loss both reach their targets;
         eval-bank rate is logged alongside when eval envs exist.
         """
@@ -593,9 +624,18 @@ class Trainer:
 
         stage_name = stage or "pretrain"
         for epoch in range(1, config.epochs + 1):
+            if callable(batches):
+                epoch_batches = batches(epoch)
+            else:
+                epoch_batches = batches
+                if 0 < config.bc_cycle < len(batches):
+                    epoch_batches = [
+                        batches[pick]
+                        for pick in bc_cycle_indices(len(batches), config.bc_cycle, self.train_config.seed, epoch)
+                    ]
             losses: list[float] = []
             accuracies: list[float] = []
-            for batch in batches:
+            for batch in epoch_batches:
                 order = torch.randperm(len(batch.decoder_length))
                 for start in range(0, len(order), config.batch_size):
                     loss, accuracy = self._bc_update(batch, order[start : start + config.batch_size])
@@ -639,7 +679,9 @@ class Trainer:
         action_masks = action_masks.clone()
         action_masks[~valid, self.pad_id] = True
 
-        logits, _ = self.policy(encoder_input, encoder_length, actions, decoder_length)
+        logits, _ = self.policy(
+            encoder_input, encoder_length, actions, decoder_length, encoder_features=batch.encoder_features
+        )
         dist = self.policy.masked_distribution(logits[:, :-1], action_masks)
         logprobs = dist.log_prob(actions)
         accuracy = dist.probs.argmax(dim=-1)[valid].eq(actions[valid]).float().mean()
@@ -660,6 +702,7 @@ class Trainer:
             "model_config"    : asdict(self.model_config),
             "train_config"    : asdict(self.train_config),
             "reward_config"   : asdict(self.reward_config),
+            "encoder_features": list(self.envs[0].encoder_features),
             "best_eval_rate"  : self._best_eval_rate,
             "last_bc_eval_rate": self._last_bc_eval_rate,
             "rng": {
@@ -704,7 +747,9 @@ class Trainer:
         train_config = train_config or TrainConfig(**payload["train_config"])
         reward_config = reward_config or RewardConfig(**payload["reward_config"])
 
-        policy = OpusPolicy(envs[0].tokenizer.config, model_config)
+        policy = OpusPolicy(
+            envs[0].tokenizer.config, model_config, encoder_features=tuple(payload.get("encoder_features", ()))
+        )
         policy.load_state_dict(payload["model_state"])
         trainer = cls(policy, envs, train_config, reward_config, model_config, eval_envs=eval_envs)
         trainer.optimizer.load_state_dict(payload["optimizer_state"])
@@ -915,6 +960,8 @@ class Trainer:
         }
         if eval_solve_rate is not None:
             entry["eval_solve_rate"] = eval_solve_rate
+        if self.bc_solve_failures is not None:
+            entry["bc_solve_failures"] = self.bc_solve_failures
         self._stamp_autodiscovery(entry)
         entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
