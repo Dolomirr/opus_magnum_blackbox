@@ -25,6 +25,7 @@ lists) with the exact measurements, and the text refers to them.
 | tier-2 mixed bank | held-out collapses to zero despite healthy train | augment fix, error taxonomy, static arms |
 | curriculum split | width was the ceiling; per-concept banks and rehearsal fix the rest | 256-wide model becomes the working default |
 | follow-up batch | width closed at 256; bootstrap cost measured; handoff held-out plateaus ~0.6 | tier-2 near-done; multi-reference supervision the one open lever; tier-3 next |
+| feeding + procedural cycle | cycled/solver-fed cloning validated; features dead; coverage law and no-extrapolation confirmed | recipe locked; tier-3 goes solver-first |
 
 ---
 
@@ -676,7 +677,85 @@ subsets; the differences are purely held-out generalization. RL + replay added l
 thin end (0.061 → 0.076), confirming the count of distinct solutions, not passes, is the
 binding variable at fixed budget.
 
-## 12. Measurement-methodology limitations (bugs that changed conclusions)
+## 12. Phase 11 — feeding mechanism, procedural BC, and the tier-3 unlock (Nov 16–17)
+
+Three linked efforts: the bank-size sweep follow-ups (why sparse banks fail), the
+feeding/features confirmation cycle, and the procedural solver-fed cloning confirmation.
+
+**Findings.**
+
+1. **Distinct-instance feeding is the mechanism (confirmed, twice).** Cycled feeding — fresh
+   seeded subsets of the full pool per epoch, budget equal to the failed static run — recovered
+   nearly all of the full-bank result on tier-2, and on tier-1 produced a fresh 256-wide
+   baseline clearly above the old 128-wide lineage from BC alone. Feeding controls *budget*;
+   it does not control *coverage* — cycling inside a partial pool is by definition the static
+   partial run.
+2. **Encoder side-channel features do not substitute for coverage (rejected).** Neither a bare
+   entrance→exit distance scalar nor a class-explicit per-ring reachability vector moved the
+   sparse-bank result; both landed near the failed baseline. Even handing the model the
+   relational answer does not generalize — representation is not the bottleneck, distinct
+   instances are.
+3. **A standing recipe rule, observed twice:** 256-wide behavior cloning diverges at lr 1e-3
+   (loss rising mid-training while token accuracy stays flat, and per-token independence makes
+   greedy ≈ accuracy^length) and works at 1e-4. Every m256 BC config uses 1e-4.
+4. **Procedural solver-fed cloning is validated end-to-end.** Training from zero with no
+   materialized train bank — every epoch's supervision freshly solved from sampled pairs —
+   matched bank-fed quality exactly, with zero solver failures across all epochs. The tier-3
+   data path exists.
+5. **The coverage law holds under procedural feeding.** Fresh specs drawn from a half-coverage
+   pool beat the static half-pool only modestly and stayed far from full-space performance;
+   and the well-covered classes degraded too — the class-competition signature, now confirmed
+   a third time.
+6. **No cross-class extrapolation exists.** Trained on ring-1 pairs only, the model solved the
+   seen classes at high rate and *never placed a long arm at all* on unseen classes — every
+   unseen-class failure was a wrong-blueprint, despite RL rolling out over the full space.
+   Classes absent from generation are never discovered later.
+7. **Incidental infrastructure proof:** an accidentally mis-configured rerun reproduced a
+   historical run value-identically across all its metrics rows with the new feeding/features
+   plumbing compiled in but inert — the strongest determinism and no-regression evidence to
+   date.
+
+**What it says about the architecture:** the data question is now precisely characterized.
+Feeding (fresh instances per epoch) solves budget; coverage (distinct pairs from the space)
+solves generalization; representation shortcuts solve neither; and class completeness is
+mandatory. Together these convert tier-3's prerequisite from "an enumerable bank" into "a fast
+verified solver plus an enumerated config space" — positions and solutions come from the
+solver, class quotas come from enumeration, and the bank survives only as an eval/rollout
+artifact.
+
+**Data 12.1 — feeding vs features confirmations** (static sparse baseline 0.076; full bank
+0.962; recovery bar 0.8; eval = complete 131-variant bank)
+
+| arm | setup | best held-out |
+|---|---|---|
+| cycled (C1) | 131-of-525 fresh subset/epoch | **0.95** |
+| features weak (C2) | static 131 + distance scalar | 0.130 |
+| features strong (C2) | static 131 + distance + ring reachability | 0.137 |
+| tier-1 modern (R1) | full tier-1 bank, m256, cycled BC at quarter budget | **0.9419** (BC-end alone 0.907; old 128d lineage 0.814) |
+
+**Data 12.2 — procedural confirmation** (from zero, no train bank, solver-fed, 131 pairs/epoch,
+same recipe; pools per plan)
+
+| run | pool | best held-out | slices at best |
+|---|---|---|---|
+| A pfull | full 525-pair space | **0.954** | d1 30/34, d2 51/51, d3 18/18, d4 22/24, d6 4/4 |
+| B phalf | stratified 50% (262 pairs) | 0.435 | d1 8/34, d2 27/51, d3 7/18, d4 13/24, d6 2/4 |
+| C pring1 | ring-1 pairs only | 0.595 | d1 29/34, d2 49/51; d3/d4/d6 **0/46** |
+
+Static coverage-curve references: 131 → 0.076, 262 → 0.351, 394 → 0.840, 525 → 0.962.
+C's unseen-class failures: all 46 wrong-blueprint. B's failures: 42 wrong-base, 19
+wrong-ticks, 13 wrong-blueprint. All runs logged `bc_solve_failures = 0` on every epoch.
+
+**Data 12.3 — supporting facts**
+
+- R1 arm 1 (diverged): BC loss 0.18 → 0.81 rising, token acc ≈ 0.93, train greedy 0.00–0.03;
+  0.93^56 ≈ 0.02 = its greedy rate. Config fix: lr 1e-3 → 1e-4.
+- Determinism proof: 1664 metrics rows reproduced value-identically (timestamps stripped) with
+  the new plumbing inert.
+- Augmentation generates no variants for single-placement solutions (nothing to shuffle) —
+  fresh per-epoch pairs are the only BC diversity source on simple solutions.
+
+## 13. Measurement-methodology limitations (bugs that changed conclusions)
 
 Recorded separately because they are about the *ruler*, not the learner. Each changed a
 conclusion before it was found.
@@ -697,7 +776,7 @@ conclusion before it was found.
 
 ---
 
-## 13. Architecture conclusions (the distilled list)
+## 14. Architecture conclusions (the distilled list)
 
 1. **Policy gradient consolidates; it does not generate.** The gradient is an expectation over
    current behavior. What matters for learning a new behavior is its *reinforcement*
@@ -743,17 +822,52 @@ conclusion before it was found.
     function.** Perfect training-slice memorization with ~0.6 held-out interpolation survived
     oversampling and reference canonicalization (Data 11.4) — the remaining tier-2 gap is a
     property of the supervision shape, and multi-reference emission is the matching lever.
+14. **Feeding solves budget; coverage solves generalization.** Fresh subsets per epoch recover
+    full-bank quality at a fraction of the budget (Data 12.1), but a partial pool fails under
+    any feeding (Data 12.2, B) — the two axes are independent and both must be satisfied.
+15. **Representation shortcuts do not substitute for instances.** Even class-explicit encoder
+    features left the sparse-bank result at the baseline (Data 12.1) — giving the model the
+    relation is not giving it the mapping.
+16. **No cross-class extrapolation.** Classes absent from the training generation are never
+    learned — not by RL over the full space, not from adjacent classes (Data 12.2, C). Every
+    class of the config space must be generated from the start.
+17. **Ignition is an operational threshold on sampled solve rate, not on greedy accuracy.**
+    Cloning's role is to move the sampling distribution into the reward-bearing region; once
+    sampled episodes solve at all, RL + stratified replay do the mode construction. At full
+    coverage, about an eighth of the cloning budget sufficed — greedy held-out was only half
+    at that point, yet the discovery stack closed nearly all of the rest (Data 11.3, k=9).
+    Below the threshold the failure is binary, not slow (zero solves across the whole no-BC
+    run, Data 5.3); at the ceiling, RL adds nothing (Data 11.3, k=5). Crucially, ignition is
+    cheap in *passes*, not in *coverage*: the dial holds coverage fixed and varies passes,
+    while the bank-size sweep shows thin coverage is rescued by nothing (Data 11.5). The two
+    axes must not be conflated when budgeting a new mechanic.
+18. **A new mechanic needs complete class enumeration plus near-complete within-class
+    coverage.** Within a class, training "starts working" around half coverage, becomes
+    reliable around three-quarters, and reaches full quality only at complete coverage
+    (Data 11.5, 12.2 B); classes absent entirely contribute exactly zero (Data 12.2, C).
+    Derived planning consequence for tier-3 (inference, not measurement): the space to
+    enumerate is level *configs* — small, so complete coverage is free — while positions live
+    in the solutions the solver emits. That makes the binding choice the per-config topology
+    policy: one canonical solution per config reduces the task to a small memorized lookup
+    (the tier-1 v1 lesson — works, but teaches no transferable skill); freshly varying
+    positions per epoch under procedural feeding is contradictory supervision on identical
+    inputs (the d5 mechanism, but universal); the middle ground is a small fixed set of
+    canonical topologies per config, which is exactly the multi-reference lever of
+    conclusion 13.
 
 ---
 
-## 14. Decisions ledger
+## 15. Decisions ledger
 
 **Chosen:** sampled-stratified then enumerated banks; exhaustive per-variant eval; best-eval
 checkpointing; eval patience early stop; low entropy in consolidation; autodiscovery dial;
 stratified replay at the moderate coefficient with the spec-derived rare-class label; static
 length-arm blueprints (wire insertion, not a grammar change; warm-start id remapping);
 warm start via model-weights-only loading; per-concept enumerated banks; mixed-diet rehearsal;
-the wider model as the working default.
+the wider model as the working default; **cycled BC feeding** (`bc_cycle`) wherever per-epoch
+budget is below bank size; **procedural solver-fed BC** (`bc_source = "procedural"`) as the
+tier-3 data path; **BC lr 1e-4 on the 256-wide model** (standing rule); the modern tier-1
+lineage (0.9419) as the tier-1 anchor.
 
 **Rejected, with the evidence that rejected them:** small sampled banks (memorized, v1);
 ε-uniform exploration (breaks working programs, no rare-slice gain — Data 6.1); progress
@@ -766,19 +880,20 @@ tractable); static-length grammar fields (wire-format break; blueprint insertion
 instead); sharing the wider model across incompatible checkpoints (shape mismatch is a hard
 error by design); **384-wide default** (below 256 under the same recipe — Data 11.2);
 **further handoff tuning via oversampling or reference canonicalization** (held-out plateau
-robust to both — Data 11.4).
+robust to both — Data 11.4); **encoder side-channel features** (class-explicit input did not
+move the sparse-bank result — Data 12.1).
 
 **Open at the time of writing:** multi-reference supervision for handoff pairs (emit several
 distinct verified topologies per level; targets the single-point-supervision signature
-directly) — the one untried tier-2 lever. Tier-3 (unfixed entrypoints) is next on the
-validated skeleton: per-concept bank + mixed rehearsal + the 256 model + the measured
-bootstrap recipe (roughly a third of the cloning budget per new mechanic, less with the
-discovery stack), warm-started from the oversampling run's checkpoint (the best tier-2 agent
-to date).
+directly) — the one untried tier-2 lever, and a candidate to build into the tier-3 solver from
+the start. Tier-3 (unfixed entrypoints) is next under the solver-first design: enumerated
+config space with per-class quotas, procedural BC, eval/rollout-only banks, per-concept staging
+with rehearsal, warm start from the tier-2 mixed checkpoint (design detail in
+`notes/tier3_readiness.md`).
 
 ---
 
-## 15. Artifact index
+## 16. Artifact index
 
 Session reports (some later removed from the repo; their content is preserved above and in
 this session's transcript): `MODE_TOKEN.md` (mode-token naming diagnosis), `REPORT.md`
@@ -787,7 +902,9 @@ this session's transcript): `MODE_TOKEN.md` (mode-token naming diagnosis), `REPO
 
 Plans: `.opencode/plan/` — `tier1_generalization.md`, `tier1_generalization_v2.md`,
 `tier1_autodiscovery_test.md`, `tier1_discovery_test.md`, `tier2_anywhere.md`,
-`tier2_curriculum_split.md`.
+`tier2_curriculum_split.md`, `tier2_followup_experiments.md`, `bc_feeding_and_features.md`,
+`procedural_bc_confirmation.md`. Stage reports for the last three live in
+`.opencode/report/`.
 
 Key run directories (under `runs/`):
 
@@ -814,6 +931,12 @@ Key run directories (under `runs/`):
 | `20261116-074844` | follow-up: oversample | best tier-2 agent; full-space 0.961 |
 | `20261116-084635` | follow-up: canonical refs | held-out unchanged — plateau confirmed |
 | `runs/batch_F3` | follow-up batch chain log | — |
+| `20261116-0941…1042` ×3 | bank-size sweep s25/s50/s75 | coverage cliff (Data 11.5) |
+| `20261116-213524` | cycled feeding (C1) | 0.076 → 0.95 at equal budget |
+| `20261116-215830` / `220644` | features weak / strong (C2) | 0.130 / 0.137 — rejected |
+| `20261116-234310` / `20261117-002502` | R1 tier-1 modern (diverged / fixed) | 0.02 / **0.9419** |
+| `20261116-235714` | accidental R2 | 1664-row value-identical reproduction |
+| `20261117-015433` / `021653` / `024935` | procedural A / B / C | 0.954 / 0.435 / 0.595 |
 
 Config lineage: `configs/tier1_simple_arms.toml` (canonical tier-1), `tier1_disc_sil2.toml`
 (best tier-1 stack), `tier1_ad*.toml` (dial), `tier1_disc_{full,shaping,eps,sil,full_k10,sil2,
