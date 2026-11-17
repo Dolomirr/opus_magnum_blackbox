@@ -1,0 +1,59 @@
+# Procedural BC confirmation, run B: solver-fed BC over a stratified 50% of the train
+# space (~262 pairs, seeded per-distance 50% cut — the procedural counterpart of the
+# static s50 bank). Identical to `configs/tier2_single_pfull.toml` except the pool.
+# Tests whether fresh-spec feeding beats the static-partial coverage curve (expected:
+# no — match the static s50 result instead).
+# Run: `just run-file configs/tier2_single_phalf.toml`
+
+[run]
+levels          = ["tier2_single/train"]
+eval_levels     = ["tier2_single/eval"]
+seed            = 0
+device          = "cuda" # force cuda
+autodiscovery   = 5      # the R2 supervision level: 111 effective BC epochs
+
+[run.model]
+d_model         = 256
+nhead           = 8
+encoder_layers  = 3
+decoder_layers  = 3
+dim_feedforward = 1024
+
+[[stage]]
+name                = "bc"
+kind                = "pretrain"
+epochs              = 200  # autodiscovery=5 scales this to 111
+lr                  = 1e-4 # validated m256 BC step
+batch_size          = 32
+augment             = true
+max_variants        = 16
+eval_interval       = 5
+early_stop_loss     = 0.5  # prevent overfit
+bc_source           = "procedural"
+procedural_pool     = "stratified_half" # seeded 50% per distance stratum, every class present
+bc_cycle            = 131               # fresh solver-fed instances per epoch
+
+[[stage]]
+name                = "rl-shape"
+kind                = "rl"
+iterations          = 400
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.005
+shaping_weight      = 0.5 # delivery-fraction shaping on unsolved COMPLETED
+progress_weight     = 0.3
+
+[[stage]]
+name                = "rl-consolidate"
+kind                = "rl"
+iterations          = 3000        # ceiling, not target
+episodes            = 32
+lr                  = 1e-4
+entropy_coef        = 0.001
+shaping_weight      = 0.0         # solve reward only
+sil_coef            = 0.4
+sil_batch_size      = 32
+sil_weighting       = "stratify"
+sil_label           = "ring"      # half the replay from non-`arm` (length-rare) solves
+eval_patience       = 40          # ~400 iterations without eval-bank improvement ends the stage
+# alpha/beta/gamma stay 0, epsilon 0, temperature 1
