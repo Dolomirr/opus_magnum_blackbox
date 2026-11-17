@@ -53,6 +53,7 @@ from opus_magnum_blackbox.config import ModelConfig, PretrainConfig, RewardConfi
 from opus_magnum_blackbox.corpus import resolve_entries
 from opus_magnum_blackbox.env import LevelEntry, OpusEnv, spec_encoder_features
 from opus_magnum_blackbox.model import OpusPolicy
+from opus_magnum_blackbox.procedural import POOL_NAMES, build_pool, guard_excludes_eval, procedural_epoch_batches
 from opus_magnum_blackbox.profile import ProfiledEnv, ProfiledEnvs
 from opus_magnum_blackbox.rollout import RolloutBatch, build_supervised
 from opus_magnum_blackbox.solutions import augment, load_solutions
@@ -300,6 +301,7 @@ def _parse_stage(raw: dict, run_config: TrainConfig) -> PretrainStage | RLStage:
     if kind == "pretrain":
         routed = _route_keys(keys, (PretrainConfig, RewardConfig), name)
         config = replace(PretrainConfig(), **routed.get(PretrainConfig, {}))
+        _validate_bc_source(config, name)
         return PretrainStage(name=name, config=config)
     eval_patience = _parse_eval_patience(keys, name)
     skip_when_bc_eval_gte = _parse_skip_when_bc_eval_gte(keys, name)
@@ -317,6 +319,25 @@ def _parse_stage(raw: dict, run_config: TrainConfig) -> PretrainStage | RLStage:
         eval_patience=eval_patience,
         skip_when_bc_eval_gte=skip_when_bc_eval_gte,
     )
+
+
+def _validate_bc_source(config: PretrainConfig, stage_name: str) -> None:
+    """
+    Load-time value validation for the procedural-source keys:
+    unknown pool or source names, and procedural mode
+    without positive per-epoch draw, fail at config parse instead of mid-stage.
+    """
+    if config.bc_source not in ("bank", "procedural"):
+        raise ValueError(f"stage {stage_name!r}: `bc_source` must be 'bank' or 'procedural', got {config.bc_source!r}")
+    if config.procedural_pool not in POOL_NAMES:
+        raise ValueError(
+            f"stage {stage_name!r}: `procedural_pool` must be one of {list(POOL_NAMES)}, got {config.procedural_pool!r}"
+        )
+    if config.bc_source == "procedural" and config.bc_cycle < 1:
+        raise ValueError(
+            f"stage {stage_name!r}: procedural `bc_source` needs `bc_cycle` >= 1 (the per-epoch instance count), "
+            f"got {config.bc_cycle}"
+        )
 
 
 def _parse_eval_patience(raw: dict, stage_name: str) -> int | None:
@@ -472,6 +493,20 @@ def _resume_trainer(
 def _run_pretrain_stage(trainer: Trainer, entries: list[LevelEntry], stage: PretrainStage, seed: int) -> None:
     tokenizer, masker = trainer.envs[0].tokenizer, trainer.envs[0].masker
     features = trainer.envs[0].encoder_features
+    if stage.config.bc_source == "procedural":
+        pool = build_pool(stage.config.procedural_pool, seed=seed)
+        eval_specs = [_entry_spec(entry) for env in trainer.eval_envs for entry in env.levels]
+        guard_excludes_eval(pool, eval_specs)
+
+        def epoch_batches(epoch: int) -> list[RolloutBatch]:
+            batches, failures = procedural_epoch_batches(
+                pool, stage.config, tokenizer, masker, features, seed=seed, epoch=epoch
+            )
+            trainer.bc_solve_failures = failures
+            return batches
+
+        trainer.pretrain(epoch_batches, stage.config, stage=stage.name)
+        return
     batches: list[RolloutBatch] = []
     variant_seed = seed
     for entry in entries:

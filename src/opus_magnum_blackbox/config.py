@@ -130,7 +130,9 @@ class PretrainConfig:
     eval_interval         : int   = 10
     early_stop_solve_rate : float = 1.0
     early_stop_loss       : float = 1e-3
-    bc_cycle              : int   = 0   # per-epoch supervised-entry subset size (cycled feeding); 0 = fixed-set (all entries every epoch)
+    bc_cycle              : int   = 0   # per-epoch supervised-entry subset size (cycled feeding); 0 = fixed-set (all entries every epoch); procedural mode: fresh instances sampled per epoch
+    bc_source             : str  = "bank" # supervised source: "bank" (materialized .oms entries) | "procedural" (solver-fed fresh pairs per epoch, bc_cycle sizes the draw)
+    procedural_pool       : str  = "full" # procedural pair pool: "full" (all train pairs) | "stratified_half" (seeded 50% per distance stratum) | "ring1" (d1/d2 pairs only)
     # fmt: on
 
 

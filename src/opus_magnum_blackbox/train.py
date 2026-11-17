@@ -8,6 +8,7 @@ upgrades algorithm; batch format and everything outside is unaffected.
 import json
 import time
 import zlib
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -164,6 +165,8 @@ class Trainer:
         self._sil_ring_group: int | None = None
         # Vocab permutation applied by the latest warm start; logged in its metrics row.
         self._warm_start_remap: dict | None = None
+        # Solver failures in latest procedural BC epoch, None in bank mode.
+        self.bc_solve_failures: int | None = None
 
         self.run_dir = Path(self.train_config.run_dir) / self._run_name()
         """Sub-second precision: trainer + resume within one second must not share a run dir.
@@ -594,12 +597,23 @@ class Trainer:
         self._best_eval_rate = eval_solve_rate
         torch.save(self._checkpoint_payload(), self.run_dir / "best_eval.pt")
 
-    def pretrain(self, batches: list[RolloutBatch], config: PretrainConfig, stage: str | None = None) -> None:
+    def pretrain(
+        self,
+        batches: list[RolloutBatch] | Callable[[int], list[RolloutBatch]],
+        config: PretrainConfig,
+        stage: str | None = None,
+    ) -> None:
         """
         Behavior cloning: masked NLL on known solution sequences.
 
-        Each batch holds one level's supervised rows;
-        rows are reshuffled every epoch and sliced into `config.batch_size` steps.
+        `batches` is one supervised batch per level in bank mode (materialized
+        once), or an epoch-keyed callable returning that epoch's batches
+        (procedural source: the callable owns `bc_cycle` sizing and stamps
+        `bc_solve_failures`).
+
+        Bank-mode rows are reshuffled every epoch and sliced into
+        `config.batch_size` steps; `bc_cycle` selects a per-epoch subset via
+        `bc_cycle_indices`.
         Early-stops when train-bank greedy rate and mean loss both reach their targets;
         eval-bank rate is logged alongside when eval envs exist.
         """
@@ -610,9 +624,15 @@ class Trainer:
 
         stage_name = stage or "pretrain"
         for epoch in range(1, config.epochs + 1):
-            epoch_batches = batches
-            if 0 < config.bc_cycle < len(batches):
-                epoch_batches = [batches[pick] for pick in bc_cycle_indices(len(batches), config.bc_cycle, self.train_config.seed, epoch)]
+            if callable(batches):
+                epoch_batches = batches(epoch)
+            else:
+                epoch_batches = batches
+                if 0 < config.bc_cycle < len(batches):
+                    epoch_batches = [
+                        batches[pick]
+                        for pick in bc_cycle_indices(len(batches), config.bc_cycle, self.train_config.seed, epoch)
+                    ]
             losses: list[float] = []
             accuracies: list[float] = []
             for batch in epoch_batches:
@@ -940,6 +960,8 @@ class Trainer:
         }
         if eval_solve_rate is not None:
             entry["eval_solve_rate"] = eval_solve_rate
+        if self.bc_solve_failures is not None:
+            entry["bc_solve_failures"] = self.bc_solve_failures
         self._stamp_autodiscovery(entry)
         entry["timestamp"] = datetime.now().isoformat()
         with (self.run_dir / "metrics.jsonl").open("a") as file:
